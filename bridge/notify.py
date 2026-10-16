@@ -73,7 +73,7 @@ ALERT_RULES: list[tuple[str, str, str]] = [
     (r"定位不到钉钉消息区",          "ocr-no-area",     "采集异常：找不到钉钉消息区"),
     (r"PrintWindow 失败",            "ocr-print-fail",  "采集异常：钉钉窗口截图失败"),
     (r"会话标题校验：不通过",        "ocr-title-mismatch", "转发已暂停：钉钉当前不是目标群"),
-    (r"锚点丢失",                    "ocr-anchor-lost", "采集波动：聊天区被滚动，本帧已跳过"),
+    (r"锚点丢失",                    "ocr-anchor-lost", "采集波动：无法确认新旧消息，本帧已跳过"),
     (r"OCR 轮询异常",                "ocr-exception",   "采集端异常"),
     (r"钉钉凭证|AppKey|client_id",   "stream-cred",     "钉钉凭证相关异常"),
 ]
