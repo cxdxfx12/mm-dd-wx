@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  喵喵钉钉-微信消息转发桥 · 手机端采集器
+
+  它只做一件事：把钉钉当前界面的无障碍节点树读出来，POST 给电脑上的网关
+  （bridge/sources/android_gateway.py 的 /screen 端点）。
+
+  为什么采集端要做成一个 App 而不是走 adb：
+    本机（华为 Mate Xs 2 / HarmonyOS）怎么都不肯把 ADB 接口挂到 USB 配置上，
+    主机侧能查的全部排除过了（驱动、线材、hub、华为服务、端口、授权），
+    最后确认是手机固件层没暴露 —— 所以「电脑端定时 adb shell uiautomator dump」
+    这条路走不通，只能让手机自己把树送出来。
+
+  为什么要自建而不是用现成的自动化 App（AutoX.js / AutoJs6 / MacroDroid）：
+    Auto.js 一系全部沿袭原作者的「MPL-2.0 + 非商业使用」条款，本产品是商用交付物，
+    挂一个非商用运行时做采集端风险不值得冒；自建则零许可证问题、逻辑全在自己手里。
+
+  权限说明：
+    · INTERNET —— 往电脑网关 POST
+    · BIND_ACCESSIBILITY_SERVICE —— 系统绑定本服务的凭据，不是自己申请的权限
+    · WRITE_EXTERNAL_STORAGE(maxSdkVersion=28) —— 只在 Android 9 及以下用于落快照，
+      Android 10+ 走 MediaStore，不需要这个权限
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.hbdxm.ddwx"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
+    <!--
+      minSdk 24：Android 7.0。无障碍节点树里带 bounds 的完整能力从 21 就有，
+      但 NotificationChannel 之类的兼容分支从 24 起最省事。
+      targetSdk 33：刻意不追 34 —— 34 起前台服务必须声明 type，
+      而这里根本没有前台服务（AccessibilityService 由系统绑定，本来就不容易被杀）。
+    -->
+    <uses-sdk
+        android:minSdkVersion="24"
+        android:targetSdkVersion="33" />
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:supportsRtl="false"
+        android:usesCleartextTraffic="true"
+        android:theme="@android:style/Theme.Material.Light">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          无障碍服务。三点必须注意，少一条就装不上或者绑不起来：
+            · android:permission 必须是 BIND_ACCESSIBILITY_SERVICE
+            · android:exported 必须为 true，否则系统绑不上
+            · meta-data 指向的配置 XML 里用 packageNames 限定只监听钉钉 ——
+              有意为之：不碰别的应用，省电、也少一层隐私顾虑
+        -->
+        <service
+            android:name=".CollectorService"
+            android:exported="true"
+            android:label="@string/service_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+    </application>
+</manifest>

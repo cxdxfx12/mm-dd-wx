@@ -25,15 +25,29 @@
     网关**不做**时间过滤，也不建基线 —— 这两件事由手机端完成（它自己知道
     哪些是新消息）。服务端再判一次反而会把「手机离线一夜、恢复后补报」的
     消息当历史丢掉。
+
+两个端点
+    ``POST /messages``
+        手机端自己解析好、直接报**消息**。走这条路时手机端承担全部业务判断。
+
+    ``POST /screen``  /  ``GET /screen``
+        手机端只把当前界面的**无障碍节点树 XML** 原样送上来（格式与
+        ``adb shell uiautomator dump`` 一致），解析、判新老、去重的活儿全留在
+        电脑侧。这条路的好处是改规则不用重装手机；``GET /screen`` 取最新一份
+        （``?raw=1`` 拿正文，不带就用 JSON 摘要），是排障和分析节点结构的入口。
+
+    两条路可以同时存在，互不影响。
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import logging
 import os
 import socket
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,8 +62,14 @@ from .base import MessageHandler, Source, infer_company
 log = logging.getLogger("bridge.source.android")
 
 MAX_BODY = 2 * 1024 * 1024          # 单次请求体上限
+# 节点树的体积比消息大得多（一屏几百个节点，中文正文，实测 30~300 KB），
+# 所以给 /screen 单独放宽到 4 MB。上限仍然要有：监听局域网意味着任何人都能来灌。
+MAX_SCREEN_BODY = 4 * 1024 * 1024
 MAX_BATCH = 200                     # 单次请求最多几条消息
 DEFAULT_PORT = 8765
+# 每收到这么多帧画面打一条 INFO。帧率可能到 0.5/s，全打会把日志淹掉；
+# 全不打又会让「手机到底还在不在上报」变成一个查不出来的问题。
+SCREEN_LOG_EVERY = 30
 
 TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                 "%m-%d %H:%M", "%H:%M")
@@ -182,6 +202,29 @@ def lan_ips() -> list[str]:
 
 # --------------------------------------------------------------- HTTP 服务
 
+def _screen_meta(screen: dict | None) -> dict:
+    """画面缓冲的对外摘要。
+
+    **刻意不含 XML 正文**：正文可能几百 KB，塞进 JSON 首页或日志里只会让
+    「看一眼状态」这件事变成「拉一份大文件」。要正文走 ``GET /screen?raw=1``。
+    """
+    if not screen:
+        return {"received": False, "hint": "还没收到任何画面"}
+    ts = screen.get("ts")
+    age = None if not ts else max(0.0, round(time.time() - float(ts), 1))
+    return {
+        "received": True,
+        "at": screen.get("at", ""),
+        "age_sec": age,
+        "bytes": screen.get("bytes", 0),
+        "md5": screen.get("md5", ""),
+        "texts": screen.get("texts", 0),
+        "device": screen.get("device", ""),
+        "reason": screen.get("reason", ""),
+        "count": screen.get("count", 0),
+    }
+
+
 @dataclass
 class _Ctx:
     token: str
@@ -190,6 +233,9 @@ class _Ctx:
     on_message: MessageHandler | None = None
     count: dict = field(default_factory=lambda: {"requests": 0, "accepted": 0,
                                                  "rejected": 0})
+    # 最新一帧节点树。只留最新一份：这一层的语义就是「手机现在长什么样」，
+    # 历史帧由解析器自己按需比对，网关不做序列缓存。
+    screen: dict | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -224,7 +270,12 @@ class _Handler(BaseHTTPRequestHandler):
         return p.rstrip("/") or "/"
 
     def _auth_ok(self) -> bool:
-        got = self.headers.get("X-Bridge-Token") or ""
+        # 两个头名都认：X-Bridge-Token 是本文档规定的口径，X-Auth-Token 是手机端
+        # 那个自建 App 用的。它们指同一个 token，不构成额外的攻击面，
+        # 但少了这个别名就会出现「App 里 token 填得一字不差却一直 401」这种
+        # 极难自查的问题。
+        got = (self.headers.get("X-Bridge-Token")
+               or self.headers.get("X-Auth-Token") or "")
         if not got:
             # 也认 ?token=xxx —— 方便用浏览器或一行 curl 做连通性自测
             got = (parse_qs(urlparse(self.path).query).get("token") or [""])[0]
@@ -244,24 +295,56 @@ class _Handler(BaseHTTPRequestHandler):
     # --- 端点 ---
 
     def do_GET(self) -> None:                                 # noqa: N802
-        if self._path() not in ("/", "/ping"):
+        path = self._path()
+        if path not in ("/", "/ping", "/screen"):
             self._reply(404, {"ok": False, "error": "未知路径"})
             return
         if not self._auth_ok():
             self._reject_auth()
+            return
+        if path == "/screen":
+            self._get_screen()
             return
         self._reply(200, {"ok": True, "source": "android",
                           "chat_name": self.ctx.chat_name,
+                          "screen": _screen_meta(self.ctx.screen),
                           "stats": dict(self.ctx.count)})
 
+    def _get_screen(self) -> None:
+        """取最新一帧节点树。默认给 JSON 摘要，``?raw=1`` 给 XML 正文。"""
+        screen = self.ctx.screen
+        if not screen:
+            self._reply(404, {
+                "ok": False, "error": "还没有收到任何画面",
+                "hint": "手机端网络通了、无障碍服务开了、钉钉停在群聊页之后，"
+                        "这里才会有内容"})
+            return
+        raw = (parse_qs(urlparse(self.path).query).get("raw") or [""])[0]
+        if raw in ("1", "true", "yes"):
+            data = (screen.get("xml") or "").encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        meta = _screen_meta(screen)
+        meta["ok"] = True
+        self._reply(200, meta)
+
     def do_POST(self) -> None:                                # noqa: N802
-        if self._path() not in ("/", "/messages"):
+        path = self._path()
+        if path not in ("/", "/messages", "/screen"):
             self._reply(404, {"ok": False, "error": "未知路径"})
             return
         if not self._auth_ok():
             self._reject_auth()
             return
 
+        limit = MAX_SCREEN_BODY if path == "/screen" else MAX_BODY
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -269,12 +352,17 @@ class _Handler(BaseHTTPRequestHandler):
         if length <= 0:
             self._reply(400, {"ok": False, "error": "请求体为空"})
             return
-        if length > MAX_BODY:
+        if length > limit:
             self._reply(413, {"ok": False,
-                              "error": f"请求体过大（{length} > {MAX_BODY} 字节）"})
+                              "error": f"请求体过大（{length} > {limit} 字节）"})
             return
 
         raw = self.rfile.read(length)
+
+        if path == "/screen":
+            self._post_screen(raw, length)
+            return
+
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -315,6 +403,60 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._reply(200, {"ok": True, "accepted": len(msgs),
                           "skipped": skipped, "chat_name": self.ctx.chat_name})
+
+    def _post_screen(self, raw: bytes, length: int) -> None:
+        """收一帧节点树。只做「存下来 + 记元信息」，不解析 —— 解析是采集端的事。"""
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            self._reply(400, {"ok": False, "error": f"画面不是 UTF-8：{exc}"})
+            return
+        # 入口形状检查。这一条的价值在于把「IP 填成了别的服务」「手机端版本不对」
+        # 这类问题在门口就挡下来 —— 否则后面解析器要拿一堆垃圾去猜结构，
+        # 报出来的错会离真正的原因非常远。
+        head = text[:600]
+        if "<hierarchy" not in head:
+            self._reply(400, {
+                "ok": False, "error": "请求体不像 uiautomator 节点树 XML",
+                "hint": "应当以 <?xml 开头且含 <hierarchy>；"
+                        "确认手机端 App 是配套版本"})
+            return
+
+        try:
+            texts = int(self.headers.get("X-Ddwx-Texts") or 0)
+        except ValueError:
+            texts = 0
+
+        with self.ctx.lock:
+            prev = self.ctx.screen or {}
+            count = int(prev.get("count", 0)) + 1
+            screen = {
+                "xml": text,
+                "bytes": length,
+                # 手机端给了摘要就用它（省一次全量哈希），没给就自己算
+                "md5": (self.headers.get("X-Ddwx-Md5") or "").strip()
+                       or hashlib.md5(raw).hexdigest(),
+                "texts": texts,
+                "device": (self.headers.get("X-Ddwx-Device") or "").strip(),
+                "reason": (self.headers.get("X-Ddwx-Reason") or "").strip(),
+                "ts": time.time(),
+                "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "count": count,
+            }
+            self.ctx.screen = screen
+
+        if count == 1:
+            log.info("收到第一帧手机画面：%d 字节，%d 条文本（来自 %s）",
+                     length, texts, screen["device"] or "未知名")
+        elif count % SCREEN_LOG_EVERY == 0:
+            log.info("手机画面已累计 %d 帧（最新 %d 字节 / %d 条文本）",
+                     count, length, texts)
+        else:
+            log.debug("画面 #%d：%d 字节，%d 条文本，md5=%s",
+                      count, length, texts, screen["md5"][:8])
+
+        self._reply(200, {"ok": True, "bytes": length, "count": count,
+                          "md5": screen["md5"]})
 
 
 def _make_handler(ctx: _Ctx):
@@ -408,6 +550,11 @@ class AndroidGatewaySource(Source):
             log.warning("  没探测到局域网 IP，请用 ipconfig 查本机地址")
         log.info("  连通性自测：手机浏览器打开 http://<本机IP>:%d/ping?token=<token>",
                  self.port)
+        log.info("  收消息 POST /messages ｜ 收画面 POST /screen ｜ "
+                 "本机查最新画面 GET /screen?token=<token>&raw=1")
+        log.warning("  注意：本模式**只负责收**。手机报上来的是消息还是画面，"
+                    "决定了下游有没有东西可转发 —— 只收到画面时程序不会自动解析，"
+                    "别把「网关在收」当成「业务在转」。")
 
         try:
             server.serve_forever(poll_interval=0.5)

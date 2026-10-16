@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  无障碍服务配置。
+
+  accessibilityFlags 里三个 flag 都是必需的，少一个就可能只读到一棵空树：
+    · flagReportViewIds            带上 resource-id，用来定位消息列表容器
+    · flagIncludeNotImportantViews 消息气泡常被标成「对无障碍不重要」，
+                                   不加这个 flag 很可能什么都读不到
+    · flagRetrieveInteractiveWindows 允许拿多窗口内容
+
+  packageNames 限定只监听钉钉：既省电，也确保服务不会去碰别的应用。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/service_desc"
+    android:notificationTimeout="200"
+    android:packageNames="com.alibaba.android.rimet" />

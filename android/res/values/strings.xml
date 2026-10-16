@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">喵喵采集端</string>
+    <string name="service_name">喵喵采集端·读钉钉</string>
+    <string name="service_desc">读取钉钉群聊页的文字并上报给电脑上的转发桥。只读、不点击、不输入。</string>
+
+    <string name="status_placeholder">正在读取服务状态…</string>
+
+    <string name="btn_access">打开系统无障碍设置（开启本服务）</string>
+    <string name="btn_capture">立即抓取并上报一次</string>
+    <string name="btn_ping">测试与电脑的连通性</string>
+    <string name="btn_snapshot">存一份快照到 Download/mmddwx</string>
+    <string name="btn_save">保存设置</string>
+
+    <string name="section_server">电脑端网关</string>
+    <string name="hint_server">这些值必须与电脑上 config.yaml 的 dingtalk 段一致：gateway_port 与 gateway_token。IP 是电脑的局域网地址。</string>
+
+    <string name="label_host">电脑 IP</string>
+    <string name="hint_host">例如 192.168.1.209</string>
+
+    <string name="label_port">端口</string>
+    <string name="hint_port">默认 8765</string>
+
+    <string name="label_token">令牌 token</string>
+    <string name="hint_token">与 config.yaml 的 gateway_token 一字不差</string>
+
+    <string name="label_interval">抓取间隔（毫秒）</string>
+    <string name="hint_interval">默认 2000，最小 500</string>
+
+    <string name="label_target">监听的包名</string>
+    <string name="hint_target">钉钉默认 com.alibaba.android.rimet</string>
+
+    <string name="label_snapshot">画面变化时同时存一份快照到 Download/mmddwx（网络不通时的兜底取证）</string>
+
+    <string name="footer_tips">使用前提：钉钉停在目标群聊页并保持亮屏。本服务只读节点树，不点击、不输入、不改动钉钉里的任何内容。建议同时在系统「电池」里把本应用设为「不允许后台省电」。</string>
+</resources>

@@ -24,7 +24,7 @@ from bridge.config import Config, DingTalkConfig, RouteConfig, StorageConfig, We
 from bridge.fingerprint import fp_of, norm_sender, unit_fp
 from bridge.service import BridgeService
 from bridge.sources.android_gateway import (
-    MAX_BATCH, AndroidGatewaySource, build_messages, lan_ips,
+    MAX_BATCH, MAX_SCREEN_BODY, AndroidGatewaySource, build_messages, lan_ips,
 )
 from bridge.sources.base import Source
 from bridge.sources.factory import build_source
@@ -380,6 +380,172 @@ class TestEndpoint(GatewayCase):
         self.post({"messages": [{"sender": "a", "content": "x"}]})
         _, body = self.get()
         self.assertEqual(body["stats"]["accepted"], 1)
+
+
+# --------------------------------------------------------------- 画面端点
+
+# 一帧最小可用的节点树。形状照着 `adb shell uiautomator dump` 的真实输出抄，
+# 属性名一个都不能改 —— 网关的入口检查、以及后面解析器都认这个形状。
+FRAME_1 = (
+    "<?xml version='1.0' encoding='UTF-8'?>\n"
+    "<hierarchy rotation=\"0\">\n"
+    "  <node index=\"0\" text=\"\" resource-id=\"\" class=\"android.widget.FrameLayout\""
+    " package=\"com.alibaba.android.rimet\" content-desc=\"\" clickable=\"false\""
+    " enabled=\"true\" scrollable=\"false\" bounds=\"[0,0][1080,2340]\">\n"
+    "    <node index=\"1\" text=\"普通件滞留7天 96票\" resource-id=\"com.alibaba.android.rimet:id/tv\""
+    " class=\"android.widget.TextView\" package=\"com.alibaba.android.rimet\""
+    " content-desc=\"\" clickable=\"false\" enabled=\"true\" scrollable=\"false\""
+    " bounds=\"[120,1200][900,1320]\">\n"
+    "    </node>\n"
+    "  </node>\n"
+    "</hierarchy>\n"
+)
+
+
+class TestScreenEndpoint(GatewayCase):
+    """``/screen`` —— 手机只送节点树、解析留在电脑侧的那条路。
+
+    这条路的失败模式跟 ``/messages`` 完全不同，所以单独立一组测试：
+    它**不会**产生消息，收了也只是存着；测试要盯的是「存得对吗、
+    形状不对的东西有没有被挡在门口、以及能不能取回来」。
+    """
+
+    def post_screen(self, body, token: str | None = TOKEN, **headers):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        req = urllib.request.Request(self.url("/screen"), data=body, method="POST")
+        if token is not None:
+            req.add_header("X-Bridge-Token", token)
+        req.add_header("Content-Type", "text/plain; charset=utf-8")
+        for k, v in headers.items():
+            req.add_header(k.replace("_", "-"), str(v))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode("utf-8"))
+
+    def get_raw(self, token: str | None = TOKEN):
+        url = f"http://127.0.0.1:{self.port}/screen"
+        url += f"?token={quote(token)}&raw=1" if token else "?raw=1"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read().decode("utf-8")
+
+    # --- 收 ---
+
+    def test_accept_frame(self):
+        code, body = self.post_screen(
+            FRAME_1, X_Ddwx_Md5="abc123", X_Ddwx_Texts=1, X_Ddwx_Device="Mate Xs 2")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["bytes"], len(FRAME_1.encode("utf-8")))
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(self.received, [])       # 画面不产生消息，这是设计
+
+    def test_md5_from_header_preferred(self):
+        self.post_screen(FRAME_1, X_Ddwx_Md5="given-md5")
+        _, meta = self.get("/screen")
+        self.assertEqual(meta["md5"], "given-md5")
+
+    def test_md5_computed_when_header_missing(self):
+        """手机端没带头也要能工作 —— 否则一个版本不匹配就整条路废掉。"""
+        import hashlib
+        self.post_screen(FRAME_1)
+        _, meta = self.get("/screen")
+        self.assertEqual(meta["md5"], hashlib.md5(FRAME_1.encode("utf-8")).hexdigest())
+
+    def test_second_frame_replaces_first(self):
+        """只留最新一帧：这一层的语义是「手机现在长什么样」，不是历史序列。"""
+        self.post_screen(FRAME_1)
+        changed = FRAME_1.replace("96票", "97票")
+        code, body = self.post_screen(changed)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["count"], 2)
+        _, raw = self.get_raw()
+        self.assertIn("97票", raw)
+        self.assertNotIn("96票", raw)
+
+    def test_non_xml_rejected(self):
+        """把「IP 填到了别的服务」这类问题挡在门口，别让解析器去猜结构。"""
+        code, body = self.post_screen("这不是节点树，只是一个普通字符串")
+        self.assertEqual(code, 400)
+        self.assertIn("hierarchy", body["hint"])
+
+    def test_non_utf8_rejected(self):
+        code, _ = self.post_screen(b"\xff\xfe\x00\x01 not utf8")
+        self.assertEqual(code, 400)
+
+    def test_too_large_413(self):
+        code, body = self.post_screen(b"<hierarchy>" + b"x" * MAX_SCREEN_BODY)
+        self.assertEqual(code, 413)
+        self.assertIn("过大", body["error"])
+
+    def test_empty_body_400(self):
+        req = urllib.request.Request(self.url("/screen"), data=b"", method="POST")
+        req.add_header("X-Bridge-Token", TOKEN)
+        req.add_header("Content-Length", "0")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                code = resp.status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        self.assertEqual(code, 400)
+
+    # --- 取 ---
+
+    def test_get_before_any_frame_404(self):
+        code, body = self.get("/screen")
+        self.assertEqual(code, 404)
+        self.assertFalse(body["ok"])
+        self.assertIn("还没有收到", body["error"])
+
+    def test_get_meta_excludes_xml(self):
+        """摘要里不能夹带正文 —— 一帧几百 KB，塞进 JSON 就没人愿意看状态了。"""
+        self.post_screen(FRAME_1, X_Ddwx_Texts=1)
+        _, meta = self.get("/screen")
+        self.assertTrue(meta["received"])
+        self.assertEqual(meta["texts"], 1)
+        self.assertNotIn("xml", meta)
+        self.assertIsInstance(meta["age_sec"], float)
+
+    def test_get_raw_returns_xml(self):
+        self.post_screen(FRAME_1)
+        code, raw = self.get_raw()
+        self.assertEqual(code, 200)
+        self.assertTrue(raw.startswith("<?xml"))
+        self.assertIn("普通件滞留7天 96票", raw)
+
+    def test_ping_includes_screen_meta(self):
+        self.post_screen(FRAME_1)
+        _, body = self.get()
+        self.assertTrue(body["screen"]["received"])
+        self.assertEqual(body["screen"]["count"], 1)
+
+    def test_ping_before_any_frame_says_not_received(self):
+        _, body = self.get()
+        self.assertFalse(body["screen"]["received"])
+
+    # --- 鉴权 ---
+
+    def test_screen_rejected_without_token(self):
+        code, _ = self.post_screen(FRAME_1, token=None)
+        self.assertEqual(code, 401)
+
+    def test_screen_get_rejected_without_token(self):
+        code, _ = self.get("/screen", token=None)
+        self.assertEqual(code, 401)
+
+    def test_auth_token_alias_accepted(self):
+        """手机端自建 App 发的是 X-Auth-Token，必须认 —— 否则表现是
+        「token 一字不差却永远 401」，现场根本查不出来。"""
+        req = urllib.request.Request(self.url("/screen"),
+                                     data=FRAME_1.encode("utf-8"), method="POST")
+        req.add_header("X-Auth-Token", TOKEN)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+        _, meta = self.get("/screen")
+        self.assertTrue(meta["received"])
 
 
 # --------------------------------------------------------------- Source
