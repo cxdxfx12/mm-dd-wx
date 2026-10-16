@@ -54,9 +54,13 @@ class NotifyConfig:
     不参与「钉钉 → 微信」的取数，详见 bridge/notify.py 顶部说明。
     """
     enabled: bool = False
-    webhook: str = ""
-    secret: str = ""                        # 机器人开了「加签」才需要
-    keyword: str = ""                       # 机器人开了「自定义关键词」才需要
+    webhook: str = ""                       # 老格式：单个地址（也认分号分隔的多个）
+    # 新格式：一个机器人一项。每项是 "地址 | 加签密钥 | 关键词"（后两段可省），
+    # 不方便写一行时也可以写成 {url:…, secret:…, keyword:…} 映射。
+    # 这一项非空时以它为准，webhook 只作为向后兼容的回落。
+    webhooks: list[str] = field(default_factory=list)
+    secret: str = ""                        # 机器人开了「加签」才需要（多机器人时作默认值）
+    keyword: str = ""                       # 机器人开了「自定义关键词」才需要（同上作默认值）
     at_mobiles: list[str] = field(default_factory=list)
     at_all: bool = False
     cooldown: float = 300.0                 # 同一类告警的最小间隔（秒），防刷屏
@@ -129,8 +133,14 @@ def load_config(path: str | Path = "config.yaml") -> Config:
     cfg.dingtalk.client_id = os.getenv("DINGTALK_CLIENT_ID") or cfg.dingtalk.client_id
     cfg.dingtalk.client_secret = os.getenv("DINGTALK_CLIENT_SECRET") or cfg.dingtalk.client_secret
     cfg.dingtalk.robot_code = os.getenv("DINGTALK_ROBOT_CODE") or cfg.dingtalk.robot_code
-    # webhook 里带 access_token，等同于凭证，同样支持用环境变量下发
-    cfg.notify.webhook = os.getenv("DINGTALK_ROBOT_WEBHOOK") or cfg.notify.webhook
+    # webhook 里带 access_token，等同于凭证，同样支持用环境变量下发。
+    # 多个机器人用 DINGTALK_ROBOT_WEBHOOKS（分号隔开，每项仍可跟 |密钥|关键词）。
+    env_many = os.getenv("DINGTALK_ROBOT_WEBHOOKS")
+    if env_many:
+        cfg.notify.webhooks = [x for x in env_many.split(";") if x.strip()]
+        cfg.notify.webhook = ""
+    else:
+        cfg.notify.webhook = os.getenv("DINGTALK_ROBOT_WEBHOOK") or cfg.notify.webhook
     cfg.notify.secret = os.getenv("DINGTALK_ROBOT_SECRET") or cfg.notify.secret
 
     if not cfg.routes:

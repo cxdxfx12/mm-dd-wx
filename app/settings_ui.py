@@ -71,21 +71,55 @@ def remember_message(text: str) -> None:
     _LAST_MESSAGE = text or ""
 
 
+def _bridge_module():
+    """按需导入 bridge 包（界面进程的 sys.path 里未必有仓库根）。"""
+    import sys
+    root = str(Path(__file__).resolve().parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import bridge.notify as m
+    return m
+
+
 def default_test_text() -> str:
     """默认测试文案，取自 bridge.notify —— 与命令行 --notify-test 同一份。"""
     global _DEFAULT_TEXT_CACHE
     if _DEFAULT_TEXT_CACHE is None:
         try:
-            import sys
-            root = str(Path(__file__).resolve().parent.parent)
-            if root not in sys.path:
-                sys.path.insert(0, root)
-            from bridge.notify import DEFAULT_TEST_TEXT
-            _DEFAULT_TEXT_CACHE = DEFAULT_TEST_TEXT
+            _DEFAULT_TEXT_CACHE = _bridge_module().DEFAULT_TEST_TEXT
         except Exception:
             # 取不到文案不该让设置窗口打不开，退化成一句等价的提示
             _DEFAULT_TEXT_CACHE = "测试消息：喵喵钉钉-微信消息转发桥通知通道正常。"
     return _DEFAULT_TEXT_CACHE
+
+
+def robot_rows_from_config(n: dict) -> list[tuple[str, str, str]]:
+    """把 notify 段读成 ``[(地址, 加签密钥, 关键词), …]``。
+
+    解析规则只在 bridge/notify.py 里有一份，这里复用，避免两处各写一套
+    后来改歪。导入失败就退化成「只认老的单个 webhook」，不让设置窗口打不开。
+    """
+    try:
+        m = _bridge_module()
+        items = list(n.get("webhooks") or [])
+        lines = items if items else [n.get("webhook") or ""]
+        specs = m.robots_from_lines(lines, str(n.get("secret") or ""),
+                                    str(n.get("keyword") or ""))
+        return [(s.url, s.secret, s.keyword) for s in specs]
+    except Exception:
+        url = str(n.get("webhook") or "").strip()
+        if not url:
+            return []
+        return [(url, str(n.get("secret") or ""), str(n.get("keyword") or ""))]
+
+
+def robot_lines_for_config(specs: list[tuple[str, str, str]]) -> list[str]:
+    """反向：把界面上的机器人行拼成写回 config.yaml 的单行写法。"""
+    try:
+        m = _bridge_module()
+        return [m.RobotSpec(u, s, k).as_line() for u, s, k in specs]
+    except Exception:
+        return ["|".join([u, s, k]).rstrip("| ") for u, s, k in specs]
 
 
 def _card(parent, title: str = "") -> tk.Frame:
@@ -439,9 +473,6 @@ class SettingsDialog:
         n = self.cfg.get("notify") or {}
 
         self.st["n_enabled"] = tk.BooleanVar(value=bool(n.get("enabled", False)))
-        self.st["n_webhook"] = tk.StringVar(value=str(n.get("webhook") or ""))
-        self.st["n_secret"] = tk.StringVar(value=str(n.get("secret") or ""))
-        self.st["n_keyword"] = tk.StringVar(value=str(n.get("keyword") or ""))
         self.st["n_at_mobiles"] = tk.StringVar(
             value="; ".join(str(m) for m in (n.get("at_mobiles") or [])))
         self.st["n_at_all"] = tk.BooleanVar(value=bool(n.get("at_all", False)))
@@ -457,17 +488,33 @@ class SettingsDialog:
         self.st["n_hourly"] = tk.BooleanVar(value=bool(n.get("report_hourly", False)))
         self.st["n_daily"] = tk.StringVar(value=str(n.get("report_daily_at") or ""))
 
-        # ---- 凭证 ----
+        # ---- 机器人清单 ----
+        # 一个群里常常不止一个机器人（每个上游系统挂一个），通知要能同时
+        # 发给他们，所以这里做成可增删的多行：一行一个机器人，
+        # 各带自己的加签密钥 / 关键词 —— 加签是每机器人一套的，不能只留全局一个。
         box = _card(page, "机器人凭证（钉钉群 → 群设置 → 智能群助手 → 添加机器人 → 自定义）")
         box.pack(fill="x", padx=12, pady=(12, 8))
         ttk.Checkbutton(box, text="启用钉钉通知（故障告警 + 运行报告）",
                         variable=self.st["n_enabled"]).pack(anchor="w", padx=14,
                                                             pady=(10, 4))
-        self._field(box, "Webhook", self.st["n_webhook"], 74)
-        self._field(box, "加签密钥", self.st["n_secret"], 34,
-                    "机器人开了「加签」才需要填，SEC 开头的字符串")
-        self._field(box, "自定义关键词", self.st["n_keyword"], 20,
-                    "机器人开了「自定义关键词」才需要填；内容里缺这个词会自动补一行")
+        tk.Label(box, text="机器人（一个机器人一行，可以加多个；通知会发给每一个）：",
+                 bg=CARD, fg=MUTED, font=F_SMALL).pack(anchor="w", padx=14,
+                                                       pady=(4, 0))
+        self._robots_box = tk.Frame(box, bg=CARD)
+        self._robots_box.pack(fill="x", padx=14, pady=(2, 2))
+        self._robot_rows: list[dict] = []
+        for _u, _s, _k in robot_rows_from_config(n):
+            self._add_robot_row(_u, _s, _k)
+        if not self._robot_rows:                # 一条都没有时给个空行，免得没处下手
+            self._add_robot_row()
+        ttk.Button(box, text="＋ 添加一个机器人",
+                   command=lambda: self._add_robot_row()).pack(anchor="w",
+                                                               padx=14,
+                                                               pady=(2, 2))
+        _tip(box, "「加签密钥」填 SEC 开头那串，机器人开了「加签」才需要；"
+                  "「关键词」机器人开了「自定义关键词」才需要（内容里缺这个词"
+                  "会自动补一行）。两个都是**每个机器人各自**的设置，留空即不用。",
+             bg=CARD).pack(anchor="w", padx=16, pady=(0, 8))
 
         # ---- 自定义消息 ----
         # 一个能直接打字的输入框：想发什么就写什么，不必先保存设置。
@@ -576,6 +623,59 @@ class SettingsDialog:
         if note:
             _tip(row, note, bg=CARD).pack(side="left")
 
+    # ---- 「钉钉通知」里的机器人行 ----
+
+    def _add_robot_row(self, url: str = "", secret: str = "",
+                       keyword: str = "") -> None:
+        """加一行「一个机器人」。地址留空的行保存时会被忽略。
+
+        行内容刻意做成独立的 StringVar，而不是共享的大 Text ——
+        用户点「＋ 添加」时新行直接出现在下面，删行也不会影响其它行。
+        """
+        row = tk.Frame(self._robots_box, bg=CARD)
+        row.pack(fill="x", pady=2)
+        v_url, v_sec, v_kw = (tk.StringVar(value=url), tk.StringVar(value=secret),
+                              tk.StringVar(value=keyword))
+        tk.Label(row, text="地址", bg=CARD, fg=MUTED, font=F_SMALL,
+                 width=4, anchor="w").pack(side="left")
+        ttk.Entry(row, textvariable=v_url).pack(side="left", fill="x",
+                                                expand=True, padx=(2, 8))
+        tk.Label(row, text="加签密钥", bg=CARD, fg=MUTED,
+                 font=F_SMALL).pack(side="left")
+        ttk.Entry(row, textvariable=v_sec, width=17).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="关键词", bg=CARD, fg=MUTED,
+                 font=F_SMALL).pack(side="left")
+        ttk.Entry(row, textvariable=v_kw, width=9).pack(side="left", padx=(2, 8))
+        ttk.Button(row, text="删除", width=5,
+                   command=lambda r=row: self._del_robot_row(r)).pack(side="left")
+        self._robot_rows.append({"row": row, "url": v_url,
+                                 "secret": v_sec, "keyword": v_kw})
+
+    def _del_robot_row(self, row) -> None:
+        for item in list(self._robot_rows):
+            if item["row"] is row:
+                self._robot_rows.remove(item)
+        try:
+            row.destroy()
+        except Exception:
+            pass
+
+    def _robot_specs_now(self) -> list[tuple[str, str, str]]:
+        """当前界面上的机器人（丢掉空地址、按地址去重）。"""
+        out: list[tuple[str, str, str]] = []
+        seen: set[str] = set()
+        for item in self._robot_rows:
+            try:
+                url = item["url"].get().strip()
+            except Exception:               # 控件已销毁
+                continue
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            out.append((url, item["secret"].get().strip(),
+                        item["keyword"].get().strip()))
+        return out
+
     # ---- 自定义消息输入框的两个辅助 ----
 
     def _fill_test_text(self):
@@ -597,11 +697,11 @@ class SettingsDialog:
         刻意不调 config.yaml：用户往往正是想边填边试。
         bridge/notify.py 只依赖标准库，界面解释器也导入得动。
         """
-        url = self.st["n_webhook"].get().strip()
-        if not url:
+        specs = self._robot_specs_now()
+        if not specs:
             messagebox.showwarning(
                 "还没填 webhook",
-                "请先填入自定义机器人的 webhook 地址。\n\n"
+                "请先在「机器人」那一行填入自定义机器人的 webhook 地址。\n\n"
                 "获取位置：钉钉群 → 群设置 → 智能群助手 → 添加机器人 → 自定义（Webhook）",
                 parent=self.win)
             return
@@ -615,20 +715,17 @@ class SettingsDialog:
             self._composer.focus_set()
             return
         self._test_btn.configure(state="disabled")
-        self._test_lab.configure(text="正在发送…", fg=MUTED)
-        vals = (url, self.st["n_secret"].get().strip(),
-                self.st["n_keyword"].get().strip(), content)
+        self._test_lab.configure(text=f"正在发送到 {len(specs)} 个机器人…",
+                                 fg=MUTED)
+        vals = (list(specs), content)
 
         def work():
             try:
-                import sys
-                root = str(Path(__file__).resolve().parent.parent)
-                if root not in sys.path:
-                    sys.path.insert(0, root)
-                from bridge.notify import DingTalkNotifier
-                nt = DingTalkNotifier(webhook=vals[0], secret=vals[1],
-                                      keyword=vals[2])
-                ok, detail = nt.send_custom(vals[3])
+                m = _bridge_module()
+                # 每个机器人用自己那套加签 / 关键词 —— 所以逐个构造后一起发
+                nt = m.DingTalkNotifier(
+                    robots=[m.RobotSpec(u, s, k) for u, s, k in vals[0]])
+                ok, detail = nt.send_custom(vals[1])
             except Exception as exc:
                 ok, detail = False, f"{type(exc).__name__}: {exc}"
             self.win.after(0, lambda: self._test_done(ok, detail))
@@ -642,8 +739,19 @@ class SettingsDialog:
         except Exception:
             return
         if ok:
-            self._test_lab.configure(text="✓ 已发送，请到钉钉群确认", fg="#0b6b3a")
-            messagebox.showinfo("发送成功", "消息已发到钉钉群。", parent=self.win)
+            self._test_lab.configure(text=f"✓ 已发送（{detail}），请到钉钉群确认",
+                                     fg="#0b6b3a")
+            # detail 不是 "ok" 就说明有机器人没发成功 —— 得让人看见是哪一个
+            if detail == "ok":
+                messagebox.showinfo("发送成功", "消息已发到钉钉群。",
+                                    parent=self.win)
+            else:
+                messagebox.showwarning(
+                    "部分机器人没发出去",
+                    f"{detail}\n\n"
+                    "已经发成功的那几个是正常的；没成功的请对着它自己的"
+                    "「加签密钥 / 关键词」检查一遍。",
+                    parent=self.win)
         else:
             self._test_lab.configure(text=f"✗ 发送失败：{detail}", fg=RED)
             messagebox.showwarning(
@@ -778,11 +886,11 @@ class SettingsDialog:
                                    parent=self.win)
             return
         n_enabled = bool(self.st["n_enabled"].get())
-        n_webhook = self.st["n_webhook"].get().strip()
-        if n_enabled and not n_webhook:
+        n_robots = self._robot_specs_now()          # [(地址, 加签密钥, 关键词), …]
+        if n_enabled and not n_robots:
             messagebox.showwarning(
                 "启用了通知但没填 webhook",
-                "请把钉钉机器人的 webhook 地址填上，或者取消「启用钉钉通知」。\n\n"
+                "请至少填一个钉钉机器人的 webhook 地址，或者取消「启用钉钉通知」。\n\n"
                 "获取位置：钉钉群 → 群设置 → 智能群助手 → 添加机器人 → 自定义（Webhook）",
                 parent=self.win)
             return
@@ -801,50 +909,72 @@ class SettingsDialog:
         cfgfile.backup(self.path)
         problems: list[str] = []
 
-        def S(section, key, value):
-            if not cfgfile.set_scalar(self.path, section, key, value):
+        def S(section, key, value, after=""):
+            # 「改或插」：老配置里没有新版本加的键（比如 dingtalk.time_window）
+            # 时，set_scalar 只会改已存在的键、直接报写入失败 —— 那会让整个
+            # 设置存不下来。所以这里统一走 set_or_insert_scalar。
+            if not cfgfile.set_or_insert_scalar(self.path, section, key, value,
+                                                after_key=after):
                 problems.append(f"{section}.{key}")
 
-        def L(section, key, items):
-            if not cfgfile.set_list(self.path, section, key, items):
+        def L(section, key, items, after=""):
+            if not (cfgfile.set_list(self.path, section, key, items)
+                    or cfgfile.ensure_list_key(self.path, section, key, items,
+                                               after_key=after)):
                 problems.append(f"{section}.{key}")
 
         if not cfgfile.set_routes(self.path, rules_in):
             problems.append("routes")
 
+        # 各键的 after= 描述的是「样板文件里的先后顺序」：老配置缺哪个键，
+        # 就地补在它该在的位置，而不是堆到段尾让人看不懂。
         sources: list[str] = []
         for r in rules_in:
             for s in r["sources"]:
                 if s not in sources:
                     sources.append(s)
         L("dingtalk", "chat_names", sources)
-        S("dingtalk", "time_filter", tf)
-        S("dingtalk", "time_window", window)
-        S("dingtalk", "ui_poll_interval", poll)
-        S("dingtalk", "anchor_guard", bool(self.st["anchor"].get()))
-        S("dingtalk", "title_check", bool(self.st["title"].get()))
-        S("dingtalk", "title_ratio", ratio)
-        S("wechat", "dry_run", bool(self.st["dry_run"].get()))
-        S("wechat", "interval", interval)
-        S("wechat", "show_hotkey", hotkey)
+        S("dingtalk", "ui_poll_interval", poll, after="chat_names")
+        S("dingtalk", "title_check", bool(self.st["title"].get()),
+          after="ui_poll_interval")
+        S("dingtalk", "title_ratio", ratio, after="title_check")
+        S("dingtalk", "time_filter", tf, after="title_ratio")
+        S("dingtalk", "time_window", window, after="time_filter")
+        S("dingtalk", "anchor_guard", bool(self.st["anchor"].get()),
+          after="time_window")
+        S("wechat", "dry_run", bool(self.st["dry_run"].get()), after="interval")
+        S("wechat", "interval", interval, after="dry_run")
+        S("wechat", "show_hotkey", hotkey, after="wxauto_path")
 
         # ---- 钉钉通知 ----
         S("notify", "enabled", n_enabled)
-        S("notify", "webhook", n_webhook)
-        S("notify", "secret", self.st["n_secret"].get().strip())
-        S("notify", "keyword", self.st["n_keyword"].get().strip())
-        L("notify", "at_mobiles", n_mobiles)
-        S("notify", "at_all", bool(self.st["n_at_all"].get()))
-        S("notify", "cooldown", n_cooldown)
-        S("notify", "log_alerts", bool(self.st["n_log_alerts"].get()))
-        S("notify", "notify_start", bool(self.st["n_start"].get()))
-        S("notify", "notify_fail", bool(self.st["n_fail"].get()))
-        S("notify", "fail_threshold", n_threshold)
-        S("notify", "notify_idle", bool(self.st["n_idle"].get()))
-        S("notify", "idle_minutes", n_idle_min)
-        S("notify", "idle_window", n_idle_win)
-        S("notify", "report_hourly", bool(self.st["n_hourly"].get()))
-        S("notify", "report_daily_at", n_daily)
+        # 多个机器人写进 notify.webhooks（一个机器人一项，可带自己的加签/关键词）。
+        # 同时把第一个地址回填到老的 notify.webhook：
+        #   · 万一有人拿旧版本 exe 读这份配置，仍然能发得出去
+        #   · 手工打开 config.yaml 时也一眼能看到主地址
+        # 采集侧只认 webhooks 非空就用它，所以不会重复发送。
+        L("notify", "webhooks", robot_lines_for_config(n_robots),
+          after="webhook")
+        S("notify", "webhook", n_robots[0][0] if n_robots else "",
+          after="webhooks")
+        L("notify", "at_mobiles", n_mobiles, after="keyword")
+        S("notify", "at_all", bool(self.st["n_at_all"].get()),
+          after="at_mobiles")
+        S("notify", "cooldown", n_cooldown, after="at_all")
+        S("notify", "log_alerts", bool(self.st["n_log_alerts"].get()),
+          after="cooldown")
+        S("notify", "notify_start", bool(self.st["n_start"].get()),
+          after="log_alerts")
+        S("notify", "notify_fail", bool(self.st["n_fail"].get()),
+          after="notify_start")
+        S("notify", "fail_threshold", n_threshold, after="notify_fail")
+        S("notify", "notify_idle", bool(self.st["n_idle"].get()),
+          after="fail_threshold")
+        S("notify", "idle_minutes", n_idle_min, after="notify_idle")
+        S("notify", "idle_window", n_idle_win, after="idle_minutes")
+        S("notify", "report_hourly", bool(self.st["n_hourly"].get()),
+          after="idle_window")
+        S("notify", "report_daily_at", n_daily, after="report_hourly")
 
         if problems:
             messagebox.showerror(

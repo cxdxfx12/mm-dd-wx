@@ -66,11 +66,26 @@ wechat:
 #   IP 白名单    -> 钉钉侧配置即可，这里不用填
 notify:
   enabled: false                     # 改成 true 并填好 webhook 才生效
-  # 建议改用环境变量 DINGTALK_ROBOT_WEBHOOK / DINGTALK_ROBOT_SECRET，
-  # 避免把带 access_token 的地址明文写进配置文件
-  webhook: "https://oapi.dingtalk.com/robot/send?access_token=改成你自己的"
-  secret: ""
-  keyword: ""
+
+  # ---- 机器人（可以配多个，通知会同时发给每一个）----
+  # 一个群里常常不止一个机器人（每个上游系统挂一个），所以这里做成列表：
+  # 一行一个机器人。每项写法：  地址 | 加签密钥 | 自定义关键词
+  # 后两段可以省略（省略就回落到下面的 secret / keyword）。
+  # 谁配错了不影响其它机器人：发失败的那几个会各自记一条 WARNING，
+  # 只要有一个发成功，告警的冷却机制就照常生效，不会刷屏。
+  webhooks:
+    - "https://oapi.dingtalk.com/robot/send?access_token=改成你自己的"
+    # - "https://oapi.dingtalk.com/robot/send?access_token=第二个机器人 | SECxxxx | 转发桥"
+
+  # 建议改用环境变量避免明文：
+  #   DINGTALK_ROBOT_WEBHOOKS  分号隔开的多个地址（推荐）
+  #   DINGTALK_ROBOT_WEBHOOK   单个地址
+  #   DINGTALK_ROBOT_SECRET    加签密钥（webhooks 某项没写自己的密钥时用它）
+
+  # ---- 下面两项是上面 webhooks 里没单独写时的**默认值** ----
+  webhook: ""                        # 老格式：单个地址，配了 webhooks 就忽略它
+  secret: ""                         # 默认加签密钥（SEC 开头）
+  keyword: ""                        # 默认自定义关键词
 
   # 告警时 @ 谁（填手机号）；at_all 为 true 时等同于 @所有人
   at_mobiles: []

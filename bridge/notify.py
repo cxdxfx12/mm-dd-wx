@@ -38,10 +38,20 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 
 log = logging.getLogger("bridge.notify")
 
 WEBHOOK_PREFIX = "https://oapi.dingtalk.com/robot/send?access_token="
+
+# 一个机器人 = 一个 webhook 地址。群里/系统里有多个机器人时，全部填上即可，
+# 通知会往每一个都发一条（谁挂了也不影响其它的）。
+# 书写格式（配置里一行一个）：
+#     https://oapi.dingtalk.com/robot/send?access_token=AAA | SECxxxx | 关键词
+# 后面的「加签密钥」「自定义关键词」可以省略 —— 省略时回落到 notify.secret /
+# notify.keyword。也认分号分隔，方便在老的 notify.webhook 单值里塞多个。
+ROBOT_SEP = "|"
+_ROBOT_SPLIT_RE = re.compile(r"[\r\n;]+")
 
 # 默认测试文案：设置中心的「填入测试文案」与命令行 --notify-test 共用，
 # 只此一份，免得两边各写一段、改了一处忘了另一处。
@@ -140,16 +150,131 @@ def mask_webhook(url: str) -> str:
     return url.replace(tok, shown)
 
 
-class DingTalkNotifier:
-    """钉钉机器人发送端。线程安全，失败不抛异常（只返回 False）。"""
+# ══════════════════════════════════════════════════════════════════════
+#  机器人清单（一个地址一个机器人，各自带自己的加签密钥 / 关键词）
+# ══════════════════════════════════════════════════════════════════════
 
-    def __init__(self, webhook: str, secret: str = "", keyword: str = "",
+@dataclass(frozen=True)
+class RobotSpec:
+    """一个钉钉自定义机器人。
+
+    ``secret`` / ``keyword`` 是**每个机器人自己**的安全设置 —— 多个机器人
+    未必用同一套，所以不能只留一个全局值。
+    """
+
+    url: str
+    secret: str = ""
+    keyword: str = ""
+
+    def as_line(self) -> str:
+        """还原成配置里的单行写法，用于写回 config.yaml。"""
+        return ROBOT_SEP.join((self.url, self.secret, self.keyword)).rstrip(
+            ROBOT_SEP + " ")
+
+    def label(self) -> str:
+        """界面 / 日志里用的短标签（地址已脱敏）。"""
+        tail = []
+        if self.secret:
+            tail.append("已加签")
+        if self.keyword:
+            tail.append(f"关键词「{self.keyword}」")
+        return mask_webhook(self.url) + (f"（{'，'.join(tail)}）" if tail else "")
+
+
+def parse_robot_line(line: str, default_secret: str = "",
+                     default_keyword: str = "") -> RobotSpec | None:
+    """一行 -> 一个 :class:`RobotSpec`；空行 / 注释 / 没有地址时返回 None。
+
+    格式：``地址`` / ``地址 | 加签密钥`` / ``地址 | 加签密钥 | 关键词``。
+    自己那段留空时回落到 ``default_secret`` / ``default_keyword``
+    （即配置里的全局 ``notify.secret`` / ``notify.keyword``），
+    这样「一个 webhook + 一个 secret」的老配置不改也能继续用。
+    """
+    line = (line or "").strip()
+    if not line or line.startswith("#"):
+        return None
+    parts = [p.strip() for p in line.split(ROBOT_SEP)]
+    url = parts[0]
+    if not url:
+        return None
+    secret = parts[1] if len(parts) > 1 and parts[1] else default_secret
+    keyword = parts[2] if len(parts) > 2 and parts[2] else default_keyword
+    return RobotSpec(url=url, secret=(secret or "").strip(),
+                     keyword=(keyword or "").strip())
+
+
+def _as_line(item) -> str:
+    """``webhooks`` 列表项可以是字符串，也可以是 ``{url, secret, keyword}`` 映射。"""
+    if isinstance(item, dict):
+        url = str(item.get("url") or item.get("webhook") or "").strip()
+        if not url:
+            return ""
+        return ROBOT_SEP.join((url, str(item.get("secret") or ""),
+                               str(item.get("keyword") or "")))
+    return str(item or "")
+
+
+def robots_from_lines(lines, default_secret: str = "",
+                      default_keyword: str = "") -> list[RobotSpec]:
+    """把若干行摊平成机器人清单：按地址去重、保持书写顺序。
+
+    每个列表项自身还可以再用换行 / 分号装多个地址 —— 老配置里
+    ``notify.webhook`` 是一个字符串，用分号塞多个也能被正确拆开。
+    """
+    out: list[RobotSpec] = []
+    seen: set[str] = set()
+    for raw in lines or []:
+        for piece in _ROBOT_SPLIT_RE.split(_as_line(raw)):
+            spec = parse_robot_line(piece, default_secret, default_keyword)
+            if spec is None or spec.url in seen:
+                continue
+            seen.add(spec.url)
+            out.append(spec)
+    return out
+
+
+def collect_robots(ncfg) -> list[RobotSpec]:
+    """从 :class:`NotifyConfig` 取出全部机器人。
+
+    优先用新的 ``webhooks`` 列表；它为空时回落到老的单个 ``webhook``。
+    两条路都空 -> 返回空列表（调用方据此判定「没配」）。
+    """
+    if ncfg is None:
+        return []
+    d_secret = str(getattr(ncfg, "secret", "") or "").strip()
+    d_keyword = str(getattr(ncfg, "keyword", "") or "").strip()
+    items = list(getattr(ncfg, "webhooks", None) or [])
+    if items:
+        return robots_from_lines(items, d_secret, d_keyword)
+    return robots_from_lines([getattr(ncfg, "webhook", "") or ""],
+                             d_secret, d_keyword)
+
+
+class DingTalkNotifier:
+    """钉钉机器人发送端。
+
+    支持**同时配置多个机器人**：一条通知会往每一个都发一份。
+    线程安全，失败不抛异常（只返回 False）。
+    """
+
+    def __init__(self, webhook: str = "", secret: str = "", keyword: str = "",
                  at_mobiles: list[str] | None = None, at_all: bool = False,
                  timeout: float = 6.0, cooldown: float = 300.0,
-                 retries: int = 2, opener=None):
-        self.webhook = (webhook or "").strip()
-        self.secret = (secret or "").strip()
-        self.keyword = (keyword or "").strip()
+                 retries: int = 2, opener=None,
+                 robots: list[RobotSpec] | None = None):
+        # robots 是「已解析好」的清单（from_config 用）；
+        # 否则按老的单个 webhook 参数解析 —— 单地址调用方无需改动。
+        if robots is not None:
+            self.robots = list(robots)
+        else:
+            src = [webhook] if (webhook or "").strip() else []
+            self.robots = robots_from_lines(src, secret, keyword)
+        # 兼容旧属性：老代码 / 老测试还在读 notifier.webhook / .secret / .keyword，
+        # 语义是「第一个机器人」。
+        first = self.robots[0] if self.robots else None
+        self.webhook = first.url if first else ""
+        self.secret = first.secret if first else (secret or "").strip()
+        self.keyword = first.keyword if first else (keyword or "").strip()
         self.at_mobiles = [str(m).strip() for m in (at_mobiles or []) if str(m).strip()]
         self.at_all = bool(at_all)
         self.timeout = float(timeout)
@@ -165,17 +290,15 @@ class DingTalkNotifier:
 
     @classmethod
     def from_config(cls, ncfg) -> "DingTalkNotifier | None":
-        """按配置构造；未启用或缺 webhook 时返回 None（调用方据此跳过）。"""
+        """按配置构造；未启用或一个地址都没填时返回 None（调用方据此跳过）。"""
         if ncfg is None or not getattr(ncfg, "enabled", False):
             return None
-        url = (getattr(ncfg, "webhook", "") or "").strip()
-        if not url:
+        robots = collect_robots(ncfg)
+        if not robots:
             log.warning("已开启钉钉通知，但没有填 webhook，通知功能将不生效")
             return None
         return cls(
-            webhook=url,
-            secret=getattr(ncfg, "secret", ""),
-            keyword=getattr(ncfg, "keyword", ""),
+            robots=robots,
             at_mobiles=list(getattr(ncfg, "at_mobiles", []) or []),
             at_all=bool(getattr(ncfg, "at_all", False)),
             cooldown=float(getattr(ncfg, "cooldown", 300.0) or 300.0),
@@ -183,14 +306,17 @@ class DingTalkNotifier:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.webhook)
+        return bool(self.robots)
 
     def describe(self) -> str:
         bits = ["钉钉通知已启用"]
-        if self.keyword:
-            bits.append(f"关键词「{self.keyword}」")
-        if self.secret:
+        if len(self.robots) > 1:
+            bits.append(f"{len(self.robots)} 个机器人")
+        if self.robots and all(r.secret for r in self.robots):
             bits.append("已加签")
+        kws = {r.keyword for r in self.robots if r.keyword}
+        if len(kws) == 1:
+            bits.append(f"关键词「{kws.pop()}」")
         if self.at_all:
             bits.append("@所有人")
         elif self.at_mobiles:
@@ -199,32 +325,48 @@ class DingTalkNotifier:
 
     # -------------------------------------------------- 请求构造
 
-    def _signed_url(self, now_ms: int | None = None) -> str:
-        """加签：timestamp + "\\n" + secret 做 HMAC-SHA256，再 urlencode。"""
-        if not self.secret:
-            return self.webhook
+    def _signed_url(self, now_ms: int | None = None,
+                    robot: RobotSpec | None = None) -> str:
+        """加签：timestamp + "\\n" + secret 做 HMAC-SHA256，再 urlencode。
+
+        ``robot`` 省略时用第一个机器人（保持老调用方与单测的用法）。
+        """
+        rb = robot or (self.robots[0] if self.robots else None)
+        url = rb.url if rb else self.webhook
+        secret = rb.secret if rb else self.secret
+        if not secret:
+            return url
         ts = str(now_ms if now_ms is not None else int(time.time() * 1000))
-        string_to_sign = f"{ts}\n{self.secret}"
-        digest = hmac.new(self.secret.encode("utf-8"),
+        string_to_sign = f"{ts}\n{secret}"
+        digest = hmac.new(secret.encode("utf-8"),
                           string_to_sign.encode("utf-8"),
                           hashlib.sha256).digest()
         sign = urllib.parse.quote_plus(base64.b64encode(digest))
-        sep = "&" if "?" in self.webhook else "?"
-        return f"{self.webhook}{sep}timestamp={ts}&sign={sign}"
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}timestamp={ts}&sign={sign}"
 
-    def _finalize(self, content: str) -> str:
-        """关键词安全设置下，内容里必须出现该词 —— 缺了就补一行，别让消息白丢。"""
-        if self.keyword and self.keyword not in content:
-            return f"{content}\n\n[{self.keyword}]"
+    def _finalize(self, content: str, robot: RobotSpec | None = None) -> str:
+        """关键词安全设置下，内容里必须出现该词 —— 缺了就补一行，别让消息白丢。
+
+        关键词是**每个机器人各自**配的，所以要按机器人补齐。
+        """
+        kw = (robot.keyword if robot else self.keyword)
+        if kw and kw not in content:
+            return f"{content}\n\n[{kw}]"
         return content
 
     def _at_payload(self) -> dict:
         return {"atMobiles": list(self.at_mobiles), "isAtAll": bool(self.at_all)}
 
-    def _post(self, payload: dict) -> tuple[bool, str]:
-        """真正发出去。返回 ``(成功, 说明)``，任何异常都吞掉只记日志。"""
+    def _post_one(self, robot: RobotSpec, factory) -> tuple[bool, str]:
+        """发给**一个**机器人。``factory(robot) -> payload`` 因为关键词要逐个补。
+
+        返回 ``(成功, 说明)``，任何异常都吞掉只记日志。
+        """
+        payload = factory(robot)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        url = self._signed_url()
+        url = self._signed_url(robot=robot)
+        who = mask_webhook(robot.url)
         last = "未知错误"
         for attempt in range(self.retries + 1):
             req = urllib.request.Request(
@@ -246,38 +388,67 @@ class DingTalkNotifier:
                 else:
                     code = int(data.get("errcode", -1))
                     if code == 0:
-                        self.last_error = ""
                         return True, "ok"
                     hint = ERR_HINTS.get(code, "")
                     last = f"errcode={code} {data.get('errmsg', '')}" + (
                         f"（{hint}）" if hint else "")
                     # 业务错误重试没用，直接返回
-                    self.last_error = last
-                    log.warning("钉钉通知发送失败：%s", last)
+                    log.warning("钉钉通知发送失败（%s）：%s", who, last)
                     return False, last
             if attempt < self.retries:
                 time.sleep(1.5 * (attempt + 1))
-        self.last_error = last
-        log.warning("钉钉通知发送失败（已重试 %d 次）：%s", self.retries, last)
+        log.warning("钉钉通知发送失败（%s，已重试 %d 次）：%s", who, self.retries, last)
         return False, last
+
+    def _broadcast(self, factory) -> tuple[bool, str]:
+        """往**每个**机器人都发一份。
+
+        判定口径：只要有任意一个发成功就算成功（返回 True）——
+        否则某个机器人配错/被移出群，会让 `/钉钉通知/` 的冷却机制一直不生效，
+        健康的那几个会被同一类告警反复刷。失败的那些逐条记 WARNING。
+        """
+        if not self.robots:
+            return False, "没有配置任何机器人 webhook 地址"
+        oks, fails = 0, []
+        for rb in self.robots:
+            ok, why = self._post_one(rb, factory)
+            if ok:
+                oks += 1
+            else:
+                fails.append(f"{mask_webhook(rb.url)} → {why}")
+        if not fails:
+            self.last_error = ""
+            return True, "ok" if oks == 1 else f"{oks} 个机器人全部发送成功"
+        self.last_error = "；".join(fails)
+        if oks:
+            log.warning("钉钉通知部分失败：%s", self.last_error)
+            return True, f"{oks}/{len(self.robots)} 个机器人成功（{self.last_error}）"
+        log.warning("钉钉通知全部失败：%s", self.last_error)
+        return False, self.last_error
 
     # -------------------------------------------------- 对外接口
 
     def send_text(self, content: str, at: bool = False) -> tuple[bool, str]:
-        payload = {"msgtype": "text",
-                   "text": {"content": self._finalize(content)}}
-        if at:
-            payload["at"] = self._at_payload()
-        return self._post(payload)
+        def build(rb: RobotSpec) -> dict:
+            payload = {"msgtype": "text",
+                       "text": {"content": self._finalize(content, rb)}}
+            if at:
+                payload["at"] = self._at_payload()
+            return payload
+
+        return self._broadcast(build)
 
     def send_markdown(self, title: str, text: str, at: bool = False) -> tuple[bool, str]:
         # markdown 的标题也在「关键词」的检查范围内，所以两边都要过一遍
-        payload = {"msgtype": "markdown",
-                   "markdown": {"title": self._finalize(title),
-                                "text": self._finalize(text)}}
-        if at:
-            payload["at"] = self._at_payload()
-        return self._post(payload)
+        def build(rb: RobotSpec) -> dict:
+            payload = {"msgtype": "markdown",
+                       "markdown": {"title": self._finalize(title, rb),
+                                    "text": self._finalize(text, rb)}}
+            if at:
+                payload["at"] = self._at_payload()
+            return payload
+
+        return self._broadcast(build)
 
     def alert(self, key: str, content: str, at: bool = True) -> bool:
         """带冷却去重的告警。

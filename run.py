@@ -263,10 +263,13 @@ def main() -> int:
                       "或把 config.yaml 的 notify.enabled 改成 true。")
             else:
                 print("钉钉通知已开启，但没有填 webhook，无法发送。")
-                print("请把自定义机器人的 webhook 地址填到 notify.webhook；"
+                print("请把自定义机器人的 webhook 地址填到 notify.webhooks"
+                      "（一个机器人一项）或 notify.webhook；"
                       "也可以用环境变量 DINGTALK_ROBOT_WEBHOOK 下发。")
             return 1
-        print(f"webhook：{mask_webhook(cfg.notify.webhook)}")
+        for i, rb in enumerate(nt.robots, 1):
+            print(f"webhook {i}/{len(nt.robots)}：{mask_webhook(rb.url)}"
+                  + ("（已加签）" if rb.secret else ""))
         print(f"通道状态：{nt.describe()}")
         if args.notify_test:
             ok, detail = nt.test()

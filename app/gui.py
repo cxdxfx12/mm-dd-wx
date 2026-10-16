@@ -37,6 +37,19 @@ for _p in (str(APP_DIR), str(BASE_DIR)):
         sys.path.insert(0, _p)
 
 
+def _notify_robots(n: dict) -> list[str]:
+    """配置段 -> 已填地址的机器人清单（只用于界面上的「配了没」判断）。
+
+    真正的解析与发送在 bridge/notify.py，这里刻意做得宽松：
+    ``webhooks`` 列表（新的多机器人写法）优先，为空时回落到单个 ``webhook``。
+    """
+    items = [x for x in (n.get("webhooks") or []) if str(x or "").strip()]
+    if items:
+        return items
+    one = str(n.get("webhook") or "").strip()
+    return [one] if one else []
+
+
 def _ensure_tkinter():
     """当前解释器不带 tkinter 时，找一个带的并重启自己（自愈）。"""
     try:
@@ -574,10 +587,11 @@ class App(tk.Tk):
         mode = "试运行（不真实发送）" if w.get("dry_run") else "正式发送"
         if not n.get("enabled"):
             notify = "未启用"
-        elif not (n.get("webhook") or "").strip():
+        elif not _notify_robots(n):
             notify = "缺 webhook"
         else:
-            notify = "已启用"
+            cnt = len(_notify_robots(n))
+            notify = "已启用" if cnt == 1 else f"已启用（{cnt} 个机器人）"
         vals = {
             "监控会话": chats,
             "转发目标": targets,
@@ -910,7 +924,7 @@ class App(tk.Tk):
         这条通道与「钉钉 → 微信」的转发完全无关：它只负责把话送到钉钉群。
         """
         nc = self.cfg.get("notify") or {}
-        if not (nc.get("webhook") or "").strip():
+        if not _notify_robots(nc):
             messagebox.showwarning(
                 "钉钉通知还没配好",
                 "请先到「工具 → 设置中心 → 钉钉通知」里填入自定义机器人的 webhook。",

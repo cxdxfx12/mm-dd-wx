@@ -84,7 +84,7 @@ python app\setup.py --quiet     # 静默安装（部署脚本用）
 | **时间范围** | 不限时间 / 只转发当天消息（默认）/ 只在指定时段转发（`08:00-18:00`，支持跨零点 `22:00-06:00`） |
 | **采集与投递** | 试运行开关、钉钉轮询间隔、微信发送间隔、锚点防护、标题护栏与阈值 |
 | **消息格式** | 转发文案模板（`{company} {sender} {chat} {time} {content} {type}`），带实时预览 |
-| **钉钉通知** | 自定义机器人 webhook、加签 / 关键词、告警场景与阈值、定时运行报告，可**当场发自定义消息** |
+| **钉钉通知** | 自定义机器人 webhook（**可加多个**，每行一个、各带自己的加签/关键词）、告警场景与阈值、定时运行报告，可**当场发自定义消息** |
 | **其他** | 开机自动启动、解释器信息、重新检测环境、打开数据/日志目录 |
 
 保存时自动把原配置备份到 `data/backup/`；改动**按行写入** `config.yaml`，
@@ -118,6 +118,31 @@ python app\setup.py --quiet     # 静默安装（部署脚本用）
 
 同一类告警有**冷却时间**（默认 300 秒）—— 窗口被切走时每轮 OCR 都会报错，
 不去重会瞬间把群刷爆。发送失败会释放冷却，下一轮还能再试。
+
+#### 多个机器人
+
+一个群里常常不止一个机器人（每个上游系统各挂一个），所以通知支持**配置多个
+webhook 地址**：设置中心「钉钉通知」页签里点「＋ 添加一个机器人」即可，一行一个。
+每个机器人有**自己**的加签密钥 / 自定义关键词（它们是逐机器人配置的，不能共用）。
+
+一条通知会发给每一个机器人；某个机器人配错或被移出群，**不影响其它机器人**，
+只要有一个发成功，告警的冷却机制就照常生效（否则坏掉的那个会让健康的
+机器人被同一类告警反复刷）。
+
+写进 `config.yaml` 是 `notify.webhooks` 列表，一行一个机器人，每项可带自己的安全设置：
+
+```yaml
+notify:
+  webhooks:
+    - "https://oapi.dingtalk.com/robot/send?access_token=第一个"
+    - "https://oapi.dingtalk.com/robot/send?access_token=第二个 | SECxxxx | 转发桥"
+```
+
+老的单值 `notify.webhook` 仍然认（也允许用分号塞多个），升级后不用改配置；
+两个都配了以 `webhooks` 为准。
+
+> 注意：多个 webhook 只是把**同一条通知**发到多个群，它依旧**收不到**群消息
+> —— 钉钉取数仍然是 OCR 截屏，别指望多加几个地址就能替代采集。
 
 ```bash
 python run.py --notify-test      # 发一条测试消息，验证 webhook / 关键词 / 加签
@@ -158,7 +183,8 @@ ddwx-bridge/
 │   ├── router.py         规则路由（公司、会话、关键词、消息类型）
 │   ├── formatter.py      模板渲染 + 批量摘要
 │   ├── service.py        编排：收 → 去重 → 路由 → 格式化 → 限流 → 投递
-│   ├── notify.py         钉钉机器人通知：故障告警 + 运行报告（单向，只发不收）
+│   ├── notify.py         钉钉机器人通知：故障告警 + 运行报告（单向，只发不收，
+│   │                     支持同时配置多个机器人）
 │   ├── sources/          采集端
 │   │   ├── dingtalk_ocr.py      OCR 截屏（当前使用）
 │   │   ├── dingtalk_stream.py   Stream 长连接（需凭证）
@@ -183,11 +209,13 @@ ddwx-bridge/
 │   ├── probe_wechat_state.py    微信窗口状态探针（最小化/托盘/标题回读）
 │   ├── probe_wechat_switch.py   切会话诊断（可加 --minimize 复现最小化场景）
 │   ├── test_settings_layout.py  设置中心布局探针（断言保存按钮可见）
+│   ├── test_settings_save.py    设置保存往返探针（老配置缺新键也能存上）
 │   ├── dump_dingtalk_tree.py    导出钉钉控件树
 │   ├── dingtalk_tree.txt        实测证据：钉钉消息区为空
 │   └── wechat_tree.txt          实测证据：微信 4.x 控件树
-├── tests/                254 项离线单元测试（核心链路 / OCR 解析 / 锚点与贴底恢复 /
-│                         跨天 / 一对多 / 解释器探测 / 钉钉通知 / 微信投递端护栏）
+├── tests/                320 项离线单元测试（核心链路 / OCR 解析 / 锚点与贴底恢复 /
+│                         跨天 / 一对多 / 解释器探测 / 钉钉通知与多机器人 / 微信投递端护栏 /
+│                         配置「改或插」写入）
 ├── run.py                入口
 ├── probe_dingtalk.py     钉钉侧能力探针
 ├── config.example.yaml   配置样板
@@ -284,7 +312,7 @@ python run.py --live                     # 6. 正式运行
 | `python tools/probe_anchor_stability.py` | 逐帧统计锚点存活/指纹抖动（定位漏转） |
 | `python tools/probe_scroll_scale.py` | 实测「滚动条数值 == 像素位移」（验证 Δ 公式） |
 | `python run.py --export out.csv` | 导出消息为 CSV（UTF-8-BOM，Excel 可直接打开） |
-| `python run.py --notify-test` | 发一条钉钉测试消息，验证 webhook / 关键词 / 加签 |
+| `python run.py --notify-test` | 发一条钉钉测试消息，验证 webhook / 关键词 / 加签（多机器人会逐个发） |
 | `python run.py --notify-report` | 把累计统计发到钉钉群 |
 | `python run.py --notify-say="文本"` | 把自定义内容发到钉钉群（等同界面上那个输入框） |
 | `python probe_dingtalk.py` | 探测钉钉侧该走哪条路线 |

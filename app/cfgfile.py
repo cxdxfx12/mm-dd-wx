@@ -182,6 +182,8 @@ def ensure_section(path: str | Path, section: str, block: str) -> bool:
 def set_scalar(path: str | Path, section: str, key: str, value) -> bool:
     """替换 ``section`` 下 ``key`` 的标量值，保留行内其它内容与全部注释。"""
     p = Path(path)
+    if not p.is_file():
+        return False
     lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
     sr = _section_range(lines, section)
     if sr is None:
@@ -214,6 +216,8 @@ def set_scalar(path: str | Path, section: str, key: str, value) -> bool:
 def set_list(path: str | Path, section: str, key: str, items: list[str]) -> bool:
     """整体替换一个列表键（写成块列表，便于人工继续编辑）。"""
     p = Path(path)
+    if not p.is_file():
+        return False
     lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
     sr = _section_range(lines, section)
     if sr is None:
@@ -232,6 +236,97 @@ def set_list(path: str | Path, section: str, key: str, items: list[str]) -> bool
     lines[i:kr[1]] = new
     _write(p, lines)
     return True
+
+
+def _content_end(lines: list[str], sr: tuple[int, int]) -> int:
+    """段内「有效内容」的结束行号。
+
+    段区间末尾往往跟若干空行 / 注释，那些是**下一个段**的说明，不该被
+    新键插到它们后面去（否则新键看起来像挂在下一段下面）。
+    """
+    end = sr[1]
+    while end > sr[0] + 1:
+        s = lines[end - 1].strip()
+        if s and not s.startswith("#"):
+            break
+        end -= 1
+    return end
+
+
+def _section_pad(lines: list[str], sr: tuple[int, int]) -> str:
+    """这一段里内容行用的缩进（取第一个非注释内容行；没有就按 2 空格）。"""
+    for i in range(sr[0] + 1, sr[1]):
+        s = lines[i].strip()
+        if s and not s.startswith("#"):
+            return " " * max(2, _indent(lines[i]))
+    return "  "
+
+
+def _insert_at(lines: list[str], sr: tuple[int, int], after_key: str) -> int:
+    """新键该插到哪一行：优先紧跟着 ``after_key`` 的块，否则放段内容末尾。"""
+    if after_key:
+        kr = _key_range(lines, sr[0], sr[1], after_key)
+        if kr is not None:
+            return kr[1]
+    return _content_end(lines, sr)
+
+
+def _ensure_key(path: str | Path, section: str, key: str, make_block,
+                after_key: str = "") -> bool:
+    """键不存在时就地插入 ``make_block(pad)`` 产出的若干行；存在则不动。
+
+    统一给 :func:`ensure_scalar` / :func:`ensure_list_key` 用。
+    返回 False 的两种情形：段不存在、键已经在了（调用方该走 set_* 去改值）。
+    """
+    p = Path(path)
+    if not p.is_file():
+        return False
+    lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+    sr = _section_range(lines, section)
+    if sr is None or _key_range(lines, sr[0], sr[1], key) is not None:
+        return False
+    at = _insert_at(lines, sr, after_key)
+    lines[at:at] = make_block(_section_pad(lines, sr))
+    _write(p, lines)
+    return True
+
+
+def ensure_scalar(path: str | Path, section: str, key: str, value,
+                  after_key: str = "") -> bool:
+    """段里**没有**这个键时插入 ``key: value``；有就返回 False（用 set_scalar 改）。
+
+    为什么需要它：老用户的 config.yaml 是旧版本生成的，新版本加的键
+    （比如 ``dingtalk.time_window``）根本不在里面，``set_scalar`` 只会改
+    已存在的键，一遇到就报「没能写入」—— 设置整个存不下来。
+    """
+    return _ensure_key(path, section, key,
+                       lambda pad: [f"{pad}{key}: {_fmt(value)}\n"],
+                       after_key=after_key)
+
+
+def set_or_insert_scalar(path: str | Path, section: str, key: str, value,
+                         after_key: str = "") -> bool:
+    """改标量；键不存在就插入。设置中心保存配置统一走这个。"""
+    return (set_scalar(path, section, key, value)
+            or ensure_scalar(path, section, key, value, after_key=after_key))
+
+
+def ensure_list_key(path: str | Path, section: str, key: str,
+                    items: list[str], after_key: str = "") -> bool:
+    """写入一个列表键；键不存在时就地插入，存在则整体替换。
+
+    插入位置优先放在 ``after_key`` 所在的块之后，读起来才顺。
+    """
+    if set_list(path, section, key, items):
+        return True
+
+    def make(pad: str) -> list[str]:
+        out = [f"{pad}{key}:" + (" []" if not items else "") + "\n"]
+        for it in items:
+            out.append(f"{pad}  - {_fmt(it)}\n")
+        return out
+
+    return _ensure_key(path, section, key, make, after_key=after_key)
 
 
 ROUTES_HEADER = (
