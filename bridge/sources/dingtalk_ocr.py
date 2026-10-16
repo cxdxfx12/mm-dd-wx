@@ -34,7 +34,6 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import difflib
-import hashlib
 import logging
 import re
 import sys
@@ -45,6 +44,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 
+from ..fingerprint import norm_sender, unit_fp        # noqa: F401  （对外仍可导入）
 from ..models import Message
 from .base import Source, infer_company
 
@@ -419,35 +419,8 @@ def group_units(lines: list[dict], area_w: int) -> list[dict]:
     return out
 
 
-_SENDER_SPACE_RE = re.compile(r"\s+")
-_ROBOT_SUFFIX = "机器人"
-
-
-def norm_sender(sender: str) -> str:
-    """发送者归一化，**只用于指纹与相似度判定**，不改变入库/转发时的展示。
-
-    两处实测过的读法抖动，都会把同一条消息算成两条：
-      · 机器人昵称的后缀时有时无 —— 同一帧消息分别读成
-        「签收跟单专员」和「签收跟单专员 机器人」，正文 md5 完全相同；
-      · 昵称被 OCR 拆成两个文本框，拼起来时中间多一个空格。
-
-    这里统一去掉空白与结尾的「机器人」，让它们对上。刻意**不**去掉
-    更靠前的字，避免把「签收跟单专员」和「拦截跟单专员」这类不同机器人
-    混成同一个。
-    """
-    s = _SENDER_SPACE_RE.sub("", sender or "")
-    return s[:-len(_ROBOT_SUFFIX)] if s.endswith(_ROBOT_SUFFIX) else s
-
-
-def unit_fp(unit: dict) -> str:
-    """消息单元指纹（发送者 + 内容），用作增量差分、锚点与去重的稳定标识。
-
-    发送者先过一遍 :func:`norm_sender` —— 否则机器人昵称多读/少读一个
-    「机器人」后缀就会算出另一个指纹，同一条消息被当成两条重复采、重复转发。
-    """
-    return hashlib.md5(
-        f"{norm_sender(unit['sender'])}|{unit['content']}".encode("utf-8")
-    ).hexdigest()
+# norm_sender / unit_fp 已抽到 bridge/fingerprint.py —— 安卓网关要用同一份实现，
+# 两边各写一份必然漂移（见该模块的说明）。这里保持导入，历史调用点与测试不受影响。
 
 
 def at_bottom(scroll: tuple[float, float] | None, tol: float = AT_BOTTOM_TOL) -> bool:

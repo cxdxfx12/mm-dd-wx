@@ -1,0 +1,4 @@
+// 探测工程不需要任何第三方依赖，纯 Android 框架 API。
+plugins {
+    id 'com.android.application' version '8.1.4' apply false
+}

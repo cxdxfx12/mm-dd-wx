@@ -20,4 +20,8 @@ def build_source(cfg: Config) -> Source:
         from .dingtalk_ocr import DingTalkOCRSource
         return DingTalkOCRSource(cfg)
 
-    raise ValueError(f"不支持的采集模式：{mode}（可选 stream / ui / ocr）")
+    if mode == "android":
+        from .android_gateway import AndroidGatewaySource
+        return AndroidGatewaySource(cfg)
+
+    raise ValueError(f"不支持的采集模式：{mode}（可选 stream / ui / ocr / android）")

@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="钉钉无障碍探测"
+            android:textSize="20sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="喵喵钉钉-微信消息转发桥 · 阶段 0 可行性探测"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="…"
+            android:textIsSelectable="true"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/btn_settings"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="打开系统「无障碍」设置" />
+
+        <Button
+            android:id="@+id/btn_grab"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="立即抓取一次" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="怎么看结果：\n\n1. 把 latest.xml 拉回电脑：\nadb pull /sdcard/Android/data/com.hbdxm.ddprobe/files/ddprobe/latest.xml .\n\n2. 跑分析器，它会直接给出判定：\npython tools/android_probe/analyze_uiautomator.py latest.xml\n\n3. 想自己看原始内容：dump_*.txt 是给人读的版本；也可以\nadb logcat -s DDPROBE\n\n判定要点只有两个：能不能读到消息正文，能不能按「一个子节点 = 一条消息」分组。"
+            android:textSize="13sp" />
+    </LinearLayout>
+</ScrollView>

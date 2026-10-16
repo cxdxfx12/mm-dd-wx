@@ -19,12 +19,15 @@ class StorageConfig:
 
 @dataclass
 class DingTalkConfig:
-    mode: str = "stream"                    # stream | ui | ocr | probe
+    mode: str = "stream"                    # stream | ui | ocr | android
     client_id: str = ""
     client_secret: str = ""
     robot_code: str = ""
     companies: list[str] = field(default_factory=list)
     chat_names: list[str] = field(default_factory=list)
+    gateway_host: str = "0.0.0.0"           # android 模式：监听地址
+    gateway_port: int = 8765                # android 模式：监听端口
+    gateway_token: str = ""                 # android 模式：必填（见 android_gateway 模块说明）
     ui_poll_interval: float = 5.0           # ui / ocr 模式的轮询间隔（秒）
     title_check: bool = True                # OCR 模式：每帧校验窗口标题，防转发错群
     title_ratio: float = 0.55               # 标题模糊匹配阈值（OCR 对标题有误识，需容错）

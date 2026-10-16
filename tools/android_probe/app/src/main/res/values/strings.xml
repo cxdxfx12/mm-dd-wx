@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">钉钉无障碍探测</string>
+    <string name="service_name">钉钉消息探测</string>
+    <string name="service_desc">只做探测：读取钉钉窗口里的文字并保存到本机文件，不做任何点击、输入或修改。用于确认钉钉安卓客户端能否被无障碍读取。</string>
+</resources>
