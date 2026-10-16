@@ -46,6 +46,42 @@ CREATE INDEX IF NOT EXISTS idx_delivery_uid ON deliveries(uid);
 """
 
 
+def _parse_dt(text: str) -> datetime | None:
+    """宽容解析库里的时间字符串 —— 解不出来就返回 None，不抛异常。
+
+    库里存的是 ``%Y-%m-%d %H:%M:%S``，但手工改过库、或早期版本留下的
+    短格式不该让整条补发流程崩掉：时间只影响渲染出来的时间占位，
+    内容本身照发。
+    """
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(text), fmt)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def row_to_message(row) -> Message:
+    """把库里的一行还原成 Message —— 「补发最近 N 条」需要完整的消息对象。
+
+    刻意保留 `raw_id`：还原出来的 `uid` 与当初入库时一模一样，
+    补发的投递记录才能正确挂回同一条消息上。
+    """
+    return Message(
+        source=row["source"] or "dingtalk",
+        chat_id=row["chat_id"] or "",
+        chat_name=row["chat_name"] or "",
+        sender_id=row["sender_id"] or "",
+        sender_name=row["sender_name"] or "",
+        company=row["company"] or "",
+        content=row["content"] or "",
+        msg_type=row["msg_type"] or "text",
+        media_path=row["media_path"] or "",
+        msg_time=_parse_dt(row["msg_time"]),
+        raw_id=row["raw_id"] or "",
+    )
+
+
 class Storage:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -118,6 +154,39 @@ class Storage:
         params.append(int(limit))
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
+
+    def recent(
+        self,
+        limit: int = 3,
+        chat_name: str | None = None,
+        only_failed: bool = False,
+    ) -> list[sqlite3.Row]:
+        """取最近入库的 N 条消息，**按发生顺序（旧 → 新）返回**。
+
+        与 `query()` 的两点差别，都是「补发」场景需要的：
+
+        1. 排序用 ``msg_time`` + ``rowid``，取完再翻正 —— 补发必须按当初
+           发生的顺序发，倒着发会让群里的人读反；
+        2. ``only_failed=True`` 只挑「最近一次投递状态是 fail」的消息。
+
+        这里用子查询按 id 倒序取最后一条投递记录，而不是 ``EXISTS(... 'fail')``：
+        失败后已经重发成功的消息不该再算成待补发，否则每点一次都会重发一遍。
+        """
+        where, params = [], []
+        if chat_name:
+            where.append("m.chat_name = ?")
+            params.append(chat_name)
+        if only_failed:
+            where.append("(SELECT d.status FROM deliveries d WHERE d.uid = m.uid"
+                         " ORDER BY d.id DESC LIMIT 1) = 'fail'")
+        sql = "SELECT m.* FROM messages m"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY m.msg_time DESC, m.rowid DESC LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return list(reversed(rows))
 
     def stats(self) -> dict:
         with self._lock:

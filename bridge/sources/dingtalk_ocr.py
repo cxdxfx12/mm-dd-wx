@@ -1153,3 +1153,45 @@ class DingTalkOCRSource(Source):
 
     def __repr__(self) -> str:
         return f"<Source {self.name} interval={self.interval}s>"
+
+
+def grab_frame_units(cfg) -> tuple[list[dict] | None, dict]:
+    """「抓一帧 → 标题护栏 → 解析消息单元」，供各手动工具复用。
+
+    返回 ``(units, info)``：
+
+    * ``units`` —— `group_units` 的输出，**按屏幕顺序**（最后一个即最新一条）；
+      自检不通过、截帧失败或护栏拦截时为 ``None``；
+    * ``info``  —— 诊断信息：``ok`` / ``why`` / ``title`` / ``passed`` /
+      ``ratio`` / ``matched``。
+
+    标题护栏（「窗口不是配置里的目标群就拒绝转发」）刻意放在这里而不是各调用方：
+
+    **手动转发没有「新消息」这层保护，一旦窗口切错群，会把别的群的对话原样发出去。**
+    护栏必须与抓帧绑死，不能靠每个工具自己记得加。
+    """
+    src = DingTalkOCRSource(cfg)
+    blank = {"title": "", "passed": False, "ratio": 0.0, "matched": "", "detail": ""}
+
+    ok, detail = src.check()
+    if not ok:
+        return None, {**blank, "ok": False, "detail": detail,
+                      "why": f"采集端自检未通过：{detail}"}
+
+    frame = src._grab_frame()
+    if frame is None:
+        return None, {**blank, "ok": False, "detail": detail,
+                      "why": "截帧失败（钉钉未启动 / 窗口最小化 / 定位不到消息区）"}
+
+    title = " / ".join(frame["title"] or [])
+    passed, ratio, matched = True, 1.0, ""
+    if src.title_check:
+        passed, ratio, matched = src._title_matches(frame["title"])
+    info = {"ok": passed, "detail": detail,
+            "why": "" if passed else "当前钉钉窗口不是配置里的目标会话，已拒绝转发",
+            "title": title, "passed": passed, "ratio": ratio, "matched": matched}
+    if not passed:
+        return None, info
+
+    units = group_units(merge_lines(frame["blocks"]), frame["area_w"])
+    return units, info

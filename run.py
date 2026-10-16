@@ -113,13 +113,14 @@ MENU_ITEMS: list[tuple[str, str, str, list[str]]] = [
     ("2", "交互测试", "手动输入消息，实时看过滤与转发效果", ["run.py", "--interactive"]),
     ("3", "钉钉OCR预览", "截一帧看钉钉群消息识别效果（只读）", ["tools/test_dingtalk_ocr.py"]),
     ("4", "转发一条", "抓一条钉钉消息，预览后确认发送到微信群", ["tools/forward_one.py"]),
-    ("5", "启动自检", "检查配置、微信连接与钉钉窗口", ["run.py", "--check"]),
-    ("6", "正式运行", "采集钉钉消息并投递微信（Ctrl+C 停止）", ["run.py", "--live"]),
-    ("7", "能力探针", "检测钉钉凭证、SDK 与本机客户端", ["probe_dingtalk.py"]),
-    ("8", "查看统计", "累计入库与投递情况", ["run.py", "--stats"]),
-    ("9", "导出消息", "把已入库消息导出为 CSV", ["run.py", "--export"]),
-    ("10", "通知测试", "往钉钉群发一条测试消息，验证 webhook", ["run.py", "--notify-test"]),
-    ("11", "发运行报告", "把累计统计发到钉钉群", ["run.py", "--notify-report"]),
+    ("5", "转发最近N条", "手动转最近 N 条，预览后确认发送", ["tools/forward_recent.py"]),
+    ("6", "启动自检", "检查配置、微信连接与钉钉窗口", ["run.py", "--check"]),
+    ("7", "正式运行", "采集钉钉消息并投递微信（Ctrl+C 停止）", ["run.py", "--live"]),
+    ("8", "能力探针", "检测钉钉凭证、SDK 与本机客户端", ["probe_dingtalk.py"]),
+    ("9", "查看统计", "累计入库与投递情况", ["run.py", "--stats"]),
+    ("10", "导出消息", "把已入库消息导出为 CSV", ["run.py", "--export"]),
+    ("11", "通知测试", "往钉钉群发一条测试消息，验证 webhook", ["run.py", "--notify-test"]),
+    ("12", "发运行报告", "把累计统计发到钉钉群", ["run.py", "--notify-report"]),
 ]
 
 
@@ -172,6 +173,15 @@ def run_menu(cfg_path: str) -> int:
                 print()
                 return 0
             argv.append(name or "messages.csv")
+        elif title == "转发最近N条":
+            # 用 --ask 让「预览 → 确认 → 发送」在同一个进程里完成：
+            # 分两次跑会在两次抓帧之间把新来的消息混进来。
+            try:
+                n = input("   转发最近几条（回车默认 3）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+            argv += ["-n", n or "3", "--ask"]
         argv += ["--config", cfg_path]
 
         print("-" * 64)

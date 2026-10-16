@@ -52,9 +52,15 @@ class BridgeService:
 
     # ---------- 核心处理 ----------
 
-    def handle(self, msg: Message) -> bool:
-        """处理一条消息。返回 True 表示确认为新消息（无论是否真的转发成功）。"""
-        if self.storage.is_duplicate(msg.uid):
+    def handle(self, msg: Message, force: bool = False) -> bool:
+        """处理一条消息。返回 True 表示确认为新消息（无论是否真的转发成功）。
+
+        ``force=True`` 跳过去重检查，给「手动转发最近 N 条」这类**人工触发**用：
+        用户既然明确点了发送，意思就是「这几条再发一次」，不该被去重挡成
+        「什么都没发生」。入库仍是 INSERT OR IGNORE，投递记录照记，
+        所以补发过的事实会留在库里，不会被下一次自动采集重复统计。
+        """
+        if not force and self.storage.is_duplicate(msg.uid):
             self.counter["duplicate"] += 1
             log.debug("重复消息，跳过：%s", msg.uid)
             return False

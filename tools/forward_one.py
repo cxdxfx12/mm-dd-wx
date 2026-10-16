@@ -40,33 +40,28 @@ TEST_BANNER = "【链路测试】本条为自动转发效果测试，可忽略�
 
 
 def grab_units(cfg):
-    """抓一帧并解析。返回 (units, 标题) 或 (None, None)。"""
-    from bridge.sources.dingtalk_ocr import (                   # 延迟导入：OCR 依赖较重
-        DingTalkOCRSource, merge_lines, group_units,
-    )
+    """抓一帧并解析。返回 (units, 标题) 或 (None, None)。
 
-    src = DingTalkOCRSource(cfg)
-    ok, detail = src.check()
-    print(f"[{'通过' if ok else '失败'}] 采集端自检：{detail}")
-    if not ok:
+    真正的抓帧与标题护栏在 `bridge.sources.dingtalk_ocr.grab_frame_units` 里
+    —— 那里是唯一的护栏实现，避免每个工具各写一份、漏加一个就发错群。
+    这里只负责把它的结论打印成人看的诊断输出。
+    """
+    from bridge.sources.dingtalk_ocr import grab_frame_units   # 延迟导入：OCR 依赖较重
+
+    units, info = grab_frame_units(cfg)
+    if not info["title"] and not info["passed"]:
+        print(f"[失败] {info['why']}")
         return None, None
 
-    frame = src._grab_frame()
-    if frame is None:
-        print("[失败] 截帧失败（钉钉未打开？窗口被最小化？）")
+    print(f"[{'通过' if info['passed'] else '不通过'}] 采集端自检：{info['detail']}")
+    print(f"[标题条] {info['title']!r}")
+    print(f"[护栏] 标题校验：{'通过' if info['passed'] else '不通过'}"
+          f"（相似度 {info['ratio']:.2f}，命中 {info['matched']!r}）")
+    if not info["passed"]:
+        print("[中止] 当前钉钉窗口不是目标会话，拒绝转发（防止发错群内容）。")
         return None, None
 
-    title = " / ".join(frame["title"] or []) or "(读不到标题)"
-    print(f"[标题条] {title!r}")
-    if src.title_check:
-        passed, ratio, matched = src._title_matches(frame["title"])
-        print(f"[护栏] 标题校验：{'通过' if passed else '不通过'}"
-              f"（相似度 {ratio:.2f}，命中 {matched!r}）")
-        if not passed:
-            print("[中止] 当前钉钉窗口不是目标会话，拒绝转发（防止发错群内容）。")
-            return None, None
-
-    return group_units(merge_lines(frame["blocks"]), frame["area_w"]), title
+    return units, info["title"]
 
 
 def main() -> int:

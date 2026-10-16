@@ -261,6 +261,8 @@ class App(tk.Tk):
         m_tool = tk.Menu(bar, tearoff=0)
         m_tool.add_command(label="钉钉窗口预览（只读）", command=self.dingtalk_preview)
         m_tool.add_command(label="转发一条（预览后确认）", command=self.forward_one_dialog)
+        m_tool.add_command(label="转发最近 N 条（预览后确认）…",
+                           command=self.forward_recent_dialog)
         m_tool.add_separator()
         m_tool.add_command(label="测试钉钉通知", command=self.notify_test)
         m_tool.add_command(label="发送消息到钉钉群…", command=self.notify_say)
@@ -1291,6 +1293,143 @@ class App(tk.Tk):
 
         bar = tk.Frame(win, bg=CARD)
         bar.pack(fill="x", padx=20, pady=(0, 16))
+        ttk.Button(bar, text="预 览", command=do_preview).pack(side="right")
+        ttk.Button(bar, text="真实发送…", command=do_send).pack(side="right", padx=8)
+        ttk.Button(bar, text="关 闭", command=win.destroy).pack(side="left")
+
+    # ---------------- 转发最近 N 条 ----------------
+
+    def forward_recent_dialog(self):
+        """手动转发最近 N 条 —— 一次补几条，来源可选钉钉画面或已入库记录。
+
+        与「转发一条」的区别只有「条数」和「来源」两件事，其余安全设计一致：
+        默认只预览，真实发送前再确认一次。
+
+        `db` 来源是给补发用的：消息当时已入库但投递失败/漏发，
+        从库里取出来重发，不必去钉钉窗口上重新找。
+        """
+        if self.runner.alive() or self._busy:
+            messagebox.showinfo("提示", "有任务正在运行，请先停止。", parent=self)
+            return
+
+        win = tk.Toplevel(self)
+        win.title("转发最近 N 条（先预览，再决定是否发送）")
+        win.geometry("620x480")
+        win.configure(bg=CARD)
+        win.transient(self)
+
+        # 固定高度的底部按钮栏必须最先 pack：Tk 按调用顺序分配空间，
+        # 内容比窗口高时最后 pack 的先被挤成 0 高（保存按钮消失过一次）。
+        bar = tk.Frame(win, bg=CARD)
+        bar.pack(fill="x", side="bottom", padx=20, pady=(0, 16))
+
+        frm = tk.Frame(win, bg=CARD)
+        frm.pack(fill="both", expand=True, padx=20, pady=(18, 8))
+
+        ttk.Label(frm, text="转发最近", style="Card.TLabel"
+                  ).grid(row=0, column=0, sticky="w", pady=6)
+        count = tk.StringVar(value="3")
+        ttk.Spinbox(frm, from_=1, to=50, textvariable=count, width=6
+                    ).grid(row=0, column=1, sticky="w", padx=(4, 0))
+        ttk.Label(frm, text="条（1~50）", style="Card.TLabel"
+                  ).grid(row=0, column=2, sticky="w", padx=(4, 0))
+
+        ttk.Label(frm, text="来源", style="Card.TLabel"
+                  ).grid(row=1, column=0, sticky="w", pady=6)
+        SRC_SCREEN = "钉钉当前画面（最下面 N 条）"
+        SRC_DB = "已入库记录（补发用）"
+        src = tk.StringVar(value=SRC_SCREEN)
+        src_box = ttk.Combobox(frm, textvariable=src, state="readonly", width=30,
+                               values=(SRC_SCREEN, SRC_DB))
+        src_box.grid(row=1, column=1, columnspan=2, sticky="w", padx=(4, 0))
+
+        failed = tk.IntVar(value=0)
+        failed_btn = ttk.Checkbutton(frm, text="只补发「最近一次投递失败」的",
+                                     variable=failed)
+        failed_btn.grid(row=2, column=1, columnspan=2, sticky="w", padx=(4, 0))
+
+        banner = tk.IntVar(value=1)
+        ttk.Checkbutton(frm, text="每条约加一行「【手动补发】」提示",
+                        variable=banner).grid(row=3, column=1, columnspan=2,
+                                              sticky="w", padx=(4, 0))
+
+        frm.columnconfigure(0, weight=0)
+        frm.columnconfigure(1, weight=1)
+
+        ttk.Label(frm, text="预览内容", style="Card.TLabel"
+                  ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(12, 2))
+        out = tk.Text(frm, height=14, font=("Microsoft YaHei UI", 9),
+                      relief="flat", bg="#f4f6fb", state="disabled", wrap="word",
+                      highlightbackground=BORDER, highlightthickness=1)
+        out.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=4)
+        frm.rowconfigure(5, weight=1)
+
+        def on_src_change(*_):
+            # 「只看失败」只对 db 来源有意义 —— 画面上的消息没有投递历史
+            failed_btn.state(["!disabled"] if src.get() == SRC_DB else ["disabled"])
+
+        src_box.bind("<<ComboboxSelected>>", on_src_change)
+        on_src_change()
+
+        def show(s: str):
+            out.configure(state="normal")
+            out.delete("1.0", "end")
+            out.insert("1.0", s)
+            out.configure(state="disabled")
+
+        def build_argv(send: bool) -> list[str] | None:
+            exe = self._worker_python()
+            if not exe:
+                self._warn_no_worker()
+                return None
+            argv = [exe, str(BASE_DIR / "tools" / "forward_recent.py"),
+                    "--config", str(CONFIG_PATH), "-n", count.get() or "3"]
+            if src.get() == SRC_DB:
+                argv += ["--from", "db"]
+                if failed.get():
+                    argv.append("--only-failed")
+            if not banner.get():
+                argv.append("--plain")
+            if send:
+                argv.append("--yes")
+            return argv
+
+        def run_cmd(send: bool, callback):
+            argv = build_argv(send)
+            if argv is None:
+                return
+            self._set_busy(True, "正在执行手动转发…")
+
+            def work():
+                try:
+                    r = subprocess.run(argv, cwd=str(BASE_DIR), capture_output=True,
+                                       text=True, timeout=600, encoding="utf-8",
+                                       errors="replace", creationflags=0x08000000)
+                    res = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+                except Exception as exc:
+                    res = f"执行失败：{exc}"
+                cleaned = self._clean_tool_output(res) or "（无输出）"
+                self.after(0, lambda: (self._set_busy(False, "完成"),
+                                       show(cleaned), callback(cleaned)))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def do_preview():
+            show("正在读取消息并渲染，请稍候…")
+            run_cmd(False, lambda _res: None)
+
+        def do_send():
+            if not messagebox.askyesno(
+                    "确认真实发送",
+                    f"即将操作微信，把最近 {count.get()} 条消息真实发送出去。\n\n"
+                    "发送时会重新读一次消息（保证发的是最新状态），"
+                    "因此若这期间钉钉来了新消息，实际发送的会是从那时起最新的 N 条 —— "
+                    "发送结果会显示在下面的框里。\n\n"
+                    "确定发送吗？",
+                    parent=win):
+                return
+            run_cmd(True, lambda _res: self._poll_db())
+
         ttk.Button(bar, text="预 览", command=do_preview).pack(side="right")
         ttk.Button(bar, text="真实发送…", command=do_send).pack(side="right", padx=8)
         ttk.Button(bar, text="关 闭", command=win.destroy).pack(side="left")
