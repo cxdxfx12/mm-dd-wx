@@ -331,6 +331,8 @@ class SettingsDialog:
 
         self.st["dry_run"] = tk.BooleanVar(value=bool(w.get("dry_run", True)))
         self.st["interval"] = tk.StringVar(value=str(w.get("interval", 3)))
+        self.st["hotkey"] = tk.StringVar(
+            value=str(w.get("show_hotkey") or "{Ctrl}{Alt}w"))
         self.st["poll"] = tk.StringVar(value=str(d.get("ui_poll_interval", 5)))
         self.st["anchor"] = tk.BooleanVar(value=bool(d.get("anchor_guard", True)))
         self.st["title"] = tk.BooleanVar(value=bool(d.get("title_check", True)))
@@ -350,6 +352,19 @@ class SettingsDialog:
                    "但别低于 5 秒（OCR 每帧约 2 秒）。")
         self._spin(grid, 1, "微信发送间隔（秒）", self.st["interval"], 1, 60,
                    "相邻两条微信之间的最小间隔，防风控，不建议调小。")
+
+        line = tk.Frame(box, bg=CARD)
+        line.pack(fill="x", padx=14, pady=(0, 4))
+        tk.Label(line, text="微信热键（显示/隐藏主窗口）", bg=CARD, fg=TEXT,
+                 font=F_UI).pack(side="left")
+        ttk.Entry(line, textvariable=self.st["hotkey"], width=16).pack(side="left",
+                                                                      padx=8)
+        _tip(line, "默认 Ctrl+Alt+W。微信窗口被最小化或收进托盘时，程序用这个"
+                   "热键把窗口唤回来；在微信「设置 → 快捷键」里改过就要同步改这里。"
+                   ).pack(side="left", padx=6)
+        _tip(box, "投递时需要微信窗口可用：被别的窗口挡住没关系（程序会切到前台），"
+                  "但请别把微信最小化 —— 万一最小化或收进托盘，程序会自动把它唤回来。"
+             ).pack(fill="x", padx=14, pady=(0, 12))
 
         box2 = _card(page, "采集防护（建议都保持开启）")
         box2.pack(fill="x", padx=12, pady=(0, 12))
@@ -728,6 +743,18 @@ class SettingsDialog:
             messagebox.showwarning("数值不对", "间隔与阈值必须是数字。", parent=self.win)
             return
 
+        # 微信「显示/隐藏主窗口」热键：SendKeys 语法，例如 {Ctrl}{Alt}w。
+        # 填错不会报错、只会在需要唤回窗口时静默失效，所以这里卡一道。
+        hotkey = self.st["hotkey"].get().strip() or "{Ctrl}{Alt}w"
+        if any(ch.isspace() for ch in hotkey) or not re.search(r"[A-Za-z0-9]", hotkey):
+            messagebox.showwarning(
+                "微信热键格式不对",
+                "请按 SendKeys 语法填写，例如 {Ctrl}{Alt}w（默认值）。\n"
+                "内容不要有空格，且至少包含一个字母或数字。\n\n"
+                "这个热键要和微信「设置 → 快捷键 → 显示/隐藏主窗口」里的一致。",
+                parent=self.win)
+            return
+
         # ---- 钉钉通知相关校验 ----
         try:
             n_cooldown = max(30, int(float(self.st["n_cooldown"].get())))
@@ -799,6 +826,7 @@ class SettingsDialog:
         S("dingtalk", "title_ratio", ratio)
         S("wechat", "dry_run", bool(self.st["dry_run"].get()))
         S("wechat", "interval", interval)
+        S("wechat", "show_hotkey", hotkey)
 
         # ---- 钉钉通知 ----
         S("notify", "enabled", n_enabled)

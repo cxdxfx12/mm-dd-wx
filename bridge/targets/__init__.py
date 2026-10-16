@@ -64,5 +64,9 @@ def build_target(cfg) -> Target:
     if driver == "wxauto":
         return WeChatTarget(wxauto_path=wxauto_path, dry_run=cfg.wechat.dry_run)
     if driver == "ui4":
-        return WeChat4Target(wxauto_path=wxauto_path, dry_run=cfg.wechat.dry_run)
+        return WeChat4Target(
+            wxauto_path=wxauto_path,
+            dry_run=cfg.wechat.dry_run,
+            show_hotkey=str(getattr(cfg.wechat, "show_hotkey", "") or ""),
+        )
     raise ValueError(f"未知的 wechat.driver：{driver!r}（可选 auto | wxauto | ui4）")

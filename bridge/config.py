@@ -40,6 +40,10 @@ class WeChatConfig:
     targets: list[str] = field(default_factory=list)
     wxauto_path: str = "../wxauto-main"
     driver: str = "auto"                    # auto | wxauto(微信3.9) | ui4(微信4.x)
+    # 微信「显示/隐藏主窗口」全局热键。微信用 Esc 或点最小化会把主窗口收进
+    # 托盘（UIA 里整个消失），此时桥用这个热键把窗口唤回来。
+    # 若你在微信「设置 → 快捷键」里改过，这里要跟着改。
+    show_hotkey: str = "{Ctrl}{Alt}w"
 
 
 @dataclass

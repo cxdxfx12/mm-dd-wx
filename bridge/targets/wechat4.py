@@ -22,8 +22,19 @@
     - 需要微信窗口可见且能被切到前台；最小化时 SendKeys 不会生效。
     - 发送用「剪贴板 + Ctrl+V」而非逐字输入，以规避中文输入法干扰。
     - 发送后默认回读消息列表做校验，确认消息真的落到目标会话。
+    - **绝不按 Esc**：搜索面板关掉之后再发 Esc，微信 4.x 会把主窗口整个
+      收进托盘，窗口对象随之从 UIA 树里消失，之后所有投递都会失败。
     - 微信若在后续版本关闭 UIA 暴露，本模块立即失效 ——
       用 `health_check()` 与 `tools/probe_wechat_ui.py` 可提前发现。
+
+三种「窗口看起来在、其实用不了」的状态（都有实测记录）
+    1. 收进托盘     窗口对象从 UIA 里整个消失（`Exists()` → False）。
+                    可用微信的「显示/隐藏主窗口」全局热键（默认 Ctrl+Alt+W）唤回。
+    2. 点了最小化   窗口对象与坐标都照常，但点击与按键都不会送到微信，
+                    会落到该屏幕坐标上的其它程序上；`IsIconic()` 可判定。
+    3. 控件没渲染完 刚唤回的窗口、或某些面板弹开时，子控件矩形会是 0×0，
+                    此时 uiautomation 的 Click 会抛 LookupError。
+    `ensure_visible()` + `_click_safely()` 就是针对这三条加的护栏。
 """
 from __future__ import annotations
 
@@ -34,7 +45,23 @@ from pathlib import Path
 
 from .base import SendResult, Target
 
+try:                                   # 非 Windows 环境下仅跑逻辑测试时降级
+    import ctypes
+    from ctypes import wintypes
+
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+except Exception:                      # pragma: no cover - 只在非 Windows 触发
+    ctypes = None                      # type: ignore[assignment]
+    wintypes = None                    # type: ignore[assignment]
+    _user32 = None
+    _kernel32 = None
+
 log = logging.getLogger("bridge.target.wechat4")
+
+SW_RESTORE = 9                         # ShowWindow 的还原指令
+MIN_WINDOW_SIDE = 200                  # 窗口矩形小于这个值视为「没渲染完」
+CLICK_RETRIES = 3                      # 会话格点击重试次数（首次点击可能被激活吞掉）
 
 
 class WeChat4Target(Target):
@@ -57,17 +84,27 @@ class WeChat4Target(Target):
     # 控件树较深（输入框约第 19 层），搜索深度要给足
     SEARCH_DEPTH = 30
 
+    # 微信「显示/隐藏主窗口」的全局热键（用于把收进托盘的窗口唤回来）。
+    # 注意它是**开关**：窗口在的时候发它会反过来把窗口收起来，所以只在
+    # 确认窗口不见了之后才发。
+    DEFAULT_SHOW_HOTKEY = "{Ctrl}{Alt}w"
+    SCROLL_TO_TOP_TURNS = 12      # 会话列表归位到顶部需要的滚轮格数（够多即可）
+    # 搜索面板打开时会话表格里会出现这些分组头，用来判断「列表被搜索结果顶掉了」
+    SEARCH_PANEL_MARKERS = ("搜索网络结果", "最常使用")
+
     def __init__(
         self,
         wxauto_path: str = "../wxauto-main",
         dry_run: bool = True,
         open_timeout: float = 6.0,
         verify: bool = True,
+        show_hotkey: str = "",
     ):
         self.wxauto_path = Path(wxauto_path).resolve()
         self.dry_run = dry_run
         self.open_timeout = open_timeout
         self.verify = verify
+        self.show_hotkey = (show_hotkey or self.DEFAULT_SHOW_HOTKEY).strip()
         self._uia = None
         self._wnd = None
         self._current = ""
@@ -95,27 +132,224 @@ class WeChat4Target(Target):
                 pass
             self._wnd = None
 
-        uia = self._load_uia()
-        wnd = uia.WindowControl(ClassName=self.WINDOW_CLASS, searchDepth=1)
-        if not wnd.Exists(1):
+        wnd = self._find_window()
+        if wnd is None:
             raise RuntimeError(
-                f"未找到微信 4.x 主窗口（{self.WINDOW_CLASS}）。"
-                "请确认微信已启动并登录，且版本为 4.x。"
+                f"未找到微信 4.x 主窗口（{self.WINDOW_CLASS}）。请确认微信已启动并登录，"
+                "且**主窗口没有被收进托盘**（按 Esc 或点最小化都会这样，窗口在系统里会"
+                "整个消失）。可运行 tools/probe_wechat_state.py 查看当前窗口状态。"
             )
         self._wnd = wnd
         return wnd
 
-    def _activate(self, wnd) -> None:
-        """把微信切到前台 —— SendKeys / Click 都依赖前台焦点。"""
-        uia = self._load_uia()
+    def _find_window(self):
+        """找主窗口，找不到返回 None（不像 `_window` 那样抛异常）。"""
         try:
-            uia.SetForegroundWindow(wnd.NativeWindowHandle)
+            uia = self._load_uia()
+            wnd = uia.WindowControl(ClassName=self.WINDOW_CLASS, searchDepth=1)
         except Exception:
+            return None
+        return wnd if wnd.Exists(1) else None
+
+    def _wnd_present(self) -> bool:
+        """主窗口当前是否**存在于系统里**（不含最小化、含被其它窗口遮挡）。"""
+        if self._wnd is not None:
             try:
-                wnd.SetActive()
+                if self._wnd.Exists(0.2):
+                    return True
+            except Exception:
+                pass
+            self._wnd = None
+        return self._find_window() is not None
+
+    # ---------- 窗口可见性护栏 ----------
+
+    @staticmethod
+    def _hwnd(wnd) -> int:
+        try:
+            return int(wnd.NativeWindowHandle)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _is_minimized(wnd) -> bool:
+        """是否「点了最小化」。注意最小化时 UIA 里坐标照旧有效，不能只看坐标。"""
+        hwnd = WeChat4Target._hwnd(wnd)
+        if not hwnd or _user32 is None:
+            return False
+        try:
+            return bool(_user32.IsIconic(wintypes.HWND(hwnd)))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _restore_window(wnd) -> None:
+        hwnd = WeChat4Target._hwnd(wnd)
+        if not hwnd or _user32 is None:
+            return
+        try:
+            _user32.ShowWindow(wintypes.HWND(hwnd), SW_RESTORE)
+        except Exception as exc:
+            log.debug("还原微信窗口失败：%s", exc)
+
+    def _wait_rendered(self, timeout: float = 4.0) -> bool:
+        """等窗口把控件渲染出来。
+
+        实测：主窗口刚被唤回、或搜索面板刚弹开的那一小段时间里，会话表格的
+        `BoundingRectangle` 会是 (0,0,0,0)，此时任何 Click 都会抛 LookupError。
+        转发是长跑，这里多等一会儿比点错地方划算。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            wnd = self._find_window()
+            if wnd is not None:
+                try:
+                    r = wnd.BoundingRectangle
+                    if (r.right - r.left >= MIN_WINDOW_SIDE
+                            and r.bottom - r.top >= MIN_WINDOW_SIDE):
+                        table = wnd.ListControl(ClassName=self.SESSION_TABLE,
+                                                searchDepth=self.SEARCH_DEPTH)
+                        if table.Exists(0.3) and self._rect_of(table) is not None:
+                            self._wnd = wnd
+                            return True
+                except Exception:
+                    pass
+            time.sleep(0.2)
+        return False
+
+    def ensure_visible(self) -> tuple[bool, str]:
+        """确保微信主窗口**存在、可见、未最小化**；必要时自动唤回 / 还原。
+
+        这是所有投递动作的前置条件。返回 (是否可用, 说明)，说明会直接写进
+        投递失败的 detail 里，方便用户在日志里看到「到底卡在哪一步」。
+        """
+        # 情形 A：窗口收进了托盘 —— 对象整个不存在，只能靠全局热键唤回
+        if not self._wnd_present():
+            log.info("微信主窗口不在（多半被收进了托盘），尝试用热键 %s 唤回",
+                     self.show_hotkey)
+            try:
+                self._load_uia().SendKeys(self.show_hotkey)
             except Exception as exc:
-                log.debug("激活窗口失败：%s", exc)
+                return False, f"唤回微信窗口失败：{exc}"
+            deadline = time.time() + 6.0
+            while time.time() < deadline:
+                if self._wnd_present():
+                    log.info("微信主窗口已唤回")
+                    break
+                time.sleep(0.25)
+            else:
+                return False, (
+                    f"微信主窗口找不到，热键 {self.show_hotkey} 也没能唤回 —— "
+                    "请在微信「设置 → 快捷键」里确认「显示/隐藏主窗口」的快捷键，"
+                    "或手动点开微信主窗口")
+
+        # 情形 B：窗口在，但被点了最小化
+        wnd = self._window()
+        if self._is_minimized(wnd):
+            log.info("微信窗口处于最小化状态，自动还原")
+            self._restore_window(wnd)
+            time.sleep(0.4)
+            if self._is_minimized(wnd):
+                return False, "微信窗口被最小化且无法自动还原，请手动点开微信主窗口"
+
+        # 情形 C：窗口在但控件还没渲染完
+        if not self._wait_rendered(timeout=2.0):
+            log.debug("会话表格暂未就绪，继续按原流程尝试")
+        return True, "窗口正常"
+
+    def _activate(self, wnd) -> None:
+        """把微信切到前台 —— SendKeys / Click 都依赖前台焦点。
+
+        注意 Windows 的「前台锁」：**不是前台的进程**调用 SetForegroundWindow
+        时，系统只会让任务栏按钮闪一下，窗口并不上浮。生产环境里桥基本都在
+        后台（前台是钉钉/本程序界面），于是紧接着的那一次点击会被系统当成
+        「激活窗口」的点击吞掉，会话切不过去 —— 表现为「已点击 XXX 但标题
+        未匹配」。这里按业内通行做法绕：先把输入队列挂到当前前台线程上，
+        再 SetForegroundWindow；还不够就补一次 Alt 键（系统把按键当用户活动）。
+        """
+        hwnd = self._hwnd(wnd)
+        if self._is_minimized(wnd):
+            self._restore_window(wnd)
+            time.sleep(0.3)
+        if self._foreground_hwnd() != hwnd:
+            if not self._force_foreground(hwnd):
+                try:                                   # Alt 键解除前台锁
+                    self._load_uia().SendKeys("{Alt}")
+                except Exception as exc:
+                    log.debug("发送 Alt 键失败：%s", exc)
+                self._force_foreground(hwnd)
         time.sleep(0.25)
+
+    @staticmethod
+    def _foreground_hwnd() -> int:
+        if _user32 is None:
+            return 0
+        try:
+            return int(_user32.GetForegroundWindow())
+        except Exception:
+            return 0
+
+    def _force_foreground(self, hwnd: int) -> bool:
+        """尽最大努力把窗口切到前台，返回是否成功。
+
+        AttachThreadInput 的作用是把本线程的输入队列临时挂到当前前台线程上，
+        这样系统就认为调用方「本来就是前台」，从而放行 SetForegroundWindow。
+        """
+        if not hwnd or _user32 is None:
+            return False
+        if self._foreground_hwnd() == hwnd:
+            return True
+        attached = False
+        fg_thread = 0
+        try:
+            fg = self._foreground_hwnd()
+            if fg:
+                fg_thread = int(_user32.GetWindowThreadProcessId(wintypes.HWND(fg), None))
+            cur_thread = int(_kernel32.GetCurrentThreadId())
+            if fg_thread and fg_thread != cur_thread:
+                attached = bool(_user32.AttachThreadInput(cur_thread, fg_thread, True))
+            _user32.BringWindowToTop(wintypes.HWND(hwnd))
+            _user32.SetForegroundWindow(wintypes.HWND(hwnd))
+        except Exception as exc:
+            log.debug("强制切前台失败：%s", exc)
+        finally:
+            if attached:
+                try:
+                    _user32.AttachThreadInput(int(_kernel32.GetCurrentThreadId()),
+                                              fg_thread, False)
+                except Exception:
+                    pass
+        return self._foreground_hwnd() == hwnd
+
+    # ---------- 控件点击护栏 ----------
+
+    @staticmethod
+    def _rect_of(ctrl):
+        """取控件矩形；0×0 / 取不到都返回 None。"""
+        try:
+            r = ctrl.BoundingRectangle
+        except Exception:
+            return None
+        if r is None or (r.right - r.left) <= 1 or (r.bottom - r.top) <= 1:
+            return None
+        return r
+
+    def _click_safely(self, ctrl, what: str) -> bool:
+        """控件矩形有效才点击。
+
+        ⚠ 微信在「面板弹开 / 刚被唤回」等状态下会把控件矩形报成 0×0，
+        此时 `Click` 要么抛 LookupError，要么把点击落到屏幕边上 ——
+        对一个后台长跑的桥来说都不可接受，所以先卡这一道。
+        """
+        if self._rect_of(ctrl) is None:
+            log.warning("%s 当前没有有效位置（微信界面可能没渲染完），放弃本次点击", what)
+            return False
+        try:
+            ctrl.Click(simulateMove=False)
+            return True
+        except Exception as exc:
+            log.warning("点击%s失败：%s", what, exc)
+            return False
 
     # ---------- 会话定位 ----------
 
@@ -140,9 +374,17 @@ class WeChat4Target(Target):
         其 BoundingRectangle 会落在表格区域之外（顶部甚至出现负坐标）。
         直接 Click 会把点击落到窗口其他位置甚至别的应用上，
         因此这里必须校验「单元格中心点位于表格可视矩形内」才允许返回。
+
+        ⚠ 滚动方向：会话列表是「新的在上、旧的在下」。只往下滚会离目标越来越
+        远 —— 上一版首次没找到就直接往下滚 3 格，一旦目标排在列表上方，之后
+        每次投递都必然失败（日志表现：「会话列表中未渲染 XXX」反复出现）。
+        现在改成：第一次没找到先归位到顶部，之后才逐屏向下找。
         """
         table = wnd.ListControl(ClassName=self.SESSION_TABLE, searchDepth=self.SEARCH_DEPTH)
         if not table.Exists(1):
+            return None
+        if self._rect_of(table) is None:
+            log.warning("会话列表当前没有有效位置（微信界面没渲染完），本次不查找")
             return None
 
         for attempt in range(scroll_tries + 1):
@@ -165,7 +407,11 @@ class WeChat4Target(Target):
 
             if attempt < scroll_tries:
                 try:
-                    table.WheelDown(wheelTimes=3)
+                    if attempt == 0:
+                        # 首次没找到：先归位到顶部（最新会话），再往下找
+                        table.WheelUp(wheelTimes=self.SCROLL_TO_TOP_TURNS)
+                    else:
+                        table.WheelDown(wheelTimes=3)
                 except Exception:
                     break
                 time.sleep(0.35)
@@ -257,38 +503,148 @@ class WeChat4Target(Target):
             log.debug("位置法回读标题失败：%s", exc)
         return best
 
+    def _title_matches(self, title: str, target: str) -> bool:
+        return bool(title) and (target in title or title.startswith(target))
+
+    def _search_panel_open(self, wnd) -> bool:
+        """会话表格里出现「搜索结果 / 最常使用」分组头，说明搜索面板是开着的。"""
+        try:
+            names = {self._first_line(c.Name) for c in self._session_cells(wnd)}
+        except Exception:
+            return False
+        return bool(names & set(self.SEARCH_PANEL_MARKERS))
+
+    def _dismiss_search_panel(self, wnd) -> bool:
+        """把搜索面板收起来。
+
+        搜索面板一旦弹开，会话列表会被「搜索结果」整块顶掉，`_find_session`
+        再也找不到任何会话 —— 日志里「会话列表中未渲染 XXX」反复出现的根源
+        就是它。收起方式**不能用 Esc**（见 `_open_chat_by_search` 的说明），
+        改成点一下右侧聊天区，实测能收起且不影响窗口状态。
+        """
+        wnd_rect = self._rect_of(wnd)
+        if wnd_rect is None:
+            return False
+        lst = wnd.ListControl(ClassName=self.MESSAGE_LIST, searchDepth=self.SEARCH_DEPTH)
+        r = self._rect_of(lst) if lst.Exists(0.3) else None
+        if r is not None:
+            x, y = (r.left + r.right) // 2, (r.top + r.bottom) // 2
+        else:
+            # 当前没有打开的会话时点标题条那一带（空白区），同样能收起面板
+            x = min(wnd_rect.left + self.TITLE_PANEL_OFFSET + 60, wnd_rect.right - 10)
+            y = wnd_rect.top + 45
+        try:
+            self._load_uia().Click(x, y)
+        except Exception as exc:
+            log.debug("收起搜索面板失败：%s", exc)
+            return False
+        time.sleep(0.4)
+        return not self._search_panel_open(wnd)
+
+    def _wait_title(self, wnd, target: str, timeout: float = 0.0) -> bool:
+        """轮询等标题切到目标会话。"""
+        deadline = time.time() + (timeout or self.open_timeout)
+        while time.time() < deadline:
+            if self._title_matches(self._chat_title(wnd), target):
+                return True
+            time.sleep(0.25)
+        return False
+
     def open_chat(self, target: str) -> bool:
-        """把目标会话切到前台。成功返回 True。"""
+        """把目标会话切到前台。成功返回 True。
+
+        进门前先过一遍 `ensure_visible()`：微信被最小化 / 收进托盘时，
+        UIA 里看到的坐标和标题**都是陈旧的**，照着点/贴会把内容发到别的
+        程序上，所以这里必须先确认窗口真的可用。
+        """
+        ok, why = self.ensure_visible()
+        if not ok:
+            log.error("微信窗口不可用，无法切换会话：%s", why)
+            return False
+
         wnd = self._window()
         self._activate(wnd)
 
-        if self._current == target:
-            title = self._chat_title(wnd)
-            if target in title or title.startswith(target):
-                return True
+        if self._current == target and self._title_matches(self._chat_title(wnd), target):
+            return True
+
+        # 搜索面板开着的话会话列表是被顶掉的，先收起再找
+        if self._search_panel_open(wnd):
+            log.info("检测到微信搜索面板处于打开状态，先收起（否则会话列表不可用）")
+            self._dismiss_search_panel(wnd)
 
         cell = self._find_session(wnd, target)
         if cell is None:
             return self._open_chat_by_search(wnd, target)
 
-        try:
-            cell.Click(simulateMove=False)
-        except Exception as exc:
-            log.warning("点击会话「%s」失败：%s", target, exc)
-            return False
-
-        deadline = time.time() + self.open_timeout
-        while time.time() < deadline:
-            title = self._chat_title(wnd)
-            if title and (target in title or title.startswith(target)):
+        # 首次点击可能被系统当成「激活窗口」的点击吞掉（微信本来在后台）；
+        # 控件矩形也可能因为界面没渲染完而暂时无效。两种情况都重新定位重试。
+        for attempt in range(CLICK_RETRIES):
+            # 最后一次给足超时，前面几次快速试
+            budget = self.open_timeout if attempt == CLICK_RETRIES - 1 else 2.0
+            if (self._click_safely(cell, f"会话「{target}」")
+                    and self._wait_title(wnd, target, timeout=budget)):
                 self._current = target
                 return True
-            time.sleep(0.25)
+            if attempt < CLICK_RETRIES - 1:
+                log.info("点击「%s」未生效（当前标题 %r），重新定位后再试一次",
+                         target, self._chat_title(wnd))
+                time.sleep(0.3)
+                cell = self._find_session(wnd, target, scroll_tries=0)
+                if cell is None:
+                    return self._open_chat_by_search(wnd, target)
         log.warning("已点击「%s」但标题未匹配（当前标题：%r）", target, self._chat_title(wnd))
         return False
 
+    def _search_results_cell(self, wnd, target: str):
+        """在搜索结果面板里找目标。
+
+        搜索面板是**分组的**，同名会有好几行，类名不一样，点错行不会切会话：
+          `mmui::SearchContentCellView` —— 真正的「聊天」条目（双行、更高），点它才切会话
+          `mmui::XTableCell`           —— 「功能 / 聊天记录」等文本建议行，点了没反应
+        所以这里优先取 SearchContent 类型，其次取更高的那一行。
+        """
+        table = wnd.ListControl(ClassName=self.SESSION_TABLE, searchDepth=self.SEARCH_DEPTH)
+        if not table.Exists(0.5):
+            return None
+        t = self._rect_of(table)
+        if t is None:
+            return None
+        found: list[tuple[int, int, int, object]] = []   # (完全匹配, 是聊天条目, 高度, 控件)
+        for c in self._session_cells(wnd):
+            try:
+                name = self._first_line(c.Name)
+                if target not in name:
+                    continue
+                r = c.BoundingRectangle
+                cx, cy = (r.left + r.right) // 2, (r.top + r.bottom) // 2
+                # 同样必须校验点击点落在表格内，否则点击会落到窗口别处
+                if not (r.height() > 4 and t.left <= cx <= t.right
+                        and t.top <= cy <= t.bottom):
+                    continue
+                found.append((1 if name == target else 0,
+                              1 if "SearchContent" in (c.ClassName or "") else 0,
+                              r.height(), c))
+            except Exception:
+                continue
+        if not found:
+            return None
+        found.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        return found[0][3]
+
     def _open_chat_by_search(self, wnd, target: str) -> bool:
-        """会话不在渲染范围内时，退回「搜索框搜索」路径。"""
+        """会话不在渲染范围内时，退回「搜索框搜索」路径。
+
+        两条实测出来的铁律（微信 4.1.15.13），改这里之前务必先读一遍：
+
+        1. **绝不能按 Esc**。搜索面板关掉之后再发 Esc（此时焦点在主窗口上），
+           微信用会把主窗口**整个收进托盘** —— 窗口对象从 UIA 树里消失，
+           之后每次投递都会失败，日志表现是「标题读成空串 + 投递失败」，
+           用户那边看到的是「微信自己最小化了」。这正是 10-16 那次事故的成因。
+        2. **切换成功后不要再去点搜索框**。点一下就会重开搜索面板，会话列表
+           会被搜索结果顶掉（只剩一项「搜索网络结果」），此后列表查找必然失败。
+           点中搜索结果后微信自己会清空搜索框并收起面板，不用我们收拾。
+        """
         uia = self._load_uia()
         box = wnd.EditControl(ClassName=self.SEARCH_BOX, searchDepth=self.SEARCH_DEPTH)
         if not box.Exists(1):
@@ -296,51 +652,40 @@ class WeChat4Target(Target):
             return False
 
         log.info("会话列表中未渲染「%s」，改用搜索框", target)
-        box.Click(simulateMove=False)
-        uia.SendKeys("{Ctrl}a{Delete}")
-        time.sleep(0.2)
-        uia.SetClipboardText(target)
-        uia.SendKeys("{Ctrl}v")
+        if not self._click_safely(box, "搜索框"):
+            return False
+        try:
+            time.sleep(0.25)
+            uia.SendKeys("{Ctrl}a{Delete}")
+            time.sleep(0.15)
+            uia.SetClipboardText(target)
+            uia.SendKeys("{Ctrl}v")
+        except Exception as exc:
+            log.warning("搜索「%s」输入失败：%s", target, exc)
+            return False
         time.sleep(1.6)
 
-        # 搜索结果通常复用了会话单元格结构
-        cell = self._find_session(wnd, target)
+        # 搜索结果复用了会话表格结构，但分组里有多种行类型，优先取「聊天」条目
+        cell = self._search_results_cell(wnd, target) \
+            or self._find_session(wnd, target, scroll_tries=0)
         if cell is None:
-            table = wnd.ListControl(ClassName=self.SESSION_TABLE,
-                                    searchDepth=self.SEARCH_DEPTH)
-            if table.Exists(0.5):
-                t = table.BoundingRectangle
-                for c in self._session_cells(wnd):
-                    try:
-                        if target not in self._first_line(c.Name):
-                            continue
-                        r = c.BoundingRectangle
-                        cx, cy = (r.left + r.right) // 2, (r.top + r.bottom) // 2
-                        # 同样必须校验点击点落在表格内
-                        if (r.height() > 4 and t.left <= cx <= t.right
-                                and t.top <= cy <= t.bottom):
-                            cell = c
-                            break
-                    except Exception:
-                        continue
-        if cell is None:
-            uia.SendKeys("{Esc}")
-            log.warning("搜索「%s」也没有结果", target)
+            log.warning("搜索「%s」也没有结果（微信里没有这个名字的会话？）", target)
             return False
 
-        try:
-            cell.Click(simulateMove=False)
-        except Exception:
-            uia.SendKeys("{Esc}")
+        if not self._click_safely(cell, f"搜索结果「{target}」"):
             return False
-        uia.SendKeys("{Esc}")
-        time.sleep(0.8)
 
-        title = self._chat_title(wnd)
-        if title and (target in title or title.startswith(target)):
+        if self._wait_title(wnd, target, timeout=3.0):
             self._current = target
             return True
-        log.warning("搜索后标题仍未匹配（当前：%r）", title)
+        # 同 open_chat：后台状态下第一次点击可能被当成激活点击吞掉，补一次
+        cell = self._search_results_cell(wnd, target) \
+            or self._find_session(wnd, target, scroll_tries=0)
+        if cell is not None and self._click_safely(cell, f"搜索结果「{target}」"):
+            if self._wait_title(wnd, target):
+                self._current = target
+                return True
+        log.warning("搜索后标题仍未匹配（当前：%r）", self._chat_title(wnd))
         return False
 
     # ---------- 读取 ----------
@@ -394,18 +739,26 @@ class WeChat4Target(Target):
 
     def _send_text_live(self, target: str, text: str) -> SendResult:
         uia = self._load_uia()
+
+        ok, why = self.ensure_visible()
+        if not ok:
+            return SendResult(False, target, f"微信窗口不可用：{why}")
+
         wnd = self._window()
         self._activate(wnd)
 
         if not self.open_chat(target):
-            return SendResult(False, target, "未能切到目标会话（标题未匹配）")
+            return SendResult(False, target,
+                              f"未能切到目标会话「{target}」（当前标题："
+                              f"{self._chat_title(wnd)!r}）")
 
         before = self._last_text_message(wnd)
 
         box = wnd.EditControl(ClassName=self.INPUT_FIELD, searchDepth=self.SEARCH_DEPTH)
         if not box.Exists(2):
             return SendResult(False, target, f"未找到输入框（{self.INPUT_FIELD}）")
-        box.Click(simulateMove=False)
+        if not self._click_safely(box, "消息输入框"):
+            return SendResult(False, target, "消息输入框没有有效位置，本次不发送")
         time.sleep(0.15)
 
         # 剪贴板粘贴：绕开中文输入法，且比逐字输入快得多
@@ -417,12 +770,7 @@ class WeChat4Target(Target):
         btn = wnd.ButtonControl(
             ClassName=self.SEND_BUTTON, Name="发送", searchDepth=self.SEARCH_DEPTH
         )
-        if btn.Exists(0.6):
-            try:
-                btn.Click(simulateMove=False)
-            except Exception:
-                uia.SendKeys("{Enter}")
-        else:
+        if not (btn.Exists(0.6) and self._click_safely(btn, "发送按钮")):
             uia.SendKeys("{Enter}")
         time.sleep(0.8)
 
@@ -453,10 +801,17 @@ class WeChat4Target(Target):
         未打开任何会话时右侧是占位页，输入框与消息列表都不存在——这是
         正常状态（发送时会先点击会话再输入），不能据此判失败。
         """
-        try:
-            wnd = self._window()
-        except Exception as exc:
-            return False, str(exc)
+        # 先区分「窗口根本不在/被最小化」——这两种状态下坐标和标题都是陈旧的，
+        # 报一句「控件结构可能已变更」会把用户带偏。
+        if not self._wnd_present():
+            return False, ("读不到微信主窗口 —— 多半是被收进了托盘（按 Esc 或点了"
+                           "最小化都会这样）。请点开微信主窗口，或用「显示/隐藏"
+                           "主窗口」快捷键唤回后重试")
+
+        wnd = self._window()
+        if self._is_minimized(wnd):
+            return False, ("微信主窗口处于最小化状态 —— 此时点击与按键都不会送到"
+                           "微信，必须先把窗口还原（运行时会自动还原，自检只做提示）")
 
         cells = len(self._session_cells(wnd))
         if cells == 0:

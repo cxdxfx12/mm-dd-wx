@@ -102,7 +102,9 @@ class BridgeService:
             f"❌ 微信投递连续失败 {self._consec_fail} 次\n"
             f"最近失败目标：{target}\n"
             f"失败原因：{detail}\n\n"
-            f"常见原因：微信没登录 / 群名与客户端不一致 / 微信窗口被弹窗挡住。\n"
+            f"常见原因：微信没登录 / 群名与客户端不一致 / 微信窗口被最小化或收进"
+            f"托盘（点最小化、按 Esc 都会这样）/ 窗口被弹窗挡住。\n"
+            f"运行中的程序会自动唤回窗口；仍失败请人工点开微信看一眼。\n"
             f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
         )
         if notified:
@@ -284,6 +286,16 @@ class BridgeService:
         if not self.cfg.wechat.targets and not any(r.targets for r in self.cfg.routes):
             problems.append("没有任何转发目标：请在 routes[].targets 中配置微信好友或群名")
         ok, detail = self.target.health_check()
+        if not ok:
+            # 只对「窗口不可用」这类可自愈的问题做一次修复尝试：
+            # 微信被最小化 / 收进托盘时，启动瞬间就该把它唤回来，
+            # 而不是丢一句报错让用户自己找原因。
+            ensure = getattr(self.target, "ensure_visible", None)
+            if callable(ensure):
+                fixed, why = ensure()
+                if fixed:
+                    log.info("微信窗口已自动恢复：%s", why)
+                    ok, detail = self.target.health_check()
         self.last_target_check = (ok, detail)
         if not ok:
             problems.append(f"微信投递端不可用：{detail}")
