@@ -250,6 +250,7 @@ class App(tk.Tk):
         m_tool.add_command(label="转发一条（预览后确认）", command=self.forward_one_dialog)
         m_tool.add_separator()
         m_tool.add_command(label="测试钉钉通知", command=self.notify_test)
+        m_tool.add_command(label="发送消息到钉钉群…", command=self.notify_say)
         m_tool.add_command(label="发送运行报告到钉钉", command=self.notify_report)
         m_tool.add_separator()
         m_tool.add_command(label="消息记录", command=self.show_records)
@@ -902,6 +903,83 @@ class App(tk.Tk):
     def notify_report(self):
         """把累计统计发到钉钉群。"""
         self._notify_cmd("--notify-report", "运行报告")
+
+    def notify_say(self):
+        """弹出输入框，把随手写的内容发到钉钉群（不必先进设置里改配置）。
+
+        这条通道与「钉钉 → 微信」的转发完全无关：它只负责把话送到钉钉群。
+        """
+        nc = self.cfg.get("notify") or {}
+        if not (nc.get("webhook") or "").strip():
+            messagebox.showwarning(
+                "钉钉通知还没配好",
+                "请先到「工具 → 设置中心 → 钉钉通知」里填入自定义机器人的 webhook。",
+                parent=self)
+            return
+        if not nc.get("enabled"):
+            messagebox.showwarning(
+                "钉钉通知未启用",
+                "「工具 → 设置中心 → 钉钉通知」里勾选「启用钉钉通知」并保存后再试。",
+                parent=self)
+            return
+        if self.runner.alive() or self._busy:
+            messagebox.showinfo("提示", "有任务正在运行，请先停止。", parent=self)
+            return
+
+        win = tk.Toplevel(self)
+        win.title("发送消息到钉钉群")
+        win.geometry("580x300")
+        win.configure(bg=CARD)
+        win.transient(self)
+        frm = tk.Frame(win, bg=CARD)
+        frm.pack(fill="both", expand=True, padx=18, pady=16)
+        ttk.Label(frm, text="要发到钉钉群里的内容：", style="Card.TLabel"
+                  ).pack(anchor="w")
+        text = tk.Text(frm, height=8, font=F_UI, relief="flat", bg="#fbfcfe",
+                       highlightbackground=BORDER, highlightthickness=1,
+                       padx=8, pady=6, wrap="word", insertbackground=TEXT)
+        text.pack(fill="both", expand=True, pady=(6, 4))
+        try:
+            from settings_ui import last_message
+            text.insert("1.0", last_message())
+        except Exception:
+            pass
+        text.focus_set()
+
+        tip = tk.Label(frm, text="这条只发到钉钉群，不会影响钉钉 → 微信的转发。",
+                       bg=CARD, fg=MUTED, font=F_SMALL, anchor="w")
+        tip.pack(anchor="w")
+
+        bar = tk.Frame(frm, bg=CARD)
+        bar.pack(fill="x", pady=(10, 0))
+
+        def send(*_a):
+            body = text.get("1.0", "end").strip()
+            if not body:
+                tip.configure(text="请先输入要发送的内容。", fg=RED)
+                text.focus_set()
+                return "break"
+            if len(body) > 3000:
+                # 走的是命令行参数，Windows 命令行总长有限；这条通道本就是发
+                # 短通知用的，真要发长文请用「发送运行报告」或设置里那个框。
+                tip.configure(text=f"内容太长了（{len(body)} 字，上限 3000），"
+                                   "请精简后再发。", fg=RED)
+                return "break"
+            try:
+                from settings_ui import remember_message
+                remember_message(body)
+            except Exception:
+                pass
+            self._notify_cmd(f"--notify-say={body}", "自定义消息")
+            win.destroy()
+            return "break"
+
+        ttk.Button(bar, text="发送到钉钉群", command=send).pack(side="left")
+        ttk.Button(bar, text="取消", command=win.destroy).pack(side="left", padx=8)
+        ttk.Label(bar, text="Ctrl+Enter 发送", style="CardMuted.TLabel"
+                  ).pack(side="left", padx=6)
+        text.bind("<Control-Return>", send)
+        win.bind("<Escape>", lambda _e: win.destroy())
 
     def _notify_cmd(self, flag: str, title: str):
         if self.runner.alive() or self._busy:

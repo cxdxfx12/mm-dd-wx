@@ -43,6 +43,14 @@ log = logging.getLogger("bridge.notify")
 
 WEBHOOK_PREFIX = "https://oapi.dingtalk.com/robot/send?access_token="
 
+# 默认测试文案：设置中心的「填入测试文案」与命令行 --notify-test 共用，
+# 只此一份，免得两边各写一段、改了一处忘了另一处。
+DEFAULT_TEST_TEXT = (
+    "✅ 喵喵钉钉-微信消息转发桥\n"
+    "通知通道测试成功，之后的故障告警会发到这里。\n"
+    "如果你在群里看到这条消息，说明配置没问题。"
+)
+
 # 钉钉接口返回的错误码，挑几个常见且值得给出人话解释的
 ERR_HINTS = {
     300001: "消息发送太快，被钉钉限流了",
@@ -297,13 +305,21 @@ class DingTalkNotifier:
             else:
                 self._last_sent.pop(key, None)
 
+    def send_custom(self, content: str, at: bool = False) -> tuple[bool, str]:
+        """发送用户自己写的内容。
+
+        与 ``send_text`` 的唯一区别是先做一次人工检查：全空白（比如用户
+        只敲了几个空格回车）直接挡下来并给出人话原因 —— 否则钉钉会返回
+        一个语焉不详的错误码，让人以为 webhook 配错了。
+        """
+        content = (content or "").strip()
+        if not content:
+            return False, "消息内容是空的，请先输入要发送的文字"
+        return self.send_text(content, at=at)
+
     def test(self) -> tuple[bool, str]:
-        """发一条测试消息，用于确认 webhook / 关键词 / 加签是否配对。"""
-        return self.send_text(
-            "✅ 喵喵钉钉-微信消息转发桥\n"
-            "通知通道测试成功，之后的故障告警会发到这里。\n"
-            "如果你在群里看到这条消息，说明配置没问题。",
-            at=False)
+        """发一条默认测试消息，用于确认 webhook / 关键词 / 加签是否配对。"""
+        return self.send_custom(DEFAULT_TEST_TEXT, at=False)
 
 
 # ══════════════════════════════════════════════════════════════════════

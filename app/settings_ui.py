@@ -27,6 +27,7 @@ WINDOW_RE = re.compile(r"^\s*\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\s*$")
 BG = "#eef1f7"
 CARD = "#ffffff"
 BORDER = "#e2e7f0"
+INPUT = "#f7f9fc"
 TEXT = "#1c2333"
 MUTED = "#69728c"
 ACCENT = "#2f6be4"
@@ -52,6 +53,39 @@ TIME_MODES = [
     ("today", "只转发当天消息", "丢弃钉钉标注为「昨天 / 星期X / 月日」的跨天消息（推荐）"),
     ("window", "只在指定时段转发", "在「只转发当天」的基础上，再加一层时段限制"),
 ]
+
+
+# 「钉钉通知」页签里那个输入框，关掉设置再打开时把上次发过的文字还回来。
+# 只存在内存里：一段随手写的通知不值得写进 config.yaml 污染配置。
+# 同一份缓存也给主界面的「发送消息到钉钉」对话框用，两处入口内容互通。
+_LAST_MESSAGE = ""
+_DEFAULT_TEXT_CACHE: str | None = None
+
+
+def last_message() -> str:
+    return _LAST_MESSAGE
+
+
+def remember_message(text: str) -> None:
+    global _LAST_MESSAGE
+    _LAST_MESSAGE = text or ""
+
+
+def default_test_text() -> str:
+    """默认测试文案，取自 bridge.notify —— 与命令行 --notify-test 同一份。"""
+    global _DEFAULT_TEXT_CACHE
+    if _DEFAULT_TEXT_CACHE is None:
+        try:
+            import sys
+            root = str(Path(__file__).resolve().parent.parent)
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            from bridge.notify import DEFAULT_TEST_TEXT
+            _DEFAULT_TEXT_CACHE = DEFAULT_TEST_TEXT
+        except Exception:
+            # 取不到文案不该让设置窗口打不开，退化成一句等价的提示
+            _DEFAULT_TEXT_CACHE = "测试消息：喵喵钉钉-微信消息转发桥通知通道正常。"
+    return _DEFAULT_TEXT_CACHE
 
 
 def _card(parent, title: str = "") -> tk.Frame:
@@ -389,11 +423,37 @@ class SettingsDialog:
         self._field(box, "自定义关键词", self.st["n_keyword"], 20,
                     "机器人开了「自定义关键词」才需要填；内容里缺这个词会自动补一行")
 
+        # ---- 自定义消息 ----
+        # 一个能直接打字的输入框：想发什么就写什么，不必先保存设置。
+        # 用途不只是连通性测试 —— 换班、交接口径变了、临时通知群里的同事，
+        # 都可以直接用这个框（这条通道本来就只有「发」这一个方向）。
+        tk.Label(box, text="发到群里的内容（想发什么就打在这里）：", bg=CARD,
+                 fg=MUTED, font=F_SMALL).pack(anchor="w", padx=14, pady=(8, 2))
+        wrap = tk.Frame(box, bg=BORDER)
+        wrap.pack(fill="x", padx=14)
+        self._composer = tk.Text(wrap, height=4, width=60, wrap="word",
+                                 font=F_UI, bg=INPUT, fg=TEXT,
+                                 relief="flat", padx=8, pady=6,
+                                 insertbackground=TEXT,
+                                 highlightthickness=0)
+        self._composer.pack(fill="x", padx=1, pady=1)
+        if last_message():                   # 上一次发过的内容，接着用
+            self._composer.insert("1.0", last_message())
+        self._composer.bind("<Control-Return>", self._send_by_hotkey)
+        _tip(box, "Ctrl+Enter 直接发送。留空会提示；想验证通道是否配对，"
+                  "点「填入测试文案」再发即可。", bg=CARD).pack(anchor="w",
+                                                             padx=16, pady=(2, 6))
+
         line = tk.Frame(box, bg=CARD)
         line.pack(fill="x", padx=14, pady=(2, 12))
-        self._test_btn = ttk.Button(line, text="发送测试消息",
+        self._test_btn = ttk.Button(line, text="发送到钉钉群",
                                     command=self._test_notify)
         self._test_btn.pack(side="left")
+        ttk.Button(line, text="填入测试文案",
+                   command=self._fill_test_text).pack(side="left", padx=(8, 0))
+        ttk.Button(line, text="清空",
+                   command=lambda: self._composer.delete("1.0", "end")
+                   ).pack(side="left", padx=(6, 0))
         self._test_lab = tk.Label(line, text="", bg=CARD, fg=MUTED, font=F_SMALL)
         self._test_lab.pack(side="left", padx=10)
 
@@ -470,8 +530,23 @@ class SettingsDialog:
         if note:
             _tip(row, note, bg=CARD).pack(side="left")
 
+    # ---- 自定义消息输入框的两个辅助 ----
+
+    def _fill_test_text(self):
+        """把默认测试文案灌进输入框（只填不发，发不发由人决定）。"""
+        self._composer.delete("1.0", "end")
+        self._composer.insert("1.0", default_test_text())
+        self._composer.focus_set()
+        self._test_lab.configure(text="已填入测试文案，点「发送到钉钉群」发出",
+                                 fg=MUTED)
+
+    def _send_by_hotkey(self, _evt=None):
+        """Ctrl+Enter 直接发送，并挡掉这次按键带出来的换行。"""
+        self._test_notify()
+        return "break"
+
     def _test_notify(self):
-        """就地发一条测试消息 —— 直接用表单里的值，不必先保存。
+        """把输入框里的内容发到钉钉群 —— 直接用表单里的值，不必先保存。
 
         刻意不调 config.yaml：用户往往正是想边填边试。
         bridge/notify.py 只依赖标准库，界面解释器也导入得动。
@@ -484,10 +559,19 @@ class SettingsDialog:
                 "获取位置：钉钉群 → 群设置 → 智能群助手 → 添加机器人 → 自定义（Webhook）",
                 parent=self.win)
             return
+        content = self._composer.get("1.0", "end").strip()
+        if not content:
+            messagebox.showwarning(
+                "还没写内容",
+                "请在「发到群里的内容」输入框里写上要发送的文字。\n\n"
+                "只想验证通道是否配对的话，点「填入测试文案」再发送即可。",
+                parent=self.win)
+            self._composer.focus_set()
+            return
         self._test_btn.configure(state="disabled")
         self._test_lab.configure(text="正在发送…", fg=MUTED)
         vals = (url, self.st["n_secret"].get().strip(),
-                self.st["n_keyword"].get().strip())
+                self.st["n_keyword"].get().strip(), content)
 
         def work():
             try:
@@ -498,11 +582,12 @@ class SettingsDialog:
                 from bridge.notify import DingTalkNotifier
                 nt = DingTalkNotifier(webhook=vals[0], secret=vals[1],
                                       keyword=vals[2])
-                ok, detail = nt.test()
+                ok, detail = nt.send_custom(vals[3])
             except Exception as exc:
                 ok, detail = False, f"{type(exc).__name__}: {exc}"
             self.win.after(0, lambda: self._test_done(ok, detail))
 
+        remember_message(content)            # 下次打开设置时还记得这段文字
         threading.Thread(target=work, daemon=True).start()
 
     def _test_done(self, ok: bool, detail: str):
@@ -512,7 +597,7 @@ class SettingsDialog:
             return
         if ok:
             self._test_lab.configure(text="✓ 已发送，请到钉钉群确认", fg="#0b6b3a")
-            messagebox.showinfo("发送成功", "测试消息已发到钉钉群。", parent=self.win)
+            messagebox.showinfo("发送成功", "消息已发到钉钉群。", parent=self.win)
         else:
             self._test_lab.configure(text=f"✗ 发送失败：{detail}", fg=RED)
             messagebox.showwarning(

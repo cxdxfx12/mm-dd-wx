@@ -32,9 +32,9 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from bridge.config import NotifyConfig, load_config                      # noqa: E402
-from bridge.notify import (AlertHandler, DingTalkNotifier,               # noqa: E402
-                           in_hhmm_window, install_alert_handler,
-                           mask_webhook, match_alert)
+from bridge.notify import (DEFAULT_TEST_TEXT, AlertHandler,              # noqa: E402
+                           DingTalkNotifier, in_hhmm_window,
+                           install_alert_handler, mask_webhook, match_alert)
 
 SECRET = "SECtestsecret0123456789"
 
@@ -223,6 +223,48 @@ class TestSend(unittest.TestCase):
         ok, detail = nf.send_text("x")
         self.assertFalse(ok)
         self.assertIn("JSON", detail)
+
+
+class TestSendCustom(unittest.TestCase):
+    """设置中心和主界面都靠 send_custom 发「用户自己写的内容」。"""
+
+    def test_custom_text_goes_out_as_is(self):
+        rec = _Recorder()
+        ok, detail = notifier(rec).send_custom("今晚 18:00 交接班")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "ok")
+        self.assertEqual(rec.body()["text"]["content"], "今晚 18:00 交接班")
+
+    def test_surrounding_blank_lines_are_trimmed(self):
+        rec = _Recorder()
+        notifier(rec).send_custom("\n  交班了  \n\n")
+        self.assertEqual(rec.body()["text"]["content"], "交班了")
+
+    def test_inner_newlines_are_preserved(self):
+        rec = _Recorder()
+        notifier(rec).send_custom("第一行\n第二行")
+        self.assertEqual(rec.body()["text"]["content"], "第一行\n第二行")
+
+    def test_empty_is_rejected_without_hitting_network(self):
+        for blank in ("", "   ", "\n\t\n"):
+            rec = _Recorder()
+            ok, detail = notifier(rec).send_custom(blank)
+            self.assertFalse(ok, f"{blank!r} 不该发出去")
+            self.assertIn("空", detail)
+            self.assertEqual(rec.count, 0, "空内容不该产生任何请求")
+
+    def test_keyword_still_appended_for_custom_text(self):
+        rec = _Recorder()
+        notifier(rec, keyword="转发桥").send_custom("随便写的通知")
+        self.assertIn("转发桥", rec.body()["text"]["content"])
+
+    def test_default_test_text_is_shared_with_cli(self):
+        # --notify-test 与设置里的「填入测试文案」用的是同一份常量，
+        # 否则两边会慢慢漂移
+        rec = _Recorder()
+        notifier(rec).test()
+        self.assertEqual(rec.body()["text"]["content"], DEFAULT_TEST_TEXT)
+        self.assertIn("喵喵钉钉", DEFAULT_TEST_TEXT)
 
 
 class TestAlertCooldown(unittest.TestCase):

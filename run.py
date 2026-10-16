@@ -8,6 +8,7 @@
     python run.py --export out.csv          # 导出消息
     python run.py --notify-test             # 发一条钉钉通知，验证 webhook 配对
     python run.py --notify-report           # 把当前统计发到钉钉群
+    python run.py --notify-say "交班了"      # 往钉钉群发自定义内容
 """
 from __future__ import annotations
 
@@ -215,6 +216,8 @@ def main() -> int:
                         help="给钉钉机器人发一条测试消息")
     parser.add_argument("--notify-report", action="store_true",
                         help="把累计统计发到钉钉群")
+    parser.add_argument("--notify-say", metavar="文本",
+                        help="把自定义内容发到钉钉群（想发什么就写什么）")
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
     args = parser.parse_args()
 
@@ -243,7 +246,13 @@ def main() -> int:
         svc.close()
         return 0
 
-    if args.notify_test or args.notify_report:
+    if args.notify_test or args.notify_report or args.notify_say:
+        # 空内容属于「参数写错了」，先说清楚，别让它落到后面被一串
+        # errcode 排查提示盖住 —— 那会让人以为是 webhook 配错了。
+        if args.notify_say is not None and not args.notify_say.strip():
+            print("消息内容是空的。--notify-say 后面要跟上要发送的文字，例如：")
+            print('  python run.py --notify-say="今天设备检修，下午 2 点恢复"')
+            return 1
         # 刻意不构造 BridgeService：通知测试不该依赖微信/钉钉环境，
         # 换台没装微信的机器也应该能验证 webhook 是否配对。
         from bridge.notify import DingTalkNotifier, mask_webhook
@@ -261,6 +270,8 @@ def main() -> int:
         print(f"通道状态：{nt.describe()}")
         if args.notify_test:
             ok, detail = nt.test()
+        elif args.notify_say:
+            ok, detail = nt.send_custom(args.notify_say)
         else:
             from bridge.storage import Storage
             st = Storage(cfg.resolve(cfg.storage.db_path))

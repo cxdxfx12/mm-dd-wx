@@ -84,7 +84,7 @@ python app\setup.py --quiet     # 静默安装（部署脚本用）
 | **时间范围** | 不限时间 / 只转发当天消息（默认）/ 只在指定时段转发（`08:00-18:00`，支持跨零点 `22:00-06:00`） |
 | **采集与投递** | 试运行开关、钉钉轮询间隔、微信发送间隔、锚点防护、标题护栏与阈值 |
 | **消息格式** | 转发文案模板（`{company} {sender} {chat} {time} {content} {type}`），带实时预览 |
-| **钉钉通知** | 自定义机器人 webhook、加签 / 关键词、告警场景与阈值、定时运行报告，可**当场发测试消息** |
+| **钉钉通知** | 自定义机器人 webhook、加签 / 关键词、告警场景与阈值、定时运行报告，可**当场发自定义消息** |
 | **其他** | 开机自动启动、解释器信息、重新检测环境、打开数据/日志目录 |
 
 保存时自动把原配置备份到 `data/backup/`；改动**按行写入** `config.yaml`，
@@ -106,6 +106,12 @@ python app\setup.py --quiet     # 静默安装（部署脚本用）
 | 运行报告 | 每小时 / 每天定时把收到、发送、失败、累计入库发到群里 |
 | 启停通知 | 开始、停止运行时各发一条 |
 
+除了机器自己发，这条通道也可以**手动用**：设置中心「钉钉通知」页签里有一个
+输入框，想发什么就打什么，`Ctrl+Enter` 或点「发送到钉钉群」即可（主界面
+**工具 → 发送消息到钉钉群…** 是同一个入口，两边共用上次输入的内容）。
+只想验证配置是否配对，点「填入测试文案」再发 —— 那段文案与命令行
+`--notify-test` 用的是同一份，不会两边写的慢慢对不上。
+
 实现上刻意**零侵入采集代码**：`bridge/notify.py` 往 `bridge` 这个 logger 上挂一个
 `AlertHandler`，把采集端本来就会打的 WARNING 日志映射成告警文案。好处是采集、
 投递、路由任何一处将来新增的 ERROR 都自动覆盖，且通知模块出问题不会影响主流程。
@@ -116,6 +122,7 @@ python app\setup.py --quiet     # 静默安装（部署脚本用）
 ```bash
 python run.py --notify-test      # 发一条测试消息，验证 webhook / 关键词 / 加签
 python run.py --notify-report    # 把累计统计发到钉钉群
+python run.py --notify-say="今天设备检修，下午 2 点恢复"   # 发自定义内容
 ```
 
 配置在 `config.yaml` 的 `notify` 段（**必须写在 `routes:` 之前** —— 界面重建
@@ -172,7 +179,7 @@ ddwx-bridge/
 │   ├── dump_dingtalk_tree.py    导出钉钉控件树
 │   ├── dingtalk_tree.txt        实测证据：钉钉消息区为空
 │   └── wechat_tree.txt          实测证据：微信 4.x 控件树
-├── tests/                148 项离线单元测试（核心链路 / OCR 解析 / 锚点 / 跨天 /
+├── tests/                178 项离线单元测试（核心链路 / OCR 解析 / 锚点 / 跨天 /
 │                         一对多 / 解释器探测 / 钉钉通知）
 ├── run.py                入口
 ├── probe_dingtalk.py     钉钉侧能力探针
@@ -268,6 +275,7 @@ python run.py --live                     # 6. 正式运行
 | `python run.py --export out.csv` | 导出消息为 CSV（UTF-8-BOM，Excel 可直接打开） |
 | `python run.py --notify-test` | 发一条钉钉测试消息，验证 webhook / 关键词 / 加签 |
 | `python run.py --notify-report` | 把累计统计发到钉钉群 |
+| `python run.py --notify-say="文本"` | 把自定义内容发到钉钉群（等同界面上那个输入框） |
 | `python probe_dingtalk.py` | 探测钉钉侧该走哪条路线 |
 | `python tools/dump_dingtalk_tree.py` | 导出钉钉控件树（UI 模式调试用） |
 | `python -m unittest discover -s tests -v` | 运行单元测试 |
