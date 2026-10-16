@@ -89,7 +89,9 @@ MIN_CONF = 0.35                 # OCR 置信度下限
 UI_WORDS = {"复制", "下载", "编辑", "转发", "收藏", "提醒", "未查收", "已读", "已签收",
             "群签到", "水印拍照", "员工档案", "任务进度", "使用帮助"}
 SIZE_RE = re.compile(r"^\d+(\.\d+)?\s*(KB|MB|GB|B)$", re.I)
-DIGIT_GAP_RE = re.compile(r"(?<=\d) (?=\d)")          # 「77035 18」→「7703518」
+# 引擎把「日期 时间」粘死时的修复：「2026-10-1615:56:22」→「2026-10-16 15:56:22」。
+# 模式要求完整日期+时间形状，不会误伤普通内容
+DATETIME_GLUE_RE = re.compile(r"(\d{4}-\d{1,2}-\d{1,2})(\d{1,2}:\d{2}(?::\d{2})?)")
 # 时间戳样式（配合居中位置判定；单纯居中不足以判定，中部的灰色文字会误判）
 TIME_RE = re.compile(r"^(今天|昨天|前天)?\s*\d{1,2}:\d{2}$|^\d+\s*分钟前$|"
                      r"^\d+\s*小时前$|^刚刚$|^星期[一二三四五六日]\s*\d{1,2}:\d{2}$|"
@@ -303,16 +305,40 @@ def merge_lines(blocks: list[dict]) -> list[dict]:
     out = []
     for ln in sorted(lines, key=lambda x: x["y0"]):
         parts = sorted(ln["parts"], key=lambda p: p["x0"])
-        text = " ".join(p["text"] for p in parts)
+        text = DATETIME_GLUE_RE.sub(r"\1 \2", _join_line_text(parts))
         out.append({
             "y0": ln["y0"], "y1": ln["y1"],
             "x0": min(p["x0"] for p in parts),
             "x1": max(p["x1"] for p in parts),
-            "text": DIGIT_GAP_RE.sub("", text),
+            "text": text,
             "kind": ln["parts"][0]["kind"],
             "kinds": [p["kind"] for p in parts],
         })
     return out
+
+
+def _join_line_text(parts: list[dict]) -> str:
+    """把一行里的 OCR 块按 x 顺序拼回文本。
+
+    关键在**空格给不给**：两个纯数字块几乎贴着（间隙 ≤ 1.2×字宽），
+    判为同一个数字被检测框拆开，直接连回去；否则保留空格。
+    表格里「单号 | 票数」的列间距实测 ≥25px（≈3×字宽），不会被误连——
+    旧的全局去空格规则会把「773446376739379 1」粘成 16 位数，
+    单号和票数全错（2026-10-16 线上实测）。
+    """
+    text = ""
+    prev: dict | None = None
+    for p in parts:
+        if prev is not None:
+            gap = p["x0"] - prev["x1"]
+            cw = ((prev["x1"] - prev["x0"]) / max(1, len(prev["text"]))
+                  + (p["x1"] - p["x0"]) / max(1, len(p["text"]))) / 2
+            if not (prev["text"].isdigit() and p["text"].isdigit()
+                    and gap <= 1.2 * cw):
+                text += " "
+        text += p["text"]
+        prev = p
+    return text
 
 
 def group_units(lines: list[dict], area_w: int) -> list[dict]:
@@ -477,7 +503,14 @@ class DingTalkOCRSource(Source):
     def _get_ocr(self):
         if self._ocr is None:
             from rapidocr_onnxruntime import RapidOCR
-            self._ocr = RapidOCR()
+            # 2026-10-16 实测标定：默认参数（limit_side_len=736, box_thresh=0.5）
+            # 检不出表格里的孤立数字——「票数」列的「1」6 个全丢，转发内容缺列。
+            # 把检测输入分辨率提到 1536、放宽阈值后 6/6 检出；
+            # 代价是单帧 OCR 0.6→1.6s（轮询间隔 5s，仍富余）。
+            # det_model_path=None 是绕过该版本 kwargs 覆盖逻辑的必填占位。
+            self._ocr = RapidOCR(det_limit_side_len=1536, det_box_thresh=0.35,
+                                 det_thresh=0.25, text_score=0.35,
+                                 det_model_path=None)
         return self._ocr
 
     def _find_window(self):
@@ -654,12 +687,21 @@ class DingTalkOCRSource(Source):
         chat_names = list(self.dt.chat_names or [])
         log.info("OCR 轮询启动，间隔 %.1fs，监控会话：%s", self.interval, chat_names)
         poll = max(self.interval, 4.0)
+        # 心跳：没有新消息时日志一片安静，用户没法区分「在正常巡检」和
+        # 「悄悄失效」。每 10 分钟报一次到帧情况，降低排查成本。
+        beat_at = time.time()
+        frames = 0
         while not self._stop.is_set():
             started = time.time()
             try:
                 self._poll_once(on_message)
+                frames += 1
             except Exception as exc:
                 log.exception("OCR 轮询异常：%s", exc)
+            if time.time() - beat_at >= 600:
+                log.info("采集心跳：近 %.0f 分钟巡检 %d 帧，链路正常",
+                         (time.time() - beat_at) / 60, frames)
+                beat_at, frames = time.time(), 0
             # 等待切片化：停止指令（含看门狗抛出的 KeyboardInterrupt）能秒级生效，
             # 不必等满一个完整轮询周期。
             deadline = started + poll

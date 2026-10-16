@@ -9,8 +9,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bridge.sources.dingtalk_ocr import (   # noqa: E402
-    classify_block, merge_lines, group_units, DIGIT_GAP_RE,
+    classify_block, merge_lines, group_units, DATETIME_GLUE_RE,
     is_cross_day, unit_fp, pick_new_units, norm_title, partial_ratio,
+    _join_line_text,
 )
 
 
@@ -75,8 +76,36 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(classify_block("59.7KB", 164.0, (163, 164, 165),
                                         (117, 183, 200, 201), self.AREA_W), "drop")
 
-    def test_digit_gap_fix(self):
-        self.assertEqual(DIGIT_GAP_RE.sub("", "7703518547221 96"), "770351854722196")
+    def test_split_number_parts_rejoined(self):
+        # 同一个数字被检测框拆成两半：两块几乎贴着（间隙 ≈ 0.3×字宽）→ 连回
+        parts = [blk(10, 0, 94, 12, "7703518547221"),    # 84px/13字 ≈ 6.5/字
+                 blk(96, 0, 109, 12, "96")]
+        self.assertEqual(_join_line_text(parts), "770351854722196")
+
+    def test_table_columns_keep_space(self):
+        # 线上实测（2026-10-16）：单号列与票数列的列间距 ≈3×字宽。
+        # 旧的全局去空格规则会把「单号 票数」粘成 16 位数，两列全错
+        parts = [blk(184, 0, 306, 12, "773446376739379"),   # 122px/15字 ≈ 8.1
+                 blk(332, 0, 340, 12, "1"),
+                 blk(388, 0, 524, 12, "2026-10-1615:56:22")]
+        self.assertEqual(_join_line_text(parts),
+                         "773446376739379 1 2026-10-1615:56:22")
+
+    def test_text_parts_keep_space(self):
+        parts = [blk(58, 0, 134, 12, "服务诊断专员"),
+                 blk(156, 0, 194, 12, "机器人")]
+        self.assertEqual(_join_line_text(parts), "服务诊断专员 机器人")
+
+    def test_datetime_glue_repaired(self):
+        # 引擎把「日期 时间」粘死是线上实测行为，确定性规则补回空格
+        fix = lambda s: DATETIME_GLUE_RE.sub(r"\1 \2", s)
+        self.assertEqual(fix("张勇 1 2026-10-1615:56:22"),
+                         "张勇 1 2026-10-16 15:56:22")
+        self.assertEqual(fix("2026-10-1611:51:34"), "2026-10-16 11:51:34")
+        # 本来就有空格的保持不变
+        self.assertEqual(fix("2026-10-16 15:56:22"), "2026-10-16 15:56:22")
+        # 不完整的日期（没有时间部分）不动
+        self.assertEqual(fix("截止 2026-10-16 交付"), "截止 2026-10-16 交付")
 
 
 class TestMergeLines(unittest.TestCase):
