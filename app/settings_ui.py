@@ -104,11 +104,15 @@ def _tip(parent, text: str, bg: str = CARD, fg: str = MUTED,
     return lab
 
 
-def _scroll_area(parent) -> tk.Frame:
-    """返回一个可垂直滚动的内层 Frame。"""
-    canvas = tk.Canvas(parent, bg=CARD, highlightthickness=0)
+def _scroll_area(parent, bg: str = BG) -> tk.Frame:
+    """返回一个可垂直滚动的内层 Frame；内容装得下时自动收起滚动条。
+
+    滚轮绑定用「进入本区域才接管」的写法，不能用 ``bind_all`` ——
+    多个滚动区共存时，后建的会把先建的顶掉，前面那些页签就滚不动了。
+    """
+    canvas = tk.Canvas(parent, bg=bg, highlightthickness=0)
     bar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-    inner = tk.Frame(canvas, bg=CARD)
+    inner = tk.Frame(canvas, bg=bg)
     window = canvas.create_window((0, 0), window=inner, anchor="nw")
     canvas.configure(yscrollcommand=bar.set)
     canvas.pack(side="left", fill="both", expand=True)
@@ -117,11 +121,24 @@ def _scroll_area(parent) -> tk.Frame:
     def _resize(_evt=None):
         canvas.configure(scrollregion=canvas.bbox("all"))
         canvas.itemconfigure(window, width=canvas.winfo_width())
+        # 内容没有溢出就把滚动条收起来，免得每个页签都拖一条没用的条
+        try:
+            over = inner.winfo_reqheight() > canvas.winfo_height() + 1
+            if over and not bar.winfo_ismapped():
+                bar.pack(side="right", fill="y")
+            elif not over and bar.winfo_ismapped():
+                bar.pack_forget()
+        except Exception:
+            pass
+
+    def _wheel(evt):
+        step = evt.delta // 120
+        canvas.yview_scroll(-step if step else -1, "units")
 
     inner.bind("<Configure>", _resize)
     canvas.bind("<Configure>", _resize)
-    canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(
-        -1 * (e.delta // 120), "units"))
+    canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel))
+    canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
     return inner
 
 
@@ -139,8 +156,12 @@ class SettingsDialog:
 
         self.win = tk.Toplevel(app)
         self.win.title("设置中心 — 钉钉 → 微信 消息转发桥")
-        self.win.geometry("840x660")
-        self.win.minsize(760, 560)
+        # 默认给高一点，但**不能超过屏幕** —— 窗口比屏幕还高时，钉在底部的
+        # 「保存」按钮会跑到屏幕外，又变成点不着。所以按屏幕高度夹一下。
+        screen_h = self.win.winfo_screenheight()
+        height = max(520, min(700, screen_h - 140))
+        self.win.geometry(f"840x{height}")
+        self.win.minsize(760, 520)
         self.win.configure(bg=BG)
         self.win.transient(app)
 
@@ -151,6 +172,19 @@ class SettingsDialog:
     # ------------------------------------------------------------ 布局
 
     def _build(self):
+        # ⚠ pack 顺序即「分配顺序」：底部按钮栏必须**先**占位（side=bottom），
+        #   否则页签内容一旦比窗口高，排最后的按钮栏会被挤成 0 高度 ——
+        #   「保存」按钮直接消失，用户就没法保存设置了。
+        bar = tk.Frame(self.win, bg=BG)
+        bar.pack(side="bottom", fill="x", padx=18, pady=(4, 14))
+        tk.Button(bar, text="保 存", command=self.save, bg=ACCENT, fg="#ffffff",
+                  activebackground="#2456bd", activeforeground="#ffffff",
+                  relief="flat", bd=0, font=("Microsoft YaHei UI", 10, "bold"),
+                  padx=22, pady=8, cursor="hand2").pack(side="right")
+        ttk.Button(bar, text="取消", command=self.win.destroy).pack(side="right",
+                                                                   padx=8)
+        ttk.Button(bar, text="还原本次修改", command=self._reload).pack(side="left")
+
         head = tk.Frame(self.win, bg=BG)
         head.pack(fill="x", padx=18, pady=(14, 6))
         tk.Label(head, text="设置中心", bg=BG, fg=TEXT,
@@ -168,25 +202,22 @@ class SettingsDialog:
         self._tab_notify(nb)
         self._tab_misc(nb)
 
-        bar = tk.Frame(self.win, bg=BG)
-        bar.pack(fill="x", padx=18, pady=(4, 14))
-        tk.Button(bar, text="保 存", command=self.save, bg=ACCENT, fg="#ffffff",
-                  activebackground="#2456bd", activeforeground="#ffffff",
-                  relief="flat", bd=0, font=("Microsoft YaHei UI", 10, "bold"),
-                  padx=22, pady=8, cursor="hand2").pack(side="right")
-        ttk.Button(bar, text="取消", command=self.win.destroy).pack(side="right",
-                                                                   padx=8)
-        ttk.Button(bar, text="还原本次修改", command=self._reload).pack(side="left")
+    def _page(self, nb, title: str, scroll: bool = True) -> tk.Frame:
+        """建一个页签页。默认套一层滚动区，内容再长也不会够不着底部。
 
-    def _page(self, nb, title: str) -> tk.Frame:
+        「转发规则」自己带一个滚动列表（要跟着窗口一起拉伸），所以传
+        scroll=False，避免两层滚动互相干扰。
+        """
         page = tk.Frame(nb, bg=BG)
         nb.add(page, text=f"   {title}   ")
-        return page
+        if not scroll:
+            return page
+        return _scroll_area(page, bg=BG)
 
     # ------------------------------------------------------------ 转发规则
 
     def _tab_rules(self, nb):
-        page = self._page(nb, "转发规则")
+        page = self._page(nb, "转发规则", scroll=False)
         box = _card(page, "钉钉群  →  微信群（一条规则一行，可加多条）")
         box.pack(fill="both", expand=True, padx=12, pady=(12, 6))
         _tip(box, "「钉钉群」填群名里能认出的片段即可（做子串匹配，例如「数字质控」）；\n"
@@ -198,7 +229,7 @@ class SettingsDialog:
 
         holder = tk.Frame(box, bg=CARD)
         holder.pack(fill="both", expand=True, padx=8, pady=4)
-        inner = _scroll_area(holder)
+        inner = _scroll_area(holder, bg=CARD)      # 规则列表自己滚（贴着卡片底色）
 
         for r in cfgfile.read_rules(self.path) or []:
             self._add_rule_row(inner, "; ".join(r.get("sources") or []),
