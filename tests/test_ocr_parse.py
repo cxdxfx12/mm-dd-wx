@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bridge.sources.dingtalk_ocr import (   # noqa: E402
     classify_block, merge_lines, group_units, DIGIT_GAP_RE,
-    is_cross_day, unit_fp, pick_new_units,
+    is_cross_day, unit_fp, pick_new_units, norm_title, partial_ratio,
 )
 
 
@@ -247,6 +247,80 @@ class TestCrossDay(unittest.TestCase):
         # 凌晨 1:30 看「3小时前」= 昨天 22:30，属跨天
         self.assertTrue(is_cross_day("3小时前", datetime(2026, 10, 16, 1, 30)))
         self.assertFalse(is_cross_day("1小时前", datetime(2026, 10, 16, 1, 30)))
+
+
+class TestTitleMatch(unittest.TestCase):
+    """标题护栏匹配（2026-10-16 线上故障的回归测试）。
+
+    故障：标题条里群名行下面还有一行「归属于 XX集团」，整条 OCR 时
+    两行被检测框合并，「【数字质控】浙江杭州萧山区大江东公司」被读成
+    「学国控）新江州山区大江东公司」，整串相似度只剩 0.12，
+    护栏连续 2 分钟拦掉所有帧，转发整体停摆。
+    修法：多候选读法 + partial_ratio 片段匹配。
+    下列乱码全部取自当日真实 OCR 输出。
+    """
+
+    NAME = "数字质控"
+
+    def _match(self, cands):
+        """用最小桩走一遍 _title_matches 的判定逻辑（不依赖窗口/OCR）。"""
+        names = [self.NAME]
+        cands = [c for c in (norm_title(t) for t in cands) if c]
+        best = 0.0
+        for n in names:
+            if any(n in c for c in cands):
+                return True, 1.0
+            best = max(best, max((partial_ratio(n, c) for c in cands),
+                                 default=0.0))
+        return best >= 0.55, best
+
+    def test_perfect_title_passes(self):
+        ok, r = self._match(["【数字质控】浙江杭州萧山区大江东公司 ③ 5"])
+        self.assertTrue(ok)
+        self.assertEqual(r, 1.0)
+
+    def test_typoed_title_passes(self):
+        # 质→教、【】→［】、漏「萧」：片段相似度 0.75 应当通过
+        ok, r = self._match(["［教字质控1浙江杭州山区大江东公司员5闵"])
+        self.assertTrue(ok, f"相似度 {r:.2f}")
+        self.assertGreaterEqual(r, 0.75)
+
+    def test_two_row_merge_garble_alone_fails(self):
+        # 两行合并读法的乱码：连「数」「字」都认错，单看它就该拦
+        ok, r = self._match(["学国控）新江州山区大江东公司"])
+        self.assertFalse(ok)
+        self.assertLess(r, 0.55)
+
+    def test_multi_candidate_picks_the_readable_one(self):
+        # 同一帧的多个候选里只要有一个读对了就放行——这是修复的核心
+        ok, r = self._match([
+            "学国控）新江州山区大江东公司",
+            "［数字质控1浙江杭州山区大江东公司员5闵",
+        ])
+        self.assertTrue(ok)
+        self.assertEqual(r, 1.0)
+
+    def test_unrelated_chat_fails(self):
+        ok, r = self._match(["张三", "产品评审会"])
+        self.assertFalse(ok)
+        self.assertEqual(r, 0.0)
+
+    def test_empty_candidates_fail(self):
+        ok, _ = self._match(["", "   "])
+        self.assertFalse(ok)
+
+    def test_partial_ratio_basics(self):
+        self.assertEqual(partial_ratio("数字质控", "数字质控1浙江"), 1.0)
+        self.assertEqual(partial_ratio("数字质控", "教字质控】浙江"), 0.75)
+        # 「国」不在配置名里，公共块只剩「控」
+        self.assertEqual(partial_ratio("数字质控", "国控"), 0.25)
+        self.assertEqual(partial_ratio("数字质控", "张三的会话"), 0.0)
+        self.assertEqual(partial_ratio("", "任意"), 0.0)
+        self.assertEqual(partial_ratio("任意", ""), 0.0)
+
+    def test_norm_title_strips_decorations(self):
+        self.assertEqual(norm_title("【数字质控】浙江-杭州 大江东"),
+                         "数字质控浙江杭州大江东")
 
 
 if __name__ == "__main__":

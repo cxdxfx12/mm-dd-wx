@@ -56,7 +56,7 @@ def grab_units(cfg):
         print("[失败] 截帧失败（钉钉未打开？窗口被最小化？）")
         return None, None
 
-    title = (frame["title"] or "").strip()
+    title = " / ".join(frame["title"] or []) or "(读不到标题)"
     print(f"[标题条] {title!r}")
     if src.title_check:
         passed, ratio, matched = src._title_matches(frame["title"])

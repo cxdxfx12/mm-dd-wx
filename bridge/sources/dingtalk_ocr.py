@@ -126,6 +126,31 @@ MINUTES_AGO_RE = re.compile(r"^(\d+)\s*分钟前$")
 WINDOW_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$")
 
 
+def norm_title(s: str) -> str:
+    """标题/群名归一化：去掉空白与装饰括号，只留实质字符。"""
+    return re.sub(r"[\s【】\[\]（）()·\-—_]", "", s or "")
+
+
+def partial_ratio(needle: str, hay: str) -> float:
+    """needle 在 hay 里的**最佳片段**相似度（0~1）。
+
+    为什么不用整串 SequenceMatcher.ratio()：窗口标题常带前后缀
+    （「③5 更新」「归属于 …」），整串比较会稀释相似度；而 OCR 又
+    会错字漏字，简单的 ``needle in hay`` 判不中。这里取「最长公共
+    连续块占 needle 长度」的比例做分——
+
+        partial_ratio("数字质控", "教字质控】浙江杭州…")  -> 0.75
+        partial_ratio("数字质控", "张三的会话")            -> 0.0
+    """
+    if not needle or not hay:
+        return 0.0
+    if needle in hay:
+        return 1.0
+    m = difflib.SequenceMatcher(None, needle, hay).find_longest_match(
+        0, len(needle), 0, len(hay))
+    return m.size / len(needle)
+
+
 def parse_clock(t: str, now: datetime | None = None) -> tuple[int, int] | None:
     """把钉钉时间戳换算成当天时刻 ``(时, 分)``；判不出来返回 None。"""
     s = (t or "").replace(" ", "")
@@ -482,42 +507,68 @@ class DingTalkOCRSource(Source):
 
     # ---------- 每帧处理 ----------
 
-    def _read_title(self, wnd, msg_rect) -> str:
-        """OCR 窗口标题条（聊天面板顶部），返回原始文本。"""
+    def _read_title(self, wnd, msg_rect) -> list[str]:
+        """OCR 窗口标题条（聊天面板顶部），返回多个候选读法。
+
+        为什么返回列表：标题行下面紧挨着「归属于 XX集团」一行，整条
+        一起识别时两行会被检测框合并、互相拖累——实测把
+        「【数字质控】浙江杭州萧山区大江东公司」读成
+        「学国控）新江州山区大江东公司」，护栏直接判死。
+        所以除整条外，把上段（群名行）、下段（归属行）各单独识别一遍，
+        由 _title_matches 取最像配置名的一个。
+        """
         import numpy as np
         from PIL import Image
 
         wr = wnd.BoundingRectangle
         w = wr.right - wr.left
         left, top = msg_rect[0], msg_rect[1]
-        strip = (left, max(20, top - 64), w, max(top - 4, top - 64 + 10))
-        img = self._last_frame.crop(strip)
-        img = img.resize((int(img.width * 2), int(img.height * 2)),
-                         Image.LANCZOS)
-        res, _ = self._get_ocr()(np.array(img))
-        return "".join(x[1] for x in (res or []))
+        strip = self._last_frame.crop(
+            (left, max(20, top - 64), w, max(top - 4, top - 64 + 10)))
+        h = strip.height
 
-    def _title_matches(self, title: str) -> tuple[bool, float, str]:
-        """标题与 chat_names 之一匹配则通过。
+        parts = [strip, strip.crop((0, 0, strip.width, max(12, int(h * 0.6))))]
+        if h > 30:
+            parts.append(strip.crop((0, int(h * 0.35), strip.width, h)))
+        texts: list[str] = []
+        for part in parts:
+            for scale in (2.0, 3.0):
+                img = part.resize((int(part.width * scale),
+                                   int(part.height * scale)), Image.LANCZOS)
+                res, _ = self._get_ocr()(np.array(img))
+                text = "".join(x[1] for x in (res or [])).strip()
+                if text:
+                    if text not in texts:
+                        texts.append(text)
+                    break        # 该区域已读出内容，不必再放大
+        return texts
+
+    def _title_matches(self, title: str | list[str]) -> tuple[bool, float, str]:
+        """标题（或候选读法列表）与 chat_names 之一匹配则通过。
 
         两层判定（取更宽松的一个）：
-          1. **包含**：标题里直接含有配置名（设置中心保存的往往是群名片段，
-             如「数字质控」，必须走这条才判得中）；
-          2. **模糊**：OCR 会认错字，用相似度兜底（实测误读「综学国控」
-             对全名相似度 0.65 仍应通过）。
+          1. **包含**：标题里直接含有配置名（设置中心保存的往往是群名
+             片段，如「数字质控」，必须走这条才判得中）；
+          2. **片段模糊**：OCR 会认错字、标题又带前后缀，用
+             partial_ratio（配置名在标题里的最佳片段相似度）兜底，
+             阈值 title_ratio。
         """
         names = [n for n in (self.dt.chat_names or []) if n]
         if not names:
             return True, 1.0, ""
-        norm = re.sub(r"[\s【】\[\]（）()·\-—_]", "", title)
+        cands = [c for c in (norm_title(t) for t in
+                             (title if isinstance(title, list) else [title]))
+                 if c]
         best_name, best = "", 0.0
         for n in names:
-            nn = re.sub(r"[\s【】\[\]（）()·\-—_]", "", n)
-            if nn and nn in norm:
+            nn = norm_title(n)
+            if not nn:
+                continue
+            if any(nn in c for c in cands):      # 包含即通过，零误杀
                 return True, 1.0, n
-            ratio = difflib.SequenceMatcher(None, norm, nn).ratio()
-            if ratio > best:
-                best_name, best = n, ratio
+            r = max((partial_ratio(nn, c) for c in cands), default=0.0)
+            if r > best:
+                best_name, best = n, r
         return best >= self.title_ratio, best, best_name
 
     def _grab_frame(self) -> dict | None:
@@ -575,7 +626,7 @@ class DingTalkOCRSource(Source):
             blocks.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1,
                            "text": item[1].strip(), "kind": kind, "conf": conf})
 
-        title = self._read_title(wnd, msg_rect) if self.title_check else ""
+        title = self._read_title(wnd, msg_rect) if self.title_check else []
         return {"area_w": aw, "area_h": ah, "blocks": blocks, "title": title}
 
     # ---------- Source 接口 ----------
@@ -624,8 +675,9 @@ class DingTalkOCRSource(Source):
         if self.title_check:
             ok, ratio, matched = self._title_matches(frame["title"])
             if ok != self._last_title_ok:
+                shown = " / ".join(frame["title"]) or "(读不到标题)"
                 log.info("会话标题校验：%s（相似度 %.2f，标题=%r）",
-                         "通过" if ok else "不通过——本帧不转发", ratio, frame["title"])
+                         "通过" if ok else "不通过——本帧不转发", ratio, shown)
                 self._last_title_ok = ok
             if not ok:
                 # 切回来时重新对齐基线，避免把旧帧当新消息

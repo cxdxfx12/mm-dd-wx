@@ -37,7 +37,7 @@ def show_frame(src: DingTalkOCRSource, raw: bool) -> Counter:
         print("[失败] 截帧失败（钉钉未开？窗口最小化？）")
         return Counter()
 
-    print(f"\n[标题条] {frame['title']!r}")
+    print(f"\n[标题条] {' / '.join(frame['title'] or []) or '(读不到标题)'!r}")
     if src.title_check:
         ok, ratio, matched = src._title_matches(frame["title"])
         mark = "通过" if ok else "不通过（正式运行时本帧全部丢弃）"
