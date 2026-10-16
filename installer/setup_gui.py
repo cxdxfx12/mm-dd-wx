@@ -458,6 +458,22 @@ class Wizard(tk.Tk):
         sys.path.insert(0, str(app_dir))
         import cfgfile                                   # noqa: E402
         cfg = self.install_dir / "config.yaml"
+        sample = self.install_dir / "config.example.yaml"
+
+        # 安装包**刻意不含 config.yaml**，原因有两个：
+        #   1) 构建机的 config.yaml 里带着真实的群名和机器人 token，
+        #      打进安装包等于把凭证随二进制一起分发出去；
+        #   2) 升级时整包解压会覆盖掉用户自己改过的配置。
+        # 所以首次安装从样板生成，升级时原配置原样保留。
+        if not cfg.is_file() and sample.is_file():
+            shutil.copy2(sample, cfg)
+            self._ui(self._log, "已按配置样板生成 config.yaml", "ok")
+
+        # 从老版本升级上来的 config.yaml 没有 notify 段，缺了它「设置中心 →
+        # 钉钉通知」就存不进去。段文本直接从样板里取，新增配置项时不会漏。
+        if cfgfile.ensure_section(cfg, "notify", cfgfile.section_text(sample, "notify")):
+            self._ui(self._log, "钉钉通知配置段已就绪", "ok")
+
         # wxauto 库随程序一起安装，写绝对路径，配置搬到 %APPDATA% 后也不失效
         cfgfile.set_scalar(cfg, "wechat", "wxauto_path",
                            str(self.install_dir / "wxauto-main"))

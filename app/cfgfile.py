@@ -106,6 +106,79 @@ def backup(path: Path) -> Path | None:
     return dst
 
 
+def has_section(path: str | Path, section: str) -> bool:
+    """配置文件里是否存在某个顶层段。
+
+    用在「设置中心」写 notify 段之前：老版本 config.yaml 没有这一段时，
+    直接报「写入失败」会让人一头雾水，先检查再给出可操作的提示。
+    """
+    p = Path(path)
+    if not p.is_file():
+        return False
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+    except Exception:
+        return False
+    return _section_range(lines, section) is not None
+
+
+def section_text(path: str | Path, section: str) -> str:
+    """取出某个顶层段的**原文**（含注释），用于搬到别的配置文件里。
+
+    刻意复用它而不是在别处再抄一份：新增配置项时只要有样板文件在，
+    升级路径就自动同步，不会漏改。
+
+    连同段头上方的连续注释一起取出来 —— 那些注释通常是这一段的说明
+    （比如 notify 段上面讲的「webhook 只能发不能收」），少了它们，
+    升级补进来的段就只剩一堆没有上下文的键。
+    """
+    p = Path(path)
+    if not p.is_file():
+        return ""
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+    except Exception:
+        return ""
+    sr = _section_range(lines, section)
+    if sr is None:
+        return ""
+    start = sr[0]
+    while start > 0 and lines[start - 1].strip().startswith("#"):
+        start -= 1
+    return "".join(lines[start:sr[1]])
+
+
+def ensure_section(path: str | Path, section: str, block: str) -> bool:
+    """确保配置文件里有某个顶层段；缺了就插到 ``routes`` 段之前。
+
+    返回 True 表示「现在存在了」（本来就有，或刚插进去）。
+    ``block`` 是段的完整原文，通常来自 ``section_text(样板文件, section)``。
+
+    插在 routes **之前**是硬要求：`set_routes()` 需要 routes 是最后一个
+    顶层段，否则它会拒绝整段重写。
+    """
+    p = Path(path)
+    if not p.is_file() or not (block or "").strip():
+        return False
+    lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+    if _section_range(lines, section) is not None:
+        return True
+
+    at = len(lines)
+    for i, line in enumerate(lines):
+        m = _SECTION_RE.match(line.rstrip("\n"))
+        if m and _indent(line) == 0 and m.group(1) == "routes":
+            at = i
+            break
+
+    text = block if block.endswith("\n") else block + "\n"
+    if at > 0 and lines[at - 1].strip():        # 与上文之间留一个空行
+        text = "\n" + text
+    lines[at:at] = text.splitlines(keepends=True)
+    _write(p, lines)
+    return True
+
+
 def set_scalar(path: str | Path, section: str, key: str, value) -> bool:
     """替换 ``section`` 下 ``key`` 的标量值，保留行内其它内容与全部注释。"""
     p = Path(path)

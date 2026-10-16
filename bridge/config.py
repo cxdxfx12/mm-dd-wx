@@ -43,6 +43,31 @@ class WeChatConfig:
 
 
 @dataclass
+class NotifyConfig:
+    """钉钉机器人通知（告警 / 运行报告）。
+
+    ⚠ 这里的 webhook 是**自定义机器人**，只能往群里发消息、收不到群消息，
+    不参与「钉钉 → 微信」的取数，详见 bridge/notify.py 顶部说明。
+    """
+    enabled: bool = False
+    webhook: str = ""
+    secret: str = ""                        # 机器人开了「加签」才需要
+    keyword: str = ""                       # 机器人开了「自定义关键词」才需要
+    at_mobiles: list[str] = field(default_factory=list)
+    at_all: bool = False
+    cooldown: float = 300.0                 # 同一类告警的最小间隔（秒），防刷屏
+    log_alerts: bool = True                 # 采集端异常日志 → 告警
+    notify_start: bool = True               # 开始 / 停止运行时各发一条
+    notify_fail: bool = True                # 投递失败告警
+    fail_threshold: int = 3                 # 连续失败达到几次才告警
+    notify_idle: bool = True                # 采集停滞告警
+    idle_minutes: int = 120                 # 多久没有新消息算停滞
+    idle_window: str = "08:00-21:00"        # 只在此时段内判定停滞（避免夜间误报）
+    report_hourly: bool = False             # 每小时运行报告
+    report_daily_at: str = ""               # 每日报告时间，空 = 不发，例如 "18:00"
+
+
+@dataclass
 class RouteConfig:
     name: str = "default"
     companies: list[str] = field(default_factory=list)
@@ -58,6 +83,7 @@ class Config:
     storage: StorageConfig = field(default_factory=StorageConfig)
     dingtalk: DingTalkConfig = field(default_factory=DingTalkConfig)
     wechat: WeChatConfig = field(default_factory=WeChatConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
     routes: list[RouteConfig] = field(default_factory=list)
 
     @property
@@ -91,6 +117,7 @@ def load_config(path: str | Path = "config.yaml") -> Config:
         storage=_section(StorageConfig, raw.get("storage")),
         dingtalk=_section(DingTalkConfig, raw.get("dingtalk")),
         wechat=_section(WeChatConfig, raw.get("wechat")),
+        notify=_section(NotifyConfig, raw.get("notify")),
         routes=[_section(RouteConfig, r) for r in (raw.get("routes") or [])],
     )
 
@@ -98,6 +125,9 @@ def load_config(path: str | Path = "config.yaml") -> Config:
     cfg.dingtalk.client_id = os.getenv("DINGTALK_CLIENT_ID") or cfg.dingtalk.client_id
     cfg.dingtalk.client_secret = os.getenv("DINGTALK_CLIENT_SECRET") or cfg.dingtalk.client_secret
     cfg.dingtalk.robot_code = os.getenv("DINGTALK_ROBOT_CODE") or cfg.dingtalk.robot_code
+    # webhook 里带 access_token，等同于凭证，同样支持用环境变量下发
+    cfg.notify.webhook = os.getenv("DINGTALK_ROBOT_WEBHOOK") or cfg.notify.webhook
+    cfg.notify.secret = os.getenv("DINGTALK_ROBOT_SECRET") or cfg.notify.secret
 
     if not cfg.routes:
         raise ValueError("config.yaml 中 routes 至少需要配置一条路由规则")

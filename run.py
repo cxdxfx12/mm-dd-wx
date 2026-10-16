@@ -6,6 +6,8 @@
     python run.py --live                    # 正式运行：Stream 长连接采集 → 真实投递微信
     python run.py --stats                   # 查看统计
     python run.py --export out.csv          # 导出消息
+    python run.py --notify-test             # 发一条钉钉通知，验证 webhook 配对
+    python run.py --notify-report           # 把当前统计发到钉钉群
 """
 from __future__ import annotations
 
@@ -115,6 +117,8 @@ MENU_ITEMS: list[tuple[str, str, str, list[str]]] = [
     ("7", "能力探针", "检测钉钉凭证、SDK 与本机客户端", ["probe_dingtalk.py"]),
     ("8", "查看统计", "累计入库与投递情况", ["run.py", "--stats"]),
     ("9", "导出消息", "把已入库消息导出为 CSV", ["run.py", "--export"]),
+    ("10", "通知测试", "往钉钉群发一条测试消息，验证 webhook", ["run.py", "--notify-test"]),
+    ("11", "发运行报告", "把累计统计发到钉钉群", ["run.py", "--notify-report"]),
 ]
 
 
@@ -207,6 +211,10 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="强制 dry-run，不真实发送")
     parser.add_argument("--stats", action="store_true", help="打印统计")
     parser.add_argument("--export", metavar="CSV", help="导出消息到 CSV")
+    parser.add_argument("--notify-test", action="store_true",
+                        help="给钉钉机器人发一条测试消息")
+    parser.add_argument("--notify-report", action="store_true",
+                        help="把累计统计发到钉钉群")
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
     args = parser.parse_args()
 
@@ -234,6 +242,49 @@ def main() -> int:
         print(svc.storage.stats())
         svc.close()
         return 0
+
+    if args.notify_test or args.notify_report:
+        # 刻意不构造 BridgeService：通知测试不该依赖微信/钉钉环境，
+        # 换台没装微信的机器也应该能验证 webhook 是否配对。
+        from bridge.notify import DingTalkNotifier, mask_webhook
+        nt = DingTalkNotifier.from_config(cfg.notify)
+        if nt is None:
+            if not getattr(cfg.notify, "enabled", False):
+                print("钉钉通知未启用。请到「设置中心 → 钉钉通知」里开启，"
+                      "或把 config.yaml 的 notify.enabled 改成 true。")
+            else:
+                print("钉钉通知已开启，但没有填 webhook，无法发送。")
+                print("请把自定义机器人的 webhook 地址填到 notify.webhook；"
+                      "也可以用环境变量 DINGTALK_ROBOT_WEBHOOK 下发。")
+            return 1
+        print(f"webhook：{mask_webhook(cfg.notify.webhook)}")
+        print(f"通道状态：{nt.describe()}")
+        if args.notify_test:
+            ok, detail = nt.test()
+        else:
+            from bridge.storage import Storage
+            st = Storage(cfg.resolve(cfg.storage.db_path))
+            try:
+                s = st.stats()
+            finally:
+                st.close()
+            d = s.get("deliveries") or {}
+            ok, detail = nt.send_text(
+                f"📊 运行报告（手动查询）\n"
+                f"累计入库消息：{s['total_messages']} 条\n"
+                f"累计投递成功：{int(d.get('ok', 0))} | 失败：{int(d.get('fail', 0))}\n"
+                f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}")
+        if ok:
+            print("已发送，请到钉钉群里查看。")
+            return 0
+        print(f"发送失败：{detail}")
+        print()
+        print("排查提示：")
+        print("  errcode=310000 = 机器人的「安全设置」不匹配：")
+        print("    开了「自定义关键词」→ 把关键词填到 notify.keyword")
+        print("    开了「加签」        → 把 SEC 开头的密钥填到 notify.secret")
+        print("  网络类错误         → 多半是本机出网受限，或被 IP 白名单拦下")
+        return 1
 
     if args.dry_run:
         cfg.wechat.dry_run = True
@@ -277,6 +328,7 @@ def main() -> int:
             except Exception as exc:
                 problems.append(f"采集端构建失败：{type(exc).__name__}: {exc}")
             print(f"  dry-run  : {cfg.wechat.dry_run}")
+            print(f"  钉钉通知 : {svc.notify_status()}")
             print(f"  转发目标 : {cfg.routes[0].targets if cfg.routes else []}")
             if problems:
                 print()
@@ -302,7 +354,15 @@ def main() -> int:
                     print(f"[问题] {p}")
                 return 1
             print(f"启动采集：{source}")
-            source.run(svc.handle)
+            if svc.notifier:
+                print(f"  钉钉通知：{svc.notify_status()}")
+            # 通知与巡检只在正式运行时挂上：自检/预览这类短命令没必要打扰群
+            svc.start_watchdog()
+            svc.announce_start(repr(source))
+            try:
+                source.run(svc.handle)
+            finally:
+                svc.announce_stop()
             return 0
 
         parser.print_help()

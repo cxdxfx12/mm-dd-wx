@@ -47,6 +47,47 @@ wechat:
   interval: 3.0
   wxauto_path: "../wxauto-main"
 
+# 钉钉机器人通知（故障告警 + 运行报告）
+#
+# ⚠ 先说清能力边界：自定义机器人 webhook 是【单向】的 ——
+#   只能往钉钉群里发消息，**收不到**群里其他人发的消息，
+#   所以它不参与「钉钉 → 微信」的取数，取数仍然是上面的 ocr 截屏方案。
+#   它的价值在于：这套程序最怕「静默失效」（窗口被切走就悄悄不转了），
+#   有了它，出问题会主动发消息到群里，而不是等人自己发现。
+#
+# 获取方式：钉钉群 → 群设置 → 智能群助手 → 添加机器人 → 自定义（Webhook）
+# 安全设置三选一（三种这里都支持）：
+#   自定义关键词 -> 把关键词填到下面的 keyword，缺词时会自动补一行
+#   加签         -> 把密钥（SEC...）填到 secret
+#   IP 白名单    -> 钉钉侧配置即可，这里不用填
+notify:
+  enabled: false                     # 改成 true 并填好 webhook 才生效
+  # 建议改用环境变量 DINGTALK_ROBOT_WEBHOOK / DINGTALK_ROBOT_SECRET，
+  # 避免把带 access_token 的地址明文写进配置文件
+  webhook: "https://oapi.dingtalk.com/robot/send?access_token=改成你自己的"
+  secret: ""
+  keyword: ""
+
+  # 告警时 @ 谁（填手机号）；at_all 为 true 时等同于 @所有人
+  at_mobiles: []
+  at_all: false
+
+  # 同一类告警的最小间隔（秒）。采集窗口被切走时每轮都会报错，
+  # 不去重会瞬间刷屏，所以这里的冷却很有必要
+  cooldown: 300
+
+  log_alerts: true                   # 采集端异常日志 → 告警（窗口最小化、找不到窗口等）
+  notify_start: true                 # 开始 / 停止运行时各发一条
+  notify_fail: true                  # 投递失败告警
+  fail_threshold: 3                  # 连续失败几次才告警（偶发一次不打扰）
+
+  notify_idle: true                  # 采集停滞告警
+  idle_minutes: 120                  # 多久没有新消息算停滞
+  idle_window: "08:00-21:00"         # 只在此时段内判定，避免夜里安静被误报
+
+  report_hourly: false               # 每小时发一次运行报告
+  report_daily_at: ""                # 每日报告时间，空 = 不发，例如 "18:00"
+
 # 路由规则：从上到下依次匹配，命中的目标合并去重
 routes:
   - name: "示例公司全部消息"

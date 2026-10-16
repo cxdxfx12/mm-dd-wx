@@ -249,6 +249,9 @@ class App(tk.Tk):
         m_tool.add_command(label="钉钉窗口预览（只读）", command=self.dingtalk_preview)
         m_tool.add_command(label="转发一条（预览后确认）", command=self.forward_one_dialog)
         m_tool.add_separator()
+        m_tool.add_command(label="测试钉钉通知", command=self.notify_test)
+        m_tool.add_command(label="发送运行报告到钉钉", command=self.notify_report)
+        m_tool.add_separator()
         m_tool.add_command(label="消息记录", command=self.show_records)
         m_tool.add_command(label="导出 CSV", command=self.export_csv)
         m_tool.add_separator()
@@ -400,7 +403,7 @@ class App(tk.Tk):
         box_cfg.pack(fill="x")
         self.cfg_rows: dict[str, tuple[tk.Label, tk.Label]] = {}
         for i, key in enumerate(("监控会话", "转发目标", "轮询间隔", "发送间隔",
-                                 "时间过滤", "运行模式")):
+                                 "时间过滤", "运行模式", "钉钉通知")):
             lab = tk.Label(body_cfg, text=key, bg=CARD, fg=MUTED, font=F_SMALL)
             lab.grid(row=i, column=0, sticky="w", pady=2)
             val = tk.Label(body_cfg, text="-", bg=CARD, fg=TEXT, font=F_SMALL,
@@ -562,11 +565,18 @@ class App(tk.Tk):
     def _apply_cfg_to_ui(self):
         d = self.cfg.get("dingtalk") or {}
         w = self.cfg.get("wechat") or {}
+        n = self.cfg.get("notify") or {}
         routes = self.cfg.get("routes") or []
         r0 = routes[0] if routes else {}
         chats = "、".join(d.get("chat_names") or []) or "-"
         targets = "、".join(r0.get("targets") or w.get("targets") or []) or "-"
         mode = "试运行（不真实发送）" if w.get("dry_run") else "正式发送"
+        if not n.get("enabled"):
+            notify = "未启用"
+        elif not (n.get("webhook") or "").strip():
+            notify = "缺 webhook"
+        else:
+            notify = "已启用"
         vals = {
             "监控会话": chats,
             "转发目标": targets,
@@ -574,6 +584,7 @@ class App(tk.Tk):
             "发送间隔": f"{w.get('interval', 3)} 秒",
             "时间过滤": "只转发今天" if d.get("time_filter") == "today" else "不限时间",
             "运行模式": mode,
+            "钉钉通知": notify,
         }
         for k, v in vals.items():
             if k in self.cfg_rows:
@@ -881,6 +892,69 @@ class App(tk.Tk):
 
     def log_message(self, text: str):
         self._log(text, "sys")
+
+    # ---------------- 钉钉通知 ----------------
+
+    def notify_test(self):
+        """发一条钉钉测试消息，确认 webhook / 关键词 / 加签是否配对。"""
+        self._notify_cmd("--notify-test", "测试通知")
+
+    def notify_report(self):
+        """把累计统计发到钉钉群。"""
+        self._notify_cmd("--notify-report", "运行报告")
+
+    def _notify_cmd(self, flag: str, title: str):
+        if self.runner.alive() or self._busy:
+            messagebox.showinfo("提示", "有任务正在运行，请先停止。", parent=self)
+            return
+        self._set_busy(True, f"正在发送钉钉{title}…")
+        self._log(f"正在发送钉钉{title}…", "sys")
+        result: dict = {}
+
+        def work():
+            argv = self._worker_argv(flag, "--config", str(CONFIG_PATH))
+            if not argv:
+                self.after(0, lambda: (self._set_busy(False),
+                                       self._warn_no_worker()))
+                return
+            try:
+                r = subprocess.run(argv, cwd=str(BASE_DIR), capture_output=True,
+                                   text=True, timeout=60, encoding="utf-8",
+                                   errors="replace", creationflags=0x08000000)
+                result["out"] = r.stdout or ""
+                result["err"] = r.stderr or ""
+                result["code"] = r.returncode
+            except Exception as exc:
+                result["out"] = f"执行失败：{exc}"
+                result["code"] = 1
+            self.after(0, lambda: self._notify_done(result, title))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _notify_done(self, result: dict, title: str):
+        self._set_busy(False)
+        for line in self._clean_tool_output(result.get("out") or "").splitlines():
+            if line.strip():
+                self._log("  " + line.strip(), "tool")
+        ok = result.get("code") == 0
+        if not ok:
+            for line in (result.get("err") or "").splitlines()[-6:]:
+                if line.strip():
+                    self._log("  " + line.strip(), "error")
+        self._log(f"钉钉{title}：{'发送成功' if ok else '发送失败'}",
+                  "sys" if ok else "error")
+        if ok:
+            messagebox.showinfo(f"{title}已发送",
+                                "消息已经发到钉钉群，请到群里确认。", parent=self)
+        else:
+            messagebox.showwarning(
+                f"{title}发送失败",
+                "失败原因见日志区。\n\n"
+                "最常见的原因是机器人的「安全设置」不匹配：\n"
+                "· 开了「自定义关键词」→ 把关键词填到 设置 → 钉钉通知\n"
+                "· 开了「加签」       → 把 SEC 开头的密钥填进去\n\n"
+                "也可能是本机出网受限，或被机器人的 IP 白名单拦下。",
+                parent=self)
 
     def redetect_env(self):
         """强制重新扫描解释器与配置（换过 Python、装过依赖后用）。"""

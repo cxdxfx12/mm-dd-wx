@@ -6,6 +6,7 @@
         时间范围   —— 不限 / 仅当天 / 只在指定时段
         采集与投递 —— 轮询间隔、发送间隔、试运行、两道防护
         消息格式   —— 转发文案模板（带实时预览）
+        钉钉通知   —— 故障告警与运行报告（自定义机器人 webhook）
         其他       —— 开机自启、环境信息、快捷入口
 
     保存时会先备份 config.yaml，再按「保留注释的按行手术」写回
@@ -14,6 +15,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from pathlib import Path
@@ -129,6 +131,7 @@ class SettingsDialog:
         self._tab_time(nb)
         self._tab_engine(nb)
         self._tab_format(nb)
+        self._tab_notify(nb)
         self._tab_misc(nb)
 
         bar = tk.Frame(self.win, bg=BG)
@@ -349,6 +352,178 @@ class SettingsDialog:
         except Exception:
             pass
 
+    # ------------------------------------------------------------ 钉钉通知
+
+    def _tab_notify(self, nb):
+        page = self._page(nb, "钉钉通知")
+        n = self.cfg.get("notify") or {}
+
+        self.st["n_enabled"] = tk.BooleanVar(value=bool(n.get("enabled", False)))
+        self.st["n_webhook"] = tk.StringVar(value=str(n.get("webhook") or ""))
+        self.st["n_secret"] = tk.StringVar(value=str(n.get("secret") or ""))
+        self.st["n_keyword"] = tk.StringVar(value=str(n.get("keyword") or ""))
+        self.st["n_at_mobiles"] = tk.StringVar(
+            value="; ".join(str(m) for m in (n.get("at_mobiles") or [])))
+        self.st["n_at_all"] = tk.BooleanVar(value=bool(n.get("at_all", False)))
+        self.st["n_log_alerts"] = tk.BooleanVar(value=bool(n.get("log_alerts", True)))
+        self.st["n_start"] = tk.BooleanVar(value=bool(n.get("notify_start", True)))
+        self.st["n_fail"] = tk.BooleanVar(value=bool(n.get("notify_fail", True)))
+        self.st["n_threshold"] = tk.StringVar(value=str(n.get("fail_threshold", 3)))
+        self.st["n_idle"] = tk.BooleanVar(value=bool(n.get("notify_idle", True)))
+        self.st["n_idle_min"] = tk.StringVar(value=str(n.get("idle_minutes", 120)))
+        self.st["n_idle_win"] = tk.StringVar(
+            value=str(n.get("idle_window") or "08:00-21:00"))
+        self.st["n_cooldown"] = tk.StringVar(value=str(n.get("cooldown", 300)))
+        self.st["n_hourly"] = tk.BooleanVar(value=bool(n.get("report_hourly", False)))
+        self.st["n_daily"] = tk.StringVar(value=str(n.get("report_daily_at") or ""))
+
+        # ---- 凭证 ----
+        box = _card(page, "机器人凭证（钉钉群 → 群设置 → 智能群助手 → 添加机器人 → 自定义）")
+        box.pack(fill="x", padx=12, pady=(12, 8))
+        ttk.Checkbutton(box, text="启用钉钉通知（故障告警 + 运行报告）",
+                        variable=self.st["n_enabled"]).pack(anchor="w", padx=14,
+                                                            pady=(10, 4))
+        self._field(box, "Webhook", self.st["n_webhook"], 74)
+        self._field(box, "加签密钥", self.st["n_secret"], 34,
+                    "机器人开了「加签」才需要填，SEC 开头的字符串")
+        self._field(box, "自定义关键词", self.st["n_keyword"], 20,
+                    "机器人开了「自定义关键词」才需要填；内容里缺这个词会自动补一行")
+
+        line = tk.Frame(box, bg=CARD)
+        line.pack(fill="x", padx=14, pady=(2, 12))
+        self._test_btn = ttk.Button(line, text="发送测试消息",
+                                    command=self._test_notify)
+        self._test_btn.pack(side="left")
+        self._test_lab = tk.Label(line, text="", bg=CARD, fg=MUTED, font=F_SMALL)
+        self._test_lab.pack(side="left", padx=10)
+
+        _tip(page, "注意：这个机器人只能往钉钉群里发消息，收不到群里的消息，"
+                   "所以它不参与「钉钉 → 微信」的转发，只负责把运行状况告诉你。",
+             bg=BG).pack(fill="x", padx=16, pady=(0, 8))
+
+        # ---- 告警场景 ----
+        box2 = _card(page, "什么情况下发告警")
+        box2.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Checkbutton(box2, text="采集端异常（找不到钉钉窗口 / 窗口被最小化 / 当前不是目标群）",
+                        variable=self.st["n_log_alerts"]).pack(anchor="w", padx=14,
+                                                               pady=(10, 2))
+        ttk.Checkbutton(box2, text="开始、停止运行时各发一条",
+                        variable=self.st["n_start"]).pack(anchor="w", padx=14, pady=2)
+        row = tk.Frame(box2, bg=CARD)
+        row.pack(fill="x", padx=14, pady=2)
+        ttk.Checkbutton(row, text="微信投递连续失败达到",
+                        variable=self.st["n_fail"]).pack(side="left")
+        ttk.Spinbox(row, from_=1, to=50, textvariable=self.st["n_threshold"],
+                    width=5).pack(side="left", padx=6)
+        tk.Label(row, text="次时告警", bg=CARD, fg=TEXT, font=F_UI).pack(side="left")
+        row2 = tk.Frame(box2, bg=CARD)
+        row2.pack(fill="x", padx=14, pady=2)
+        ttk.Checkbutton(row2, text="采集停滞：连续",
+                        variable=self.st["n_idle"]).pack(side="left")
+        ttk.Spinbox(row2, from_=10, to=1440, textvariable=self.st["n_idle_min"],
+                    width=6).pack(side="left", padx=6)
+        tk.Label(row2, text="分钟没有新消息时告警，仅在",
+                 bg=CARD, fg=TEXT, font=F_UI).pack(side="left")
+        ttk.Entry(row2, textvariable=self.st["n_idle_win"], width=14
+                  ).pack(side="left", padx=6)
+        tk.Label(row2, text="时段内判定", bg=CARD, fg=TEXT, font=F_UI).pack(side="left")
+        _tip(box2, "采集窗口被切走时每轮 OCR 都会报错，所以同类告警有冷却时间：",
+             bg=CARD).pack(fill="x", padx=14, pady=(6, 0))
+        row3 = tk.Frame(box2, bg=CARD)
+        row3.pack(fill="x", padx=14, pady=(2, 12))
+        ttk.Spinbox(row3, from_=30, to=3600, increment=30,
+                    textvariable=self.st["n_cooldown"], width=7).pack(side="left")
+        tk.Label(row3, text="秒内同一类告警只发一次（防止刷屏）",
+                 bg=CARD, fg=TEXT, font=F_UI).pack(side="left", padx=6)
+
+        # ---- 报告与提醒 ----
+        box3 = _card(page, "运行报告与提醒方式")
+        box3.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Checkbutton(box3, text="每小时发一次运行报告",
+                        variable=self.st["n_hourly"]).pack(anchor="w", padx=14,
+                                                           pady=(10, 2))
+        row4 = tk.Frame(box3, bg=CARD)
+        row4.pack(fill="x", padx=14, pady=2)
+        tk.Label(row4, text="每天定时发报告：", bg=CARD, fg=TEXT,
+                 font=F_UI).pack(side="left")
+        ttk.Entry(row4, textvariable=self.st["n_daily"], width=8).pack(side="left",
+                                                                       padx=6)
+        _tip(row4, "填 HH:MM，留空表示不发", bg=CARD).pack(side="left")
+        row5 = tk.Frame(box3, bg=CARD)
+        row5.pack(fill="x", padx=14, pady=(4, 2))
+        tk.Label(row5, text="告警时 @ 手机号：", bg=CARD, fg=TEXT,
+                 font=F_UI).pack(side="left")
+        ttk.Entry(row5, textvariable=self.st["n_at_mobiles"], width=40
+                  ).pack(side="left", padx=6)
+        _tip(row5, "多个用英文分号 ; 隔开，留空表示不 @ 任何人",
+             bg=CARD).pack(side="left")
+        ttk.Checkbutton(box3, text="告警时 @ 所有人",
+                        variable=self.st["n_at_all"]).pack(anchor="w", padx=14,
+                                                           pady=(4, 12))
+
+    def _field(self, box, label: str, var, width: int, note: str = ""):
+        row = tk.Frame(box, bg=CARD)
+        row.pack(fill="x", padx=14, pady=3)
+        tk.Label(row, text=label, bg=CARD, fg=MUTED, font=F_SMALL,
+                 width=12, anchor="w").pack(side="left")
+        ttk.Entry(row, textvariable=var, width=width).pack(side="left", padx=(4, 8))
+        if note:
+            _tip(row, note, bg=CARD).pack(side="left")
+
+    def _test_notify(self):
+        """就地发一条测试消息 —— 直接用表单里的值，不必先保存。
+
+        刻意不调 config.yaml：用户往往正是想边填边试。
+        bridge/notify.py 只依赖标准库，界面解释器也导入得动。
+        """
+        url = self.st["n_webhook"].get().strip()
+        if not url:
+            messagebox.showwarning(
+                "还没填 webhook",
+                "请先填入自定义机器人的 webhook 地址。\n\n"
+                "获取位置：钉钉群 → 群设置 → 智能群助手 → 添加机器人 → 自定义（Webhook）",
+                parent=self.win)
+            return
+        self._test_btn.configure(state="disabled")
+        self._test_lab.configure(text="正在发送…", fg=MUTED)
+        vals = (url, self.st["n_secret"].get().strip(),
+                self.st["n_keyword"].get().strip())
+
+        def work():
+            try:
+                import sys
+                root = str(Path(__file__).resolve().parent.parent)
+                if root not in sys.path:
+                    sys.path.insert(0, root)
+                from bridge.notify import DingTalkNotifier
+                nt = DingTalkNotifier(webhook=vals[0], secret=vals[1],
+                                      keyword=vals[2])
+                ok, detail = nt.test()
+            except Exception as exc:
+                ok, detail = False, f"{type(exc).__name__}: {exc}"
+            self.win.after(0, lambda: self._test_done(ok, detail))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _test_done(self, ok: bool, detail: str):
+        try:
+            self._test_btn.configure(state="normal")
+        except Exception:
+            return
+        if ok:
+            self._test_lab.configure(text="✓ 已发送，请到钉钉群确认", fg="#0b6b3a")
+            messagebox.showinfo("发送成功", "测试消息已发到钉钉群。", parent=self.win)
+        else:
+            self._test_lab.configure(text=f"✗ 发送失败：{detail}", fg=RED)
+            messagebox.showwarning(
+                "发送失败",
+                f"{detail}\n\n"
+                "errcode=310000 表示机器人的「安全设置」不匹配：\n"
+                "· 开了「自定义关键词」→ 把关键词填到上面的输入框\n"
+                "· 开了「加签」       → 把 SEC 开头的密钥填上去\n"
+                "网络类错误则多半是本机出网受限，或被 IP 白名单拦下。",
+                parent=self.win)
+
     # ------------------------------------------------------------ 其他
 
     def _tab_misc(self, nb):
@@ -437,6 +612,49 @@ class SettingsDialog:
             messagebox.showwarning("数值不对", "间隔与阈值必须是数字。", parent=self.win)
             return
 
+        # ---- 钉钉通知相关校验 ----
+        try:
+            n_cooldown = max(30, int(float(self.st["n_cooldown"].get())))
+            n_threshold = max(1, int(float(self.st["n_threshold"].get())))
+            n_idle_min = max(5, int(float(self.st["n_idle_min"].get())))
+        except ValueError:
+            messagebox.showwarning("数值不对",
+                                   "钉钉通知里的冷却时间、失败次数、停滞分钟数必须是数字。",
+                                   parent=self.win)
+            return
+        n_daily = self.st["n_daily"].get().strip()
+        if n_daily and not re.match(r"^\d{1,2}:\d{2}$", n_daily):
+            messagebox.showwarning("每日报告时间格式不对",
+                                   "请填 HH:MM，例如 18:00；不想发就留空。",
+                                   parent=self.win)
+            return
+        n_idle_win = self.st["n_idle_win"].get().strip() or "08:00-21:00"
+        if not WINDOW_RE.match(n_idle_win):
+            messagebox.showwarning("停滞判定时段格式不对",
+                                   "请填 HH:MM-HH:MM，例如 08:00-21:00。",
+                                   parent=self.win)
+            return
+        n_enabled = bool(self.st["n_enabled"].get())
+        n_webhook = self.st["n_webhook"].get().strip()
+        if n_enabled and not n_webhook:
+            messagebox.showwarning(
+                "启用了通知但没填 webhook",
+                "请把钉钉机器人的 webhook 地址填上，或者取消「启用钉钉通知」。\n\n"
+                "获取位置：钉钉群 → 群设置 → 智能群助手 → 添加机器人 → 自定义（Webhook）",
+                parent=self.win)
+            return
+        if n_enabled and not cfgfile.has_section(self.path, "notify"):
+            messagebox.showwarning(
+                "配置文件里没有 notify 段",
+                "保存「钉钉通知」的配置需要 config.yaml 里存在 notify: 段。\n\n"
+                "请用记事本打开 config.yaml，在 routes: 这一行**之前**插入 notify 段"
+                "（可以直接参考同目录的 config.example.yaml），保存后再重新打开设置中心。",
+                parent=self.win)
+            return
+        n_mobiles = [x.strip() for x in
+                     self.st["n_at_mobiles"].get().replace("，", ";").split(";")
+                     if x.strip()]
+
         cfgfile.backup(self.path)
         problems: list[str] = []
 
@@ -466,6 +684,24 @@ class SettingsDialog:
         S("wechat", "dry_run", bool(self.st["dry_run"].get()))
         S("wechat", "interval", interval)
 
+        # ---- 钉钉通知 ----
+        S("notify", "enabled", n_enabled)
+        S("notify", "webhook", n_webhook)
+        S("notify", "secret", self.st["n_secret"].get().strip())
+        S("notify", "keyword", self.st["n_keyword"].get().strip())
+        L("notify", "at_mobiles", n_mobiles)
+        S("notify", "at_all", bool(self.st["n_at_all"].get()))
+        S("notify", "cooldown", n_cooldown)
+        S("notify", "log_alerts", bool(self.st["n_log_alerts"].get()))
+        S("notify", "notify_start", bool(self.st["n_start"].get()))
+        S("notify", "notify_fail", bool(self.st["n_fail"].get()))
+        S("notify", "fail_threshold", n_threshold)
+        S("notify", "notify_idle", bool(self.st["n_idle"].get()))
+        S("notify", "idle_minutes", n_idle_min)
+        S("notify", "idle_window", n_idle_win)
+        S("notify", "report_hourly", bool(self.st["n_hourly"].get()))
+        S("notify", "report_daily_at", n_daily)
+
         if problems:
             messagebox.showerror(
                 "保存失败",
@@ -476,11 +712,14 @@ class SettingsDialog:
 
         self.app.set_autostart_enabled(bool(self.st["autostart"].get()))
         self.app.reload_after_settings()
+        notify_line = ("钉钉通知：已启用，故障会发到群里。"
+                       if n_enabled else "钉钉通知：未启用。")
         messagebox.showinfo(
             "已保存",
             "设置已保存（原配置已备份到 data/backup/）。\n\n"
             + ("当前仍是【试运行】模式，不会真实发送。" if
                self.st["dry_run"].get() else "当前为【正式发送】模式。")
+            + "\n" + notify_line
             + "\n\n若转发任务正在运行，请停止后重新开始。",
             parent=self.win)
         self.win.destroy()

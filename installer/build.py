@@ -18,7 +18,9 @@
 """
 from __future__ import annotations
 
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import zipfile
@@ -34,7 +36,14 @@ PYINSTALLER = [sys.executable, "-m", "PyInstaller"]
 EXCLUDE_DIR_NAMES = {"__pycache__", ".git", ".idea", ".vscode", "node_modules"}
 EXCLUDE_FILE_SUFFIX = {".pyc", ".pyo", ".log", ".tmp", ".spec"}
 EXCLUDE_FILE_NAMES = {"_env.json"}       # 开发机的解释器缓存，不随安装包分发
-EXCLUDE_TOP = {"data", "installer", "dist", "build", ".workbuddy"}
+# config.yaml 也在排除之列（它是个文件，靠名字匹配即可生效）：
+# 构建机的配置里有真实群名和钉钉机器人 access_token，打进安装包等于把凭证
+# 随二进制一起分发；而且升级时整包解压会覆盖用户自己改过的配置。
+# 首次安装由 setup_gui.py 从 config.example.yaml 生成。
+# .git 必须排除：早先的排除只在「文件/目录名」层面生效，rglob 仍会钻进
+# .git 把对象库整个搬走，既撑大安装包又可能因只读属性报 PermissionError。
+EXCLUDE_TOP = {"data", "installer", "dist", "build", ".workbuddy", ".git",
+               "config.yaml", ".gitignore"}
 
 WELCOME = r"""
 =============================================================
@@ -77,22 +86,45 @@ def want(p: Path) -> bool:
 
 def copy_tree(src: Path, dst: Path, top_excludes: set[str] | None = None
               ) -> set[str]:
-    """复制目录（过滤缓存/垃圾文件），返回复制文件的相对路径集合。"""
+    """复制目录（过滤缓存/垃圾文件），返回复制文件的相对路径集合。
+
+    用 ``os.walk`` **逐层剪枝**，而不是 ``rglob`` 全量遍历后再过滤。
+    区别很关键：``rglob`` 会继续钻进被排除的目录，再把里面的文件逐个搬过去，
+    于是「排除 .git」只挡住了那个目录条目本身，对象库照样被完整复制
+    （踩过：安装包被 .git 撑大，还会因 git 对象只读而报 PermissionError）。
+    """
     copied: set[str] = set()
-    for p in src.rglob("*"):
-        rel = p.relative_to(src)
-        if top_excludes and rel.parts and rel.parts[0] in top_excludes:
+    for dirpath, dirnames, filenames in os.walk(src):
+        d = Path(dirpath)
+        rel_dir = d.relative_to(src)
+        if top_excludes and rel_dir.parts and rel_dir.parts[0] in top_excludes:
+            dirnames[:] = []
             continue
-        if not want(p):
-            continue
-        target = dst / rel
-        if p.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-        elif p.is_file():
+        # 就地剪枝：这些子目录既不进入也不复制
+        dirnames[:] = [n for n in dirnames if n not in EXCLUDE_DIR_NAMES]
+        for name in filenames:
+            p = d / name
+            if not want(p):
+                continue
+            rel = p.relative_to(src)
+            target = dst / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(p, target)
             copied.add(rel.as_posix())
     return copied
+
+
+def _force_unlink(p: Path) -> None:
+    """删掉文件；只读的（比如 git 对象）先去只读位再删。
+
+    Windows 上 ``unlink`` 碰到只读文件会直接 PermissionError，
+    而 git 对象默认就是只读的。
+    """
+    try:
+        p.chmod(p.stat().st_mode | stat.S_IWRITE)
+    except Exception:
+        pass
+    p.unlink()
 
 
 def build_payload(app_exe: Path) -> Path:
@@ -133,12 +165,19 @@ def build_payload(app_exe: Path) -> Path:
     for p in payload.rglob("*"):
         if p.is_file() and p.relative_to(payload).as_posix() not in expected:
             try:
-                p.unlink()
+                _force_unlink(p)
                 stale += 1
             except Exception as exc:
                 print(f"    （跳过）{p.name}: {exc}")
     if stale:
         print(f"    已清理上一轮遗留的 {stale} 个多余文件")
+    # 顺带清掉因此变空的目录，避免下一轮又扫到
+    for d in sorted((x for x in payload.rglob("*") if x.is_dir()),
+                    key=lambda x: len(x.parts), reverse=True):
+        try:
+            d.rmdir()
+        except OSError:
+            pass
 
     zip_path = BUILD / "payload.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
