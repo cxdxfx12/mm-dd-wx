@@ -190,6 +190,24 @@ GUI 通过管道实时读它的日志（`@@LOG@@` JSON 行），停止通过**�
 `data/run.stop` 握手（Windows 无法向无控制台子进程投递 Ctrl+Break）。
 解释器自动探测逻辑见 `app/paths.py`，结果缓存在 `app/_env.json`。
 
+### OCR 引擎（2026-10-16 升级到 PP-OCRv6）
+
+采集端用的是 PP-OCR 系列离线模型，通过适配层 `_OcrEngine`（`bridge/sources/
+dingtalk_ocr.py`）统一两代引擎的调用形状：
+
+- **优先** `rapidocr`（3.x，**PP-OCRv6**）：出厂参数即最优，无需调参；
+- **回退** `rapidocr-onnxruntime`（1.x，PP-OCRv3）：保留一组围绕「表格孤立
+  数字漏检」实测标定的补丁参数，仅在环境里只有旧包时使用。
+
+换 v6 的依据（`tools/ocr_bench.py` 同图实测）：v3 会把「引发」读成「引1发」
+并原样转发进微信群，v6 无此错字且置信度普遍 0.94+，速度不降反升；v3 的
+补丁参数搬到 v6 反而引入碎块与新错字，故不迁移。旧配置无需改动。
+
+**模型文件**：新版 rapidocr 的模型（`site-packages/rapidocr/models/` 下 3 个
+onnx）是首次运行时联网下载的；安装向导装完依赖后会**预热一次**把模型拉下来，
+之后离线可用。升级引擎后的第一次启动，请让钉钉停在目标群并滚回底部 ——
+模型变了同一条消息的文本指纹可能变化，贴底建好基线可避免旧消息被重复补发。
+
 ## 目录结构
 
 ```
@@ -216,6 +234,7 @@ ddwx-bridge/
 ├── tools/
 │   ├── forward_one.py           端到端转发一条（默认只预览）
 │   ├── forward_recent.py        手动转发最近 N 条（默认只预览，支持 --ask）
+│   ├── ocr_bench.py             OCR 引擎/模型离线对比（v3 vs v6 标定结论的依据）
 │   ├── test_dingtalk_ocr.py     钉钉 OCR 识别效果预览（只读）
 │   ├── test_scroll_guard.py     实测滚动不会导致历史消息被误转发
 │   ├── test_wechat4.py          微信投递端验证（默认只读）
@@ -233,9 +252,9 @@ ddwx-bridge/
 │   ├── dump_dingtalk_tree.py    导出钉钉控件树
 │   ├── dingtalk_tree.txt        实测证据：钉钉消息区为空
 │   └── wechat_tree.txt          实测证据：微信 4.x 控件树
-├── tests/                352 项离线单元测试（核心链路 / OCR 解析 / 锚点与贴底恢复 /
+├── tests/                367 项离线单元测试（核心链路 / OCR 解析 / 锚点与贴底恢复 /
 │                         跨天 / 一对多 / 解释器探测 / 钉钉通知与多机器人 / 微信投递端护栏 /
-│                         配置「改或插」写入 / 手动转发最近 N 条）
+│                         配置「改或插」写入 / 手动转发最近 N 条 / OCR 引擎适配层）
 ├── run.py                入口
 ├── probe_dingtalk.py     钉钉侧能力探针
 ├── config.example.yaml   配置样板
@@ -441,7 +460,9 @@ routes:
 1. 钉钉客户端打开着目标群（本例：`【数字质控】浙江杭州萧山区大江东公司`）
 2. 钉钉窗口**不能最小化**（被遮挡可以，最小化截不到）；**也别拉得太窄**——
    窗口太窄时钉钉自己会把表格类消息右侧截掉（不渲染），OCR 读不到
-3. 本机已装 `rapidocr-onnxruntime`（见 requirements.txt）
+3. 本机已装 `rapidocr`（见 requirements.txt；旧包 `rapidocr-onnxruntime`
+   也可用，代码自动识别，但建议用新版 —— 同图实测错字更少、置信度更高，
+   详见 `tools/ocr_bench.py` 的对比结论）
 
 **可以放心滚动聊天区**：程序靠消息区滚动条判断「视口是否贴底」，
 你翻看历史时它不会误发旧消息、也不会因此丢掉这期间新到的消息

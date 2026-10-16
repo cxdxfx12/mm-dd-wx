@@ -5,8 +5,8 @@
 
       GUI 进程   —— 需要 ``tkinter``（Python 标准库自带），不需要任何第三方包，
                     这样界面能秒开，也不会被 OCR 那些大依赖拖慢。
-      工作进程   —— 需要 ``pyyaml / pillow / numpy / rapidocr-onnxruntime``
-                    才能真正采集钉钉消息、投递微信。
+      工作进程   —— 需要 ``pyyaml / pillow / numpy / rapidocr（或旧包
+                    rapidocr-onnxruntime）`` 才能真正采集钉钉消息、投递微信。
 
     这台机器上的现实是：
       * 系统 Python 3.12.4（``%LOCALAPPDATA%\\Programs\\Python\\Python312``）
@@ -82,7 +82,10 @@ CACHE_FILE = (APP_DIR / "_env.json") if BASE_DIR_WRITABLE else (DATA_ROOT / "_en
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0   # CREATE_NO_WINDOW
 
 GUI_MODULES = ("tkinter",)
-WORKER_MODULES = ("yaml", "PIL", "numpy", "rapidocr_onnxruntime", "onnxruntime")
+# OCR 包二选一：新版 rapidocr（3.x / PP-OCRv6）或旧包 rapidocr_onnxruntime
+# （1.x / PP-OCRv3，回退）。用「组」表达任一语义，见 missing_modules。
+OCR_MODULE_GROUPS = (("rapidocr", "rapidocr_onnxruntime"),)
+WORKER_MODULES = ("yaml", "PIL", "numpy", "onnxruntime") + OCR_MODULE_GROUPS
 WORKER_ESSENTIAL = ("yaml", "PIL", "numpy")        # 缺这几个就一定跑不起来
 
 
@@ -97,21 +100,35 @@ def _run(exe: str, args: list[str], timeout: float = 20.0):
 
 
 def missing_modules(exe: str, modules: tuple[str, ...]) -> tuple[bool, list[str]]:
-    """在指定解释器里查这些模块是否存在（用 find_spec，不真正导入，快）。"""
+    """在指定解释器里查这些模块是否存在（用 find_spec，不真正导入，快）。
+
+    ``modules`` 的元素可以是模块名字符串，也可以是**字符串元组** ——
+    后者表示「组内任一存在即算有」（用于 OCR 新旧包二选一）。
+    缺失项的报告中组内名字用 ``|`` 连接。
+    """
+    groups: list[list[str]] = [
+        [m] if isinstance(m, str) else list(m) for m in modules
+    ]
     code = (
-        "import importlib.util as u, sys\n"
-        "mods = %r\n"
+        "import importlib.util as u\n"
+        "groups = %r\n"
         "miss = []\n"
-        "for m in mods:\n"
-        "    try:\n"
-        "        if u.find_spec(m) is None: miss.append(m)\n"
-        "    except Exception:\n"
-        "        miss.append(m)\n"
-        "print(','.join(miss))\n" % (list(modules),)
+        "for g in groups:\n"
+        "    found = False\n"
+        "    for m in g:\n"
+        "        try:\n"
+        "            if u.find_spec(m) is not None:\n"
+        "                found = True\n"
+        "                break\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "    if not found:\n"
+        "        miss.append('|'.join(g))\n"
+        "print(','.join(miss))\n" % (groups,)
     )
     r = _run(exe, ["-c", code])
     if r is None or r.returncode != 0:
-        return False, list(modules)
+        return False, ["|".join(g) for g in groups]
     miss = [m for m in (r.stdout or "").strip().split(",") if m.strip()]
     return (not miss), miss
 
@@ -306,7 +323,8 @@ def venv_hint() -> str:
     return (
         "未找到同时满足依赖的 Python 解释器。\n"
         "界面需要一个带 tkinter 的 Python（官方安装包默认自带）；\n"
-        f"采集/投递需要 pyyaml、pillow、numpy、rapidocr-onnxruntime。\n"
+        f"采集/投递需要 pyyaml、pillow、numpy、rapidocr（或旧包"
+        f" rapidocr-onnxruntime）。\n"
         f"当前工作解释器：{resolve().get('worker')}"
     )
 

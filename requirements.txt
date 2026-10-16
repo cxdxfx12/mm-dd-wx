@@ -1,8 +1,11 @@
 # 核心依赖
 pyyaml>=6.0
 
-# 钉钉截屏 OCR 采集（mode: ocr 时需要；PP-OCR 离线模型，中文效果好）
-rapidocr-onnxruntime>=1.2.3
+# 钉钉截屏 OCR 采集（mode: ocr 时需要；PP-OCRv6 离线模型，中文效果好）
+# 新版 rapidocr（3.x，PP-OCRv6）：错字更少、置信度更高；模型首次运行时
+# 自动下载到 site-packages/rapidocr/models/（安装向导会预热一次，离线可用）。
+# 代码同时兼容旧包 rapidocr-onnxruntime（PP-OCRv3）作为回退，无需重装也能跑。
+rapidocr>=3.10.0
 onnxruntime>=1.20.0
 numpy>=1.26
 

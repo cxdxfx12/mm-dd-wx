@@ -637,6 +637,73 @@ def pick_new_units(units: list[dict], fps: list[str],
     return picked, new_anchor
 
 
+class _OcrEngine:
+    """统一两代 rapidocr 的调用形状：``engine(arr) -> [(box, text, conf), ...]``。
+
+    为什么包一层：旧包 ``rapidocr_onnxruntime``（1.x，PP-OCRv3）返回
+    ``[(box, text, conf), ...]``；新包 ``rapidocr``（3.x，PP-OCRv6）返回
+    ``RapidOCROutput`` 对象（.boxes/.txts/.scores）。`_grab_frame` 与
+    `_read_title` 两处调用点只想面对一种形状 —— 在这里归一，上层零改动。
+
+    为什么优先新包（2026-10-16 实测，tools/ocr_bench.py 同图对比）：
+    v3 把「引发」读成「引1发」并原样转发进微信群，v6 无此错字；v6 置信度
+    普遍 0.94+；速度不降反升。且 v6 出厂参数即可检全表格数字 —— v3 那组
+    「孤立数字」补丁参数搬到 v6 上反而引入碎块与新错字（「引|发」），不迁移。
+    """
+
+    def __init__(self, backend, name: str):
+        self._backend = backend
+        self.name = name
+
+    def __call__(self, arr):
+        out = self._backend(arr)
+        # legacy 1.x 返回 (result, elapse) 元组，result 为 None 表示无内容
+        if isinstance(out, tuple) and len(out) == 2 and not isinstance(out[1], str):
+            out = out[0]
+        if out is None:
+            return []
+        if hasattr(out, "txts"):                      # 3.x RapidOCROutput
+            # ⚠ boxes/scores/txts 可能是 numpy 数组：不能用 `or` 判空
+            #（多元素数组的真值是歧义的，会抛 ValueError），必须 is None。
+            txts = list(out.txts) if out.txts is not None else []
+            raw_scores = out.scores if out.scores is not None else None
+            scores = ([float(s) for s in raw_scores] if raw_scores is not None
+                      else [])
+            scores += [1.0] * (len(txts) - len(scores))
+            raw_boxes = out.boxes if out.boxes is not None else None
+            boxes = (list(raw_boxes) if raw_boxes is not None else [])
+            boxes += [()] * (len(txts) - len(boxes))
+            return list(zip(boxes, txts, scores))
+        return list(out)                              # 1.x 原生形状
+
+
+def _build_ocr_engine() -> _OcrEngine:
+    """构建 OCR 引擎：优先新版 rapidocr（PP-OCRv6），导入失败回退旧包。
+
+    旧包那组参数是围绕 v3 的「表格孤立数字漏检」实测标定的（见下），
+    **只对 v3 有效**，所以跟旧包绑死在一起，不作为全局配置。
+    """
+    try:
+        from rapidocr import RapidOCR
+    except ImportError:
+        from rapidocr_onnxruntime import RapidOCR
+        # 2026-10-16 实测标定（v3）：默认参数（limit_side_len=736, box_thresh=0.5）
+        # 检不出表格里的孤立数字——「票数」列的「1」6 个全丢，转发内容缺列。
+        # 把检测输入分辨率提到 1536、放宽阈值后 6/6 检出；
+        # 代价是单帧 OCR 0.6→1.6s（轮询间隔 5s，仍富余）。
+        # det_model_path=None 是绕过该版本 kwargs 覆盖逻辑的必填占位。
+        backend = RapidOCR(det_limit_side_len=1536, det_box_thresh=0.35,
+                           det_thresh=0.25, text_score=0.35,
+                           det_model_path=None)
+        return _OcrEngine(backend, "rapidocr_onnxruntime / PP-OCRv3（旧包回退）")
+    # v6 出厂参数即最优（bench 实测：13/13 运单号、无新增错字、无碎块），
+    # 不传任何参数；只把它的 INFO 日志压到 WARNING（每次构建引擎打 6 条
+    # 「Using …onnx」，生产首帧的日志里全是噪音）。
+    return _OcrEngine(
+        RapidOCR(params={"Global.log_level": "WARNING"}),
+        "rapidocr / PP-OCRv6")
+
+
 class DingTalkOCRSource(Source):
     name = "dingtalk-ocr"
 
@@ -676,17 +743,10 @@ class DingTalkOCRSource(Source):
         self._uia = uia
         return uia
 
-    def _get_ocr(self):
+    def _get_ocr(self) -> _OcrEngine:
         if self._ocr is None:
-            from rapidocr_onnxruntime import RapidOCR
-            # 2026-10-16 实测标定：默认参数（limit_side_len=736, box_thresh=0.5）
-            # 检不出表格里的孤立数字——「票数」列的「1」6 个全丢，转发内容缺列。
-            # 把检测输入分辨率提到 1536、放宽阈值后 6/6 检出；
-            # 代价是单帧 OCR 0.6→1.6s（轮询间隔 5s，仍富余）。
-            # det_model_path=None 是绕过该版本 kwargs 覆盖逻辑的必填占位。
-            self._ocr = RapidOCR(det_limit_side_len=1536, det_box_thresh=0.35,
-                                 det_thresh=0.25, text_score=0.35,
-                                 det_model_path=None)
+            self._ocr = _build_ocr_engine()
+            log.info("OCR 引擎：%s", self._ocr.name)
         return self._ocr
 
     def _find_window(self):
@@ -753,7 +813,7 @@ class DingTalkOCRSource(Source):
             for scale in (2.0, 3.0):
                 img = part.resize((int(part.width * scale),
                                    int(part.height * scale)), Image.LANCZOS)
-                res, _ = self._get_ocr()(np.array(img))
+                res = self._get_ocr()(np.array(img))
                 text = "".join(x[1] for x in (res or [])).strip()
                 if text:
                     if text not in texts:
@@ -825,7 +885,7 @@ class DingTalkOCRSource(Source):
         # 颜色分析必须用原始分辨率——放大插值会把深色文字洗浅，破坏分类基准
         orig = np.array(area.convert("RGB"))
         t = time.time()
-        res, _ = self._get_ocr()(arr)
+        res = self._get_ocr()(arr)
         log.debug("OCR %.2fs，%d 块", time.time() - t, len(res or []))
 
         blocks: list[dict] = []
@@ -915,7 +975,7 @@ class DingTalkOCRSource(Source):
         try:
             self._get_ocr()
         except Exception as exc:
-            return False, f"OCR 引擎不可用：{exc}（pip install rapidocr-onnxruntime）"
+            return False, f"OCR 引擎不可用：{exc}（pip install rapidocr）"
         wnd = self._find_window()
         if wnd is None:
             return False, "未找到钉钉主窗口，请确认客户端已启动并登录"

@@ -748,6 +748,25 @@ class Wizard(tk.Tk):
                 self._env_btn_retry()
                 return
 
+            # 预热 OCR 模型：新版 rapidocr 的模型文件（约几 MB）是首次运行时
+            # 才下载的。现在网络可用，趁热拉下来，用户之后离线也能采集；
+            # 失败不阻塞安装 —— 只是首次采集会多等一次模型下载。
+            self._env_log("预下载 OCR 模型（离线运行要用）…", "dim")
+            warmup = (
+                "import numpy as np\n"
+                "try:\n"
+                "    from rapidocr import RapidOCR\n"
+                "    eng = RapidOCR()\n"
+                "except ImportError:\n"
+                "    from rapidocr_onnxruntime import RapidOCR\n"
+                "    eng = RapidOCR(det_limit_side_len=1536, det_box_thresh=0.35,\n"
+                "                   det_thresh=0.25, text_score=0.35,\n"
+                "                   det_model_path=None)\n"
+                "eng(np.full((64, 320, 3), 255, dtype='uint8'))\n"
+                "print('ok')\n"
+            )
+            self._run_logged([vpy, "-c", warmup])
+
             sys.path.insert(0, str(self.install_dir / "app"))
             import paths                                 # noqa: E402
             paths._save_cache({"gui": "", "worker": str(vpy)})

@@ -253,16 +253,17 @@ def main() -> int:
     print(f"\n[OCR] 对 {best.name} 识别中…")
     try:
         import numpy as np
-        from rapidocr_onnxruntime import RapidOCR
-        ocr = RapidOCR()
+        from bridge.sources.dingtalk_ocr import _build_ocr_engine
+        ocr = _build_ocr_engine()
+        print(f"[OCR] 引擎：{ocr.name}")
         from PIL import Image
         t = time.time()
-        res, _ = ocr(np.array(Image.open(best).convert("RGB")))
+        res = ocr(np.array(Image.open(best).convert("RGB")))
         print(f"[OCR] 耗时 {time.time()-t:.2f}s  文本块 {len(res or [])} 个")
         for r in (res or []):
             box = r[0]
-            left = int(min(p[0] for p in box))
-            top = int(min(p[1] for p in box))
+            left = int(min(p[0] for p in box)) if len(box) else 0
+            top = int(min(p[1] for p in box)) if len(box) else 0
             print(f"   x={left:<5} y={top:<5} {r[1]}")
     except Exception as exc:
         print(f"[OCR] 失败：{type(exc).__name__}: {exc}")

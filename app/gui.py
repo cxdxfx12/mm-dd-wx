@@ -533,7 +533,7 @@ class App(tk.Tk):
 
     def _warn_no_worker(self) -> None:
         self._log("未找到可用的工作解释器（需要 Python 3.10+ 与 pyyaml / "
-                  "pillow / numpy / rapidocr-onnxruntime）。", "error")
+                  "pillow / numpy / rapidocr）。", "error")
         messagebox.showwarning(
             "缺少运行环境",
             "本机没有找到能跑采集与投递的 Python 环境。\n\n"
