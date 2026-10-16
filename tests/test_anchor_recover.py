@@ -29,7 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bridge.sources.dingtalk_ocr import (        # noqa: E402
     DingTalkOCRSource, at_bottom, scroll_offset, units_match,
-    pick_new_units, unit_fp, _pick_with_units, UNIT_GAP, AT_BOTTOM_TOL,
+    pick_new_units, unit_fp, norm_sender, _pick_with_units, UNIT_GAP,
+    AT_BOTTOM_TOL,
 )
 
 
@@ -390,6 +391,77 @@ class TestChatSwitchRecover(unittest.TestCase):
         f = frame_of([("甲", "历史消息 1111", 400)], scroll=(-2000.0, -488.0),
                      title=self.TARGET_TITLE)
         self.assertEqual(run_poll(src, f), [])
+
+
+class TestSenderNoise(unittest.TestCase):
+    """发送者读法抖动不许把同一条消息变成两条（线上实录）。
+
+    2026-10-16 的库里出现两条**正文 md5 完全相同**的消息，只是发送者一个读成
+    「签收跟单专员」、一个读成「签收跟单专员 机器人」。指纹里带了发送者，
+    于是算出两个 uid → 入库两条 → 两个投递任务（那次第一条发送失败，
+    侥幸没在微信群里变成两条一样的消息）。
+
+    群里消息以机器人播报为主，这个后缀时有时无是常态，必须挡住。
+    """
+
+    TARGET_TITLE = "【数字质控】浙江杭州萧山区大江东公司"
+    BODY = "一阶段签收进度播报：当前签收率 75.22%"
+
+    def test_robot_suffix_jitter_same_fingerprint(self):
+        self.assertEqual(unit_fp(unit(self.BODY, "签收跟单专员")),
+                         unit_fp(unit(self.BODY, "签收跟单专员 机器人")))
+
+    def test_whitespace_jitter_same_fingerprint(self):
+        """昵称被 OCR 拆成两个框时，拼起来中间会多一个空格。"""
+        self.assertEqual(unit_fp(unit("内容 1234", "数字质控 播报助手")),
+                         unit_fp(unit("内容 1234", "数字质控播报助手")))
+
+    def test_different_robots_still_differ(self):
+        """归一化只削掉「机器人」后缀，不许把不同的机器人混成一条。"""
+        self.assertNotEqual(
+            unit_fp(unit("同上 1234", "签收跟单专员 机器人")),
+            unit_fp(unit("同上 1234", "拦截跟单专员 机器人")))
+
+    def test_suffix_stripping_is_deliberate(self):
+        """刻意容忍：「张三」与「张三机器人」在**内容相同**时算同一条
+        —— 这正是「后缀时有时无」的场景。内容不同仍各自成条。"""
+        self.assertEqual(unit_fp(unit("内容 1234", "张三")),
+                         unit_fp(unit("内容 1234", "张三机器人")))
+        self.assertNotEqual(unit_fp(unit("内容 1234", "张三")),
+                            unit_fp(unit("内容 5678", "张三机器人")))
+
+    def test_norm_sender_keeps_meaningful_suffix(self):
+        self.assertEqual(norm_sender("播报小助手"), "播报小助手")
+        self.assertEqual(norm_sender("机器人之家 机器人"), "机器人之家")
+        self.assertEqual(norm_sender(""), "")
+        self.assertEqual(norm_sender("机器人"), "")
+
+    def test_units_match_tolerates_suffix(self):
+        self.assertTrue(units_match(unit(self.BODY, "签收跟单专员"),
+                                    unit(self.BODY, "签收跟单专员 机器人")))
+
+    def test_pick_treats_as_same_message(self):
+        """差分阶段也必须认成同一条，否则每帧都会把同一张表再发一次。"""
+        prev = [unit(self.BODY, "签收跟单专员", y0=100)]
+        cur = [unit(self.BODY, "签收跟单专员 机器人", y0=100),
+               unit("新的播报 2222", "签收跟单专员 机器人", y0=300)]
+        picked, _ = pick(cur, prev)
+        self.assertEqual([cur[i]["content"] for i in picked], ["新的播报 2222"])
+
+    def test_identical_body_from_two_people_still_two_messages(self):
+        """归一化不能过头：同群两个人先后发同样内容，仍是两条。"""
+        self.assertNotEqual(unit_fp(unit("收到", "张三")),
+                            unit_fp(unit("收到", "李四")))
+
+    def test_poll_once_does_not_duplicate_on_suffix_jitter(self):
+        """端到端：同一张表相邻两帧只差发送者后缀，只该发一次。"""
+        src = make_source()
+        run_poll(src, frame_of([("签收跟单专员", self.BODY, 300)],
+                               scroll=(-488.0, -488.0), title=self.TARGET_TITLE))
+        got = run_poll(src, frame_of([("签收跟单专员 机器人", self.BODY, 300)],
+                                     scroll=(-488.0, -488.0),
+                                     title=self.TARGET_TITLE))
+        self.assertEqual(got, [])
 
 
 if __name__ == "__main__":
