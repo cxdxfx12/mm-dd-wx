@@ -1,0 +1,65 @@
+# 数据落库
+storage:
+  # 相对本配置文件的路径
+  db_path: "data/bridge.db"
+
+# 钉钉采集端
+dingtalk:
+  # stream = 官方长连接事件订阅（需自建应用+机器人，无需公网IP；但只收得到 @机器人 的消息）
+  # ocr    = 截屏 + OCR 读取钉钉客户端（能拿到群内全部消息，需窗口处于打开状态）
+  # ui     = 读钉钉客户端控件树（实测不可用，消息不进无障碍树，仅存档）
+  # probe  = 仅探测能力，不采集（python probe_dingtalk.py 使用）
+  mode: "ocr"
+
+  # 敏感凭证建议改用环境变量：
+  #   DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET / DINGTALK_ROBOT_CODE
+  client_id: ""
+  client_secret: ""
+  robot_code: ""
+
+  # 只转发这些公司的消息，留空表示不限
+  companies:
+    - "示例科技有限公司"
+
+  # 只转发这些会话的消息，留空表示不限
+  chat_names: []
+
+  # ---- 以下为 ocr 模式专用 ----
+  # ocr 轮询间隔（秒）。越小越不漏消息，但一帧 OCR 约 2.5s，不建议低于 5
+  ui_poll_interval: 5.0
+
+  # 安全护栏：每帧 OCR 窗口标题，与 chat_names 模糊匹配；不匹配则整帧丢弃
+  title_check: true
+  title_ratio: 0.55
+
+  # 时间过滤：today = 丢弃被钉钉标记为「昨天/星期X/MM-DD」的跨天消息；any = 不限
+  time_filter: "today"
+
+  # 锚点防护：只转发「上一帧靠下位置那条消息」下方的新内容，
+  # 防止聊天区被滚动时把历史消息误当成新消息发出去
+  anchor_guard: true
+
+# 微信投递端
+wechat:
+  # true = 只打印不真发，用于联调；确认无误后改 false
+  dry_run: true
+  # 相邻两条消息的最小发送间隔（秒），防风控，建议不低于 3
+  interval: 3.0
+  wxauto_path: "../wxauto-main"
+
+# 路由规则：从上到下依次匹配，命中的目标合并去重
+routes:
+  - name: "示例公司全部消息"
+    companies: ["示例科技有限公司"]
+    msg_types: []                 # 空 = 不限
+    keywords: []
+    targets:
+      - "测试群"                   # 微信里的群名或好友备注，需完整匹配
+    template: "【{company}】{sender} {time}\n{content}"
+
+  # 示例：只转发含「加急」二字的消息到另一个群
+  # - name: "加急件单独提醒"
+  #   companies: ["示例科技有限公司"]
+  #   keywords: ["加急", "紧急"]
+  #   targets: ["调度群"]
+  #   template: "⚠ {sender}：{content}"

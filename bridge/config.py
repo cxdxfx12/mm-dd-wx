@@ -1,0 +1,106 @@
+"""配置加载：YAML -> dataclass。
+
+敏感字段（AppKey / AppSecret）优先从环境变量读取，避免写进配置文件。
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+@dataclass
+class StorageConfig:
+    db_path: str = "data/bridge.db"
+
+
+@dataclass
+class DingTalkConfig:
+    mode: str = "stream"                    # stream | ui | ocr | probe
+    client_id: str = ""
+    client_secret: str = ""
+    robot_code: str = ""
+    companies: list[str] = field(default_factory=list)
+    chat_names: list[str] = field(default_factory=list)
+    ui_poll_interval: float = 5.0           # ui / ocr 模式的轮询间隔（秒）
+    title_check: bool = True                # OCR 模式：每帧校验窗口标题，防转发错群
+    title_ratio: float = 0.55               # 标题模糊匹配阈值（OCR 对标题有误识，需容错）
+    time_filter: str = "today"              # today = 丢弃跨天旧消息；any = 不限；window = 指定时段
+    time_window: str = "08:00-18:00"        # time_filter=window 时的时段，支持跨零点（22:00-06:00）
+    anchor_guard: bool = True               # OCR 模式：用锚点防止窗口滚动导致历史消息被误转发
+
+
+@dataclass
+class WeChatConfig:
+    dry_run: bool = True
+    interval: float = 3.0                   # 相邻两条消息的最小发送间隔（秒），防风控
+    targets: list[str] = field(default_factory=list)
+    wxauto_path: str = "../wxauto-main"
+    driver: str = "auto"                    # auto | wxauto(微信3.9) | ui4(微信4.x)
+
+
+@dataclass
+class RouteConfig:
+    name: str = "default"
+    companies: list[str] = field(default_factory=list)
+    chat_names: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
+    msg_types: list[str] = field(default_factory=list)
+    targets: list[str] = field(default_factory=list)
+    template: str = "{content}"
+
+
+@dataclass
+class Config:
+    storage: StorageConfig = field(default_factory=StorageConfig)
+    dingtalk: DingTalkConfig = field(default_factory=DingTalkConfig)
+    wechat: WeChatConfig = field(default_factory=WeChatConfig)
+    routes: list[RouteConfig] = field(default_factory=list)
+
+    @property
+    def base_dir(self) -> Path:
+        return self._base_dir
+
+    def resolve(self, path: str) -> Path:
+        """把相对路径解析成相对配置文件所在目录的绝对路径。"""
+        p = Path(path)
+        return p if p.is_absolute() else (self._base_dir / p).resolve()
+
+
+def _section(cls, raw: Any) -> Any:
+    if not isinstance(raw, dict):
+        return cls()
+    known = {f.name for f in cls.__dataclass_fields__.values()}
+    return cls(**{k: v for k, v in raw.items() if k in known})
+
+
+def load_config(path: str | Path = "config.yaml") -> Config:
+    cfg_path = Path(path).resolve()
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"配置文件不存在：{cfg_path}")
+
+    with cfg_path.open("r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("配置文件根节点必须是映射（key: value）")
+
+    cfg = Config(
+        storage=_section(StorageConfig, raw.get("storage")),
+        dingtalk=_section(DingTalkConfig, raw.get("dingtalk")),
+        wechat=_section(WeChatConfig, raw.get("wechat")),
+        routes=[_section(RouteConfig, r) for r in (raw.get("routes") or [])],
+    )
+
+    # 环境变量覆盖敏感字段，优先级高于配置文件
+    cfg.dingtalk.client_id = os.getenv("DINGTALK_CLIENT_ID") or cfg.dingtalk.client_id
+    cfg.dingtalk.client_secret = os.getenv("DINGTALK_CLIENT_SECRET") or cfg.dingtalk.client_secret
+    cfg.dingtalk.robot_code = os.getenv("DINGTALK_ROBOT_CODE") or cfg.dingtalk.robot_code
+
+    if not cfg.routes:
+        raise ValueError("config.yaml 中 routes 至少需要配置一条路由规则")
+
+    cfg._base_dir = cfg_path.parent
+    return cfg

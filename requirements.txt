@@ -1,0 +1,19 @@
+# 核心依赖
+pyyaml>=6.0
+
+# 钉钉截屏 OCR 采集（mode: ocr 时需要；PP-OCR 离线模型，中文效果好）
+rapidocr-onnxruntime>=1.2.3
+onnxruntime>=1.20.0
+numpy>=1.26
+
+# 钉钉 Stream 长连接（mode: stream 时需要，钉钉官方 SDK）
+dingtalk-stream>=0.20.0
+
+# 微信投递依赖（wxauto 自身依赖，Windows 平台）
+pywin32>=306
+comtypes>=1.2.0
+pyperclip>=1.8.2
+pillow>=10.0.0
+psutil>=5.9.0
+colorama>=0.4.6
+tenacity>=8.2.0
