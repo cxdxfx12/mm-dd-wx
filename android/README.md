@@ -151,6 +151,24 @@ python android/build.py --clean    # 先清干净
 
 ## 电脑侧
 
+### 联调阶段：不用改 `mode`
+
+只要想确认「手机报了没有、报上来长什么样」，用这个**只收不转**的工具就够 ——
+它只起接收网关这一层，**不开微信、不连数据库、不改 config.yaml**，也不管你
+当前是 `ocr` 还是 `android` 模式：
+
+```bash
+python tools/android_capture.py          # 起网关，等手机报第一帧 → 存下来 + 出结构判定
+python tools/android_capture.py --now    # 已经收到过帧了？直接看最新那一帧
+python tools/android_capture.py --keep   # 收到后继续盯着，观察上报是否持续
+python tools/android_capture.py --bind 127.0.0.1   # 只在本机自测，不触发防火墙提示
+```
+
+它会占住 `gateway_port`（默认 8765），所以**别跟主程序同时跑** ——
+两边抢同一个端口，后起的那个会直接报「端口起不来」。
+
+### 正式上线
+
 1. `config.yaml` 里 `dingtalk.mode` 改成 `"android"`，
    `gateway_token` 填一个随机串（**不能留空**，网关监听局域网，没 token 等于谁都能往
    你的微信群发消息）：
@@ -161,13 +179,17 @@ python android/build.py --clean    # 先清干净
 
 2. 启动主程序。日志里会打印手机端该填的地址。
 
-3. 验证手机上报是否到了：
+3. 验证手机上报是否到了（这次是问**已在运行的主程序**）：
 
    ```bash
    python tools/android_screen.py                 # 只看状态，不下载正文
    python tools/android_screen.py --watch 60      # 盯 60 秒，看上报是否持续
    python tools/android_screen.py --save --analyze  # 存一帧并出结构判定
    ```
+
+> `android_capture.py` 与 `android_screen.py` 的分工：前者**自己起网关**（联调用，
+> 不需要主程序），后者**连现成的网关**（线上用，主程序在跑时才通）。
+> 两者都只是排障与取证入口，都不参与转发。
 
 ---
 
@@ -178,7 +200,7 @@ python android/build.py --clean    # 先清干净
 | 闸门：钉钉安卓的无障碍树里有消息文本 | ✅ 手机「屏幕朗读」实测读出完整正文 |
 | 手机端采集 App | ✅ 本篇，已编译出可直接安装的 APK |
 | 电脑侧 `/screen` 接收端点 | ✅ `bridge/sources/android_gateway.py` |
-| 排障工具 | ✅ `tools/android_screen.py` |
+| 排障工具 | ✅ `tools/android_screen.py`（连现成网关）、`tools/android_capture.py`（自起网关，联调用） |
 | **消息边界确认** | ⏳ **下一步**：手机上报一帧真实画面，用 `--save --analyze` 看结构 |
 | 电脑侧解析器（XML → 消息） | ⏳ 等边界确认后再写 |
 | 设置中心里的网关页签 | ⏳ 目前只能改 config.yaml |
