@@ -372,6 +372,52 @@ class SettingsDialog:
         self.st["title"] = tk.BooleanVar(value=bool(d.get("title_check", True)))
         self.st["ratio"] = tk.StringVar(value=str(d.get("title_ratio", 0.55)))
 
+        # ---- 数据来源（dingtalk.mode）----
+        # 这是「消息从哪来」的总开关，放最上面：它决定下面一堆参数有没有意义。
+        mode_now = str(d.get("mode") or "ocr")
+        self.st["src"] = tk.StringVar(value=mode_now)
+        self.st["gw_host"] = tk.StringVar(value=str(d.get("gateway_host") or "0.0.0.0"))
+        self.st["gw_port"] = tk.StringVar(value=str(d.get("gateway_port") or 8765))
+        self.st["gw_token"] = tk.StringVar(value=str(d.get("gateway_token") or ""))
+        self.st["gw_parse"] = tk.BooleanVar(value=bool(d.get("android_parse")))
+
+        srcbox = _card(page, "数据来源：消息从哪儿读")
+        srcbox.pack(fill="x", padx=12, pady=(12, 8))
+
+        ttk.Radiobutton(
+            srcbox, text="PC 钉钉（截屏 + 文字识别）",
+            value="ocr", variable=self.st["src"],
+            command=self._on_source_radio).pack(anchor="w", padx=14,
+                                                pady=(10, 0))
+        _tip(srcbox, "电脑上开着钉钉、窗口停在目标群即可。窗口可以被别的窗口挡住，"
+                     "但不能最小化；识别有极小概率认错字。").pack(fill="x", padx=30)
+
+        ttk.Radiobutton(
+            srcbox, text="手机钉钉（手机 App 无障碍上报）",
+            value="android", variable=self.st["src"],
+            command=self._on_source_radio).pack(anchor="w", padx=14,
+                                                pady=(8, 0))
+        _tip(srcbox, "需要一台安卓手机：装好采集 App、开着无障碍、停在目标群且屏幕不黑。"
+                     "读到的是精确原文，没有识别误差，比截图识别可靠；代价是这台手机不能"
+                     "再干别的。").pack(fill="x", padx=30)
+
+        grid2 = tk.Frame(srcbox, bg=CARD)
+        grid2.pack(fill="x", padx=14, pady=(8, 4))
+        self._entry_row(grid2, 0, "监听地址", self.st["gw_host"], 16,
+                        "默认 0.0.0.0（局域网都能连，手机才连得上）。只在本机自测时改 127.0.0.1。")
+        self._entry_row(grid2, 1, "监听端口", self.st["gw_port"], 8,
+                        "手机端填 http://<本机IP>:这个端口")
+        self._entry_row(grid2, 2, "访问 token", self.st["gw_token"], 24,
+                        "手机端必须填一样的。能往这个端口发东西就等于能往你的微信群发消息，"
+                        "所以不允许留空。")
+
+        ttk.Checkbutton(srcbox, text="把手机报来的画面解析成消息并转发",
+                        variable=self.st["gw_parse"]).pack(anchor="w", padx=14,
+                                                           pady=(6, 0))
+        _tip(srcbox, "手机模式下**必须**勾选，否则网关只收不转、一条消息都不会发出去。"
+                     "（默认不勾是安全考虑：先确认解析结果对不对。）"
+             ).pack(fill="x", padx=30, pady=(0, 12))
+
         box = _card(page, "投递")
         box.pack(fill="x", padx=12, pady=(12, 8))
         ttk.Checkbutton(box, text="试运行模式：只打印日志，不真的发到微信",
@@ -424,6 +470,28 @@ class SettingsDialog:
         ttk.Spinbox(blk, from_=lo, to=hi, textvariable=var, width=6
                     ).pack(side="left", padx=8)
         _tip(blk, note, bg=CARD).pack(side="left")
+
+    def _on_source_radio(self):
+        """选中「手机钉钉」时自动勾上后台解析。
+
+        不自动勾的话，用户切到手机模式、保存、开始运行 —— 网关只收不转，
+        一条消息都发不出去，而且日志里只有一句 INFO。这个坑比「自动勾了」
+        危险得多，所以默认帮用户勾上；真想关，保存时会二次确认。
+        """
+        if self.st["src"].get() == "android" and not self.st["gw_parse"].get():
+            self.st["gw_parse"].set(True)
+
+    def _entry_row(self, parent, row: int, label: str, var, width: int,
+                   note: str = ""):
+        """标签 + 输入框 + 说明。用于地址/端口/token 这类不能是数字的项。"""
+        blk = tk.Frame(parent, bg=CARD)
+        blk.grid(row=row, column=0, sticky="w", pady=4)
+        tk.Label(blk, text=label, bg=CARD, fg=TEXT, font=F_UI,
+                 width=8, anchor="w").pack(side="left")
+        ttk.Entry(blk, textvariable=var, width=width).pack(side="left",
+                                                           padx=(4, 8))
+        if note:
+            _tip(blk, note, bg=CARD).pack(side="left")
 
     # ------------------------------------------------------------ 消息格式
 
@@ -851,6 +919,38 @@ class SettingsDialog:
             messagebox.showwarning("数值不对", "间隔与阈值必须是数字。", parent=self.win)
             return
 
+        # ---- 数据来源 + 手机网关 ----
+        src_mode = str(self.st["src"].get() or "ocr")
+        gw_host = self.st["gw_host"].get().strip() or "0.0.0.0"
+        gw_token = self.st["gw_token"].get().strip()
+        gw_parse = bool(self.st["gw_parse"].get())
+        try:
+            gw_port = int(float(self.st["gw_port"].get()))
+            if not (1 <= gw_port <= 65535):
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning(
+                "监听端口不对", "端口要填 1–65535 之间的整数，例如 8765。",
+                parent=self.win)
+            return
+        if src_mode == "android":
+            # 这两个是「选了手机却一条都收不到」的头号原因，保存时就拦住，
+            # 别让用户回去对着日志猜。
+            if not gw_token:
+                messagebox.showwarning(
+                    "还缺访问 token",
+                    "手机模式下必须填一个 token，且与手机 App 里填的完全一致。\n\n"
+                    "能往这个端口发东西就等于能往你的微信群发消息，所以不允许留空。\n"
+                    "随便一串随机字符即可。",
+                    parent=self.win)
+                return
+            if not gw_parse and not messagebox.askyesno(
+                    "手机模式但没开解析",
+                    "你选了「手机钉钉」，但没勾「把手机报来的画面解析成消息并转发」。\n\n"
+                    "这样网关只会收画面、**一条消息都不会发出去**（这是刻意的安全默认值）。\n\n"
+                    "确定就这样保存吗？", parent=self.win):
+                return
+
         # 微信「显示/隐藏主窗口」热键：SendKeys 语法，例如 {Ctrl}{Alt}w。
         # 填错不会报错、只会在需要唤回窗口时静默失效，所以这里卡一道。
         hotkey = self.st["hotkey"].get().strip() or "{Ctrl}{Alt}w"
@@ -934,6 +1034,8 @@ class SettingsDialog:
                 if s not in sources:
                     sources.append(s)
         L("dingtalk", "chat_names", sources)
+        # mode 在样板文件里是 dingtalk 段的第一个键，所以插入点留空（段首）。
+        S("dingtalk", "mode", src_mode)
         S("dingtalk", "ui_poll_interval", poll, after="chat_names")
         S("dingtalk", "title_check", bool(self.st["title"].get()),
           after="ui_poll_interval")
@@ -942,6 +1044,11 @@ class SettingsDialog:
         S("dingtalk", "time_window", window, after="time_filter")
         S("dingtalk", "anchor_guard", bool(self.st["anchor"].get()),
           after="time_window")
+        # 手机网关参数：老的 config.yaml 里没有这些键，所以走「改或插」。
+        S("dingtalk", "gateway_host", gw_host, after="anchor_guard")
+        S("dingtalk", "gateway_port", gw_port, after="gateway_host")
+        S("dingtalk", "gateway_token", gw_token, after="gateway_port")
+        S("dingtalk", "android_parse", gw_parse, after="gateway_token")
         S("wechat", "dry_run", bool(self.st["dry_run"].get()), after="interval")
         S("wechat", "interval", interval, after="dry_run")
         S("wechat", "show_hotkey", hotkey, after="wxauto_path")

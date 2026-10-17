@@ -124,6 +124,25 @@ F_LOG = ("Microsoft YaHei UI", 9)
 COPYRIGHT = "杭州喵喵至家网络有限公司  www.hbdxm.com"
 APP_TITLE = "喵喵钉钉-微信消息转发桥"
 
+# 数据来源（= config.yaml 的 dingtalk.mode）。这是给用户看的两个选项，
+# 顺序即下拉框顺序。
+SOURCE_LABELS = {
+    "ocr": "PC 钉钉 · 截图识别",
+    "android": "手机钉钉 · 无障碍",
+}
+
+
+def source_label(mode: str) -> str:
+    """把 mode 翻成人话；不认识的值原样显示（别把旧配置藏起来）。"""
+    return SOURCE_LABELS.get(mode, mode or "-")
+
+
+def label_source(label: str) -> str:
+    for mode, text in SOURCE_LABELS.items():
+        if text == label:
+            return mode
+    return ""
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -419,7 +438,7 @@ class App(tk.Tk):
         box_cfg.pack(fill="x")
         self.cfg_rows: dict[str, tuple[tk.Label, tk.Label]] = {}
         for i, key in enumerate(("监控会话", "转发目标", "轮询间隔", "发送间隔",
-                                 "时间过滤", "运行模式", "钉钉通知")):
+                                 "时间过滤")):
             lab = tk.Label(body_cfg, text=key, bg=CARD, fg=MUTED, font=F_SMALL)
             lab.grid(row=i, column=0, sticky="w", pady=2)
             val = tk.Label(body_cfg, text="-", bg=CARD, fg=TEXT, font=F_SMALL,
@@ -427,6 +446,26 @@ class App(tk.Tk):
             val.grid(row=i, column=1, sticky="e", pady=2)
             body_cfg.columnconfigure(1, weight=1)
             self.cfg_rows[key] = (lab, val)
+
+        # 数据来源做成**可切换的下拉**而不是一行只读文字：这是「数据从哪来」
+        # 的唯一开关，藏在设置中心里没人找得到（只能手改 config.yaml 时，
+        # 用户根本不知道有这个选项）。
+        row = 5
+        tk.Label(body_cfg, text="数据来源", bg=CARD, fg=MUTED,
+                 font=F_SMALL).grid(row=row, column=0, sticky="w", pady=2)
+        self.src_var = tk.StringVar()
+        self.src_combo = ttk.Combobox(
+            body_cfg, textvariable=self.src_var, state="readonly", width=17,
+            values=list(SOURCE_LABELS.values()), font=F_SMALL)
+        self.src_combo.grid(row=row, column=1, sticky="e", pady=1)
+        self.src_combo.bind("<<ComboboxSelected>>", self._on_source_change)
+
+        lab = tk.Label(body_cfg, text="钉钉通知", bg=CARD, fg=MUTED, font=F_SMALL)
+        lab.grid(row=6, column=0, sticky="w", pady=2)
+        val = tk.Label(body_cfg, text="-", bg=CARD, fg=TEXT, font=F_SMALL,
+                       anchor="e", wraplength=150, justify="right")
+        val.grid(row=6, column=1, sticky="e", pady=2)
+        self.cfg_rows["钉钉通知"] = (lab, val)
 
         # ---------------- 日志区 ----------------
         right = tk.Frame(main, bg=CARD, highlightbackground=BORDER,
@@ -586,7 +625,6 @@ class App(tk.Tk):
         r0 = routes[0] if routes else {}
         chats = "、".join(d.get("chat_names") or []) or "-"
         targets = "、".join(r0.get("targets") or w.get("targets") or []) or "-"
-        mode = "试运行（不真实发送）" if w.get("dry_run") else "正式发送"
         if not n.get("enabled"):
             notify = "未启用"
         elif not _notify_robots(n):
@@ -600,12 +638,14 @@ class App(tk.Tk):
             "轮询间隔": f"{d.get('ui_poll_interval', 5)} 秒",
             "发送间隔": f"{w.get('interval', 3)} 秒",
             "时间过滤": "只转发今天" if d.get("time_filter") == "today" else "不限时间",
-            "运行模式": mode,
             "钉钉通知": notify,
         }
         for k, v in vals.items():
             if k in self.cfg_rows:
                 self.cfg_rows[k][1].configure(text=v)
+        # 数据来源是下拉框，值不能写进 Label
+        if getattr(self, "src_var", None) is not None:
+            self.src_var.set(source_label(str(d.get("mode") or "")))
         self.subtitle.configure(
             text=f"{chats}   →   {targets}" if chats != "-" else "尚未配置监控会话")
         if w.get("dry_run"):
@@ -615,6 +655,56 @@ class App(tk.Tk):
             self.drybar.pack(fill="x", before=self.main_frame)
         else:
             self.drybar.pack_forget()
+
+    # ================================================== 数据来源切换
+
+    def _on_source_change(self, _ev=None):
+        """主界面下拉切换数据来源（PC 截图识别 ↔ 手机无障碍上报）。
+
+        写盘而不是只改内存：真正采集的是子进程（`bridge_worker --live`），
+        它启动时重新读 config.yaml，界面里的内存值它看不到。也正因为它
+        只在启动时读，切换后必须**重新开始运行**才生效。
+        """
+        mode = label_source(self.src_var.get())
+        if not mode:
+            return
+        if not isinstance(self.cfg, dict):
+            messagebox.showwarning("配置尚未加载", "请先点「重新检测环境」。",
+                                   parent=self)
+            return
+        d = self.cfg.setdefault("dingtalk", {})
+        old = str(d.get("mode") or "")
+        if old == mode:
+            return
+
+        ok = cfgfile.set_or_insert_scalar(CONFIG_PATH, "dingtalk", "mode", mode,
+                                          after_key="chat_names")
+        if not ok:
+            messagebox.showerror(
+                "切换失败", f"没能把数据来源写进配置文件：\n{CONFIG_PATH}\n\n"
+                            "请检查文件是否只读，或用「设置 → 采集与投递」再试一次。",
+                parent=self)
+            self.src_var.set(source_label(old))
+            return
+
+        d["mode"] = mode
+        self._log(f"数据来源已切换为「{source_label(mode)}」", "sys")
+
+        running = self.runner.alive()
+        body = (f"数据来源：{source_label(mode)}\n\n"
+                "这个设置要重新「开始运行」才会生效"
+                + ("——当前正在运行，请先点停止。" if running else "。"))
+        if mode == "android":
+            tok = str(d.get("gateway_token") or "").strip()
+            body += ("\n\n手机端要一直停在目标群、屏幕不能黑，"
+                     "并在 App 里填本机地址与 token。")
+            if not tok:
+                body += "\n\n⚠ 网关 token 还是空的，手机连不上 —— " \
+                        "先到「设置 → 采集与投递」填一个。"
+            if not d.get("android_parse"):
+                body += "\n\n⚠ 「把手机报来的画面解析成消息」还没开，手机模式下" \
+                        "不会转发任何消息 —— 请到「设置 → 采集与投递」勾上。"
+        messagebox.showinfo("已保存", body, parent=self)
 
     # ================================================== 日志
 

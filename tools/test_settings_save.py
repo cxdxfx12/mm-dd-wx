@@ -77,7 +77,8 @@ def notify_section(path: Path) -> str:
     return "\n".join(lines[i:j])
 
 
-def run_case(root: tk.Tk, title: str, config_text: str, problems: list[str]):
+def run_case(root: tk.Tk, title: str, config_text: str, problems: list[str],
+             mode: str = "", token: str = ""):
     tmp = Path(tempfile.mkdtemp(prefix="ddwx_save_"))
     path = tmp / "config.yaml"
     path.write_text(config_text, encoding="utf-8")
@@ -93,6 +94,12 @@ def run_case(root: tk.Tk, title: str, config_text: str, problems: list[str]):
     for u, s, k in ROBOTS:
         win._add_robot_row(u, s, k)
     win.st["n_enabled"].set(True)
+    # 数据来源：模拟用户在界面上切到手机模式并填 token
+    if mode:
+        win.st["src"].set(mode)
+        win._on_source_radio()          # 真实点击单选时由 ttk 调用，这里手动触发
+        if token:
+            win.st["gw_token"].set(token)
     win.win.update_idletasks()
     win.win.update()
 
@@ -117,6 +124,10 @@ def run_case(root: tk.Tk, title: str, config_text: str, problems: list[str]):
         print(f"    · {u[-12:]}  加签={'有' if s else '无'}  关键词={k or '-'}")
     print(f"  time_window ：{back.dingtalk.time_window!r}")
     print(f"  anchor_guard：{back.dingtalk.anchor_guard!r}")
+    print(f"  数据来源    ：{back.dingtalk.mode!r}"
+          f"  网关 {back.dingtalk.gateway_host}:{back.dingtalk.gateway_port}"
+          f"  token={'有' if back.dingtalk.gateway_token else '无'}"
+          f"  解析={back.dingtalk.android_parse}")
 
     if problems:
         problems.append(f"{title}：保存时报了配置项写入失败")
@@ -126,6 +137,13 @@ def run_case(root: tk.Tk, title: str, config_text: str, problems: list[str]):
         problems.append(f"{title}：dingtalk.time_window 没写进去")
     if back.dingtalk.anchor_guard is None:
         problems.append(f"{title}：dingtalk.anchor_guard 没写进去")
+    if mode and back.dingtalk.mode != mode:
+        problems.append(f"{title}：数据来源没写进去（读回 {back.dingtalk.mode!r}）")
+    if token and back.dingtalk.gateway_token != token:
+        problems.append(f"{title}：网关 token 没写进去")
+    if mode == "android" and not back.dingtalk.android_parse:
+        # 切到手机模式却没开解析 = 收得到但一条都不转，是最难自己发现的那种坏
+        problems.append(f"{title}：切到手机模式后没自动开启画面解析")
     if first != second:
         problems.append(f"{title}：保存两次内容有差异（往返不稳定）")
     tail = [l for l in second.rstrip().splitlines() if l.strip()][-1]
@@ -141,6 +159,10 @@ def main() -> int:
     problems: list[str] = []
     run_case(root, "新装（样板生成，已有 webhooks 键）", EXAMPLE, problems)
     run_case(root, "老配置升级（缺 time_window / webhooks 等新键）", OLD, problems)
+    # 数据来源切到手机：老配置里根本没有 gateway_* 这几个键，
+    # 走的正是「改或插」，也是线上升级时最容易存不下来的那种形态。
+    run_case(root, "老配置 + 切到手机钉钉", OLD, problems,
+             mode="android", token="Tok3n-测试-abc")
     root.destroy()
 
     print("\n" + "=" * 60)
@@ -149,7 +171,7 @@ def main() -> int:
         for p in problems:
             print("  -", p)
         return 1
-    print("全部通过：两种配置形态下保存往返均无损")
+    print("全部通过：三种配置形态下保存往返均无损")
     return 0
 
 
