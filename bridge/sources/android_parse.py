@@ -84,6 +84,17 @@ NOISE_LABELS = frozenset({
 # 逐层往下的最大深度：防病态布局（自嵌套包装）把递归拖爆。
 MAX_SPLIT_DEPTH = 6
 
+# 气泡容器的 resource-id（真机上是语义化名字，不是混淆串）。用它认正文比
+# 「面积最大」可靠得多 —— 行被滑到屏幕边界时行内 bounds 会整体塌掉。
+# 仍然保留面积法兜底：某天 id 改了也不至于彻底读不到正文。
+BUBBLE_RID_RE = re.compile(
+    r"(chat_bubble_container|chatting_content_view_stub|card_view_container)$")
+
+# 一行至少要有这么高才算「完整地露在屏幕上」。真机实测：被滑到列表顶部边界
+# 之外的消息，行级 bounds 会缩成 38px 这种细条（内部 bounds 更是塌成负数）。
+# 这种半截行不该被转发 —— 内容可能不全，而且它多半早就发过了。
+MIN_ROW_HEIGHT = 60
+
 # 昵称后面会跟一个单独的「机器人」标签（机器人账号发消息时）。库里存的昵称
 # 不该带它 —— 指纹那边也会把尾部的「机器人」去掉，这里提前对齐，展示才一致。
 ROBOT_TAG_RE = re.compile(r"\s+机器人$")
@@ -447,7 +458,18 @@ def _looks_like_msgrow(node: Node) -> bool:
 
 def _one(node: Node) -> list[Unit]:
     unit = split_row(node)
-    return [] if unit.kind == "empty" else [unit]
+    if unit.kind == "empty":
+        return []
+    # 只露出一截的消息行直接丢掉。真机上消息被滑到列表顶部边界外时，行级
+    # bounds 会缩成 38px 这种细条、行内 bounds 全部塌成负数 —— 这时切出来的
+    # 正文是错的（昵称被当成正文，实测「签收跟单专员/机器人」），而它多半
+    # 早就发过了。宁可漏一条（`forward_recent.py` 能补），也不发错内容。
+    #
+    # 时间分隔条不适用：它只是个标记，本身就可能只有 40px 高；真丢了也只是
+    # 排障信息少一行，不影响转发。
+    if unit.kind != "time" and node.bounds[3] - node.bounds[1] < MIN_ROW_HEIGHT:
+        return []
+    return [unit]
 
 
 def _item_units(item: Node, depth: int = 0) -> list[Unit]:
@@ -458,6 +480,8 @@ def _item_units(item: Node, depth: int = 0) -> list[Unit]:
     若干 ``RelativeLayout``）。把它当一条的后果不是报错，而是整屏消息被拼成
     一条、时间条混进正文里 —— 所以这里要能往下走两层。
     """
+    # 半截行在 `_one` 里丢；时间分隔条不受高度限制 —— 它只是个标记，
+    # 而真机上时间条本身就可能只有 40px 高。
     kids = _labeled_children(item)
     if not kids:
         return _one(item)
@@ -507,17 +531,28 @@ def _bubble_and_sender(node: Node) -> tuple[Node | None, str]:
     content-desc 与「机器人」标签都不会混进正文。
     """
     kids = _labeled_children(node)
-    # 气泡 = **面积最大**的那个容器。不能只按「文本行数」比：只有一行的消息
-    # （正文两三个字）与「昵称 + 机器人标签」那个小块的文本数一样多，按行数
-    # 会挑到昵称块，正文就成了「昵称 / 机器人」。
     bubble: Node | None = None
-    best: tuple[int, int] = (-1, -1)
+
+    # 先按 resource-id 认气泡。这比「面积最大」可靠得多：消息行被滑到屏幕边界
+    # 只露出一截时，行内所有子节点的 bounds 都会塌掉（top 被夹成列表顶部、
+    # bottom 变成负数），此时昵称块的「面积」会算得比气泡还大，正文就成了
+    # 「昵称 / 机器人」——真机实测过（08:42 那条只露 38px）。
     for k in kids:
-        if not _labeled_children(k):
-            continue
-        key = (_area(k), len(_clean_leaves(k)))
-        if key > best:
-            bubble, best = k, key
+        if BUBBLE_RID_RE.search(k.rid):
+            bubble = k
+            break
+
+    if bubble is None:
+        # 退回「面积最大」：id 被改掉或这颗树里没带 id 时的兜底。
+        # 不能只按「文本行数」比：只有一行的消息（正文两三个字）与「昵称 +
+        # 机器人标签」那个小块的文本数一样多，按行数会挑到昵称块。
+        best: tuple[int, int] = (-1, -1)
+        for k in kids:
+            if not _labeled_children(k):
+                continue
+            key = (_area(k), len(_clean_leaves(k)))
+            if key > best:
+                bubble, best = k, key
     if bubble is None:
         return None, ""
 

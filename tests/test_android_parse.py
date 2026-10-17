@@ -125,6 +125,7 @@ def dt_message(sender: str, lines: list[str], top: int, *,
         f'<node index="6" text="机器人" class="android.widget.TextView" package="{PKG}" '
         f'bounds="[419,{top + 20}][536,{top + 64}]"></node></node>'
         f'<node index="7" text="" class="android.widget.FrameLayout" package="{PKG}" '
+        f'resource-id="{PKG}:id/chat_bubble_container" '
         f'bounds="[174,{top + 80}][1002,{top + h - 10}]">{bubble}'
         f'<node index="8" text="" class="android.view.View" package="{PKG}" '
         f'content-desc="复制" bounds="[541,{top + h - 40}][635,{top + h - 5}]"></node>'
@@ -369,6 +370,84 @@ class TestRealDeviceLayout(unittest.TestCase):
                                      hidden_time="08:13"))))
         self.assertEqual(f.separators, ["今天 08:13"])
         self.assertEqual(len(f.units), 1)
+
+    # --- 被滑到屏幕边界外、只露出一截的行 ---
+    #
+    # 真机第三帧（13:07）实测：屏幕上第一条消息只剩 38px 高，
+    # 行内所有 bounds 都塌了（top 恒为 265、bottom 是负数）。当时解析器
+    # 把它切成了「签收跟单专员 / 机器人」—— 昵称被当成正文，正文整段丢了。
+    # 这类行不能发（内容不可信，而且多半早就发过了）。
+
+    def clipped_item(self) -> str:
+        """复刻真机那条只露 38px 的组：组高 38，行内 bounds 全塌。"""
+        return (
+            f'<node index="20" text="" class="android.widget.LinearLayout" package="{PKG}" '
+            f'clickable="true" bounds="[0,265][1176,303]">'
+            f'<node index="21" text="今天 08:42" class="android.widget.TextView" '
+            f'resource-id="{PKG}:id/chatting_time_tv" package="{PKG}" '
+            f'bounds="[473,265][702,-394]"></node>'
+            f'<node index="22" text="" class="android.widget.RelativeLayout" package="{PKG}" '
+            f'bounds="[0,265][1176,278]">'
+            f'<node index="23" text="" class="android.widget.ImageView" package="{PKG}" '
+            f'content-desc="签收跟单专员" bounds="[24,265][137,-247]"></node>'
+            f'<node index="24" text="" class="android.view.ViewGroup" package="{PKG}" '
+            f'bounds="[178,265][1006,-316]">'
+            f'<node index="25" text="签收跟单专员" class="android.widget.TextView" '
+            f'package="{PKG}" bounds="[178,265][406,-316]"></node>'
+            f'<node index="26" text="机器人" class="android.widget.TextView" package="{PKG}" '
+            f'bounds="[419,265][536,-316]"></node></node>'
+            f'<node index="27" text="" class="android.widget.FrameLayout" package="{PKG}" '
+            f'resource-id="{PKG}:id/chat_bubble_container" bounds="[174,265][1002,265]">'
+            f'<node index="28" text="@所有人今日出仓进度提醒" class="android.widget.TextView" '
+            f'package="{PKG}" bounds="[212,265][964,-200]"></node></node></node></node>')
+
+    def test_clipped_row_is_skipped(self):
+        """只露一截的行整条丢掉 —— 切出来的正文不可信，不能发。"""
+        f = parse_frame(dt_frame(self.clipped_item(),
+                                 dt_item("今天 13:07",
+                                         dt_message("履约跟单专员", ["正文"], 1700))))
+        self.assertEqual([u.content for u in f.units], ["正文"])
+        self.assertNotIn("签收跟单专员", [u.content for u in f.units])
+        # 时间条照留（它只是排障信息，本身就可能只有 40px 高）
+        self.assertIn("今天 08:42", f.separators)
+
+    def test_bubble_found_by_id_when_bounds_collapsed(self):
+        """气泡按 resource-id 认，不看面积。
+
+        行内 bounds 塌掉时，昵称块算出来的「面积」会比气泡大（气泡的
+        top == bottom，面积 0），按面积挑就把正文换成了「昵称 / 机器人」。
+        """
+        collapsed = (
+            f'<node index="1" text="" class="android.widget.RelativeLayout" package="{PKG}" '
+            f'bounds="[0,600][1176,900]">'
+            f'<node index="2" text="" class="android.view.ViewGroup" package="{PKG}" '
+            f'bounds="[178,265][1006,-316]">'
+            f'<node index="3" text="签收跟单专员" class="android.widget.TextView" '
+            f'package="{PKG}" bounds="[178,265][406,-316]"></node>'
+            f'<node index="4" text="机器人" class="android.widget.TextView" package="{PKG}" '
+            f'bounds="[419,265][536,-316]"></node></node>'
+            f'<node index="5" text="" class="android.widget.FrameLayout" package="{PKG}" '
+            f'resource-id="{PKG}:id/chat_bubble_container" bounds="[174,265][1002,265]">'
+            f'<node index="6" text="出仓进度提醒" class="android.widget.TextView" '
+            f'package="{PKG}" bounds="[212,265][964,-200]"></node></node></node>')
+        f = parse_frame(dt_frame(dt_item("今天 08:42", collapsed)))
+        self.assertEqual(len(f.units), 1)
+        self.assertEqual(f.units[0].content, "出仓进度提醒")
+        self.assertEqual(f.units[0].sender, "签收跟单专员")
+
+    def test_bubble_falls_back_to_area_without_id(self):
+        """树里没带 resource-id 时，仍能靠面积找到气泡（老逻辑不能丢）。"""
+        no_rid = (
+            f'<node index="1" text="" class="android.widget.RelativeLayout" package="{PKG}" '
+            f'bounds="[0,600][1176,900]">'
+            f'<node index="2" text="签收跟单专员" class="android.widget.TextView" '
+            f'package="{PKG}" bounds="[178,620][406,664]"></node>'
+            f'<node index="5" text="" class="android.widget.FrameLayout" package="{PKG}" '
+            f'bounds="[174,690][1002,880]">'
+            f'<node index="6" text="出仓进度提醒" class="android.widget.TextView" '
+            f'package="{PKG}" bounds="[212,700][964,760]"></node></node></node>')
+        f = parse_frame(dt_frame(dt_item("今天 08:42", no_rid)))
+        self.assertEqual([u.content for u in f.units], ["出仓进度提醒"])
 
 
 class TestFingerprintDrift(unittest.TestCase):
