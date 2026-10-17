@@ -83,6 +83,11 @@ SCREEN_LOG_EVERY = 30
 # 连续这么多帧都认不出「聊天页」→ 升到 WARNING（会触发钉钉告警）。
 # 认不出意味着一条都不转发，属于「程序在跑但静默失效」，必须让人知道。
 UNKNOWN_PAGE_ALERT_AFTER = 3
+# H5 卡片「扣住待稳」：新内容第一次见扣住不放，请手机 HOLD_MS 毫秒后重报；
+# 同样的内容见到第 HOLD_MAX 眼就放行（渲染实在稳不下来的兜底 —— 宁可发
+# 一条可能不完整的，也不能永远不发）。原生消息不经过这条路，延迟零增加。
+HOLD_MS = 800
+HOLD_MAX = 4
 # 看门狗多久检查一次「手机还在不在」（秒）。比心跳间隔（手机端 60s）小得多，
 # 所以失联的发现延迟最多是「心跳间隔 + 这个 tick」。
 OFFLINE_TICK = 10.0
@@ -554,6 +559,14 @@ class _Ctx:
     # 不能写死 8765：用户在设置里改过端口时，页面照着旧值显示，
     # 手机上填了就是连不上，而且他没法从 App 里看出错在哪。
     port: int = DEFAULT_PORT
+    # H5 卡片「扣住待稳」的状态（见 _ingest 的 garbled 分支）。
+    # hold_key 是被扣住那批新单元的指纹串，hold_seen 记这是第几眼看到它 ——
+    # 同样的内容见到第二眼才投递；超过 HOLD_MAX 眼还稳不下来就放行，
+    # 宁可发一条可能不完整的，也不能永远不发。
+    hold_key: str = ""
+    hold_seen: int = 0
+    # 不管 key 换没换都累计 —— 防「内容一直在长」导致永远扣住。
+    hold_total: int = 0
     companies: list[str] = field(default_factory=list)
     on_message: MessageHandler | None = None
     count: dict = field(default_factory=lambda: {"requests": 0, "accepted": 0,
@@ -920,10 +933,11 @@ class _Handler(BaseHTTPRequestHandler):
             pending: list = []
             note = ""
             scroll = False
+            hold_ms = 0
             if self.ctx.parse and self.ctx.on_message is not None:
                 # 手机端上翻补全后重报的那一帧会带 reason=scroll-fill。
                 # 它必须走另一套判定 —— 见 _ingest 里的说明。
-                pending, note, scroll = self._ingest(
+                pending, note, scroll, hold_ms = self._ingest(
                     text, filling=(screen["reason"] == "scroll-fill"))
 
         # 记「手机还活着」。必须在锁外调：touch 走的是另一把锁，
@@ -955,12 +969,21 @@ class _Handler(BaseHTTPRequestHandler):
             # 手机端见 android/.../CollectorService.maybeFillTruncated。
             if scroll:
                 body["scroll"] = True
+            # 同样是给手机端的指令：H5 卡片还在渲染，等 hold_ms 毫秒重报一帧。
+            # 手机端见 android/.../CollectorService.maybeHoldConfirm。
+            if hold_ms:
+                body["hold"] = hold_ms
         self._reply(200, body)
 
     # --- 画面解析（仅 dingtalk.android_parse = true）---
 
-    def _ingest(self, text: str, *, filling: bool = False) -> tuple[list, str, bool]:
-        """一帧节点树 → 本帧**新增**的消息单元。返回 ``(单元列表, 说明, 是否要补全)``。
+    def _ingest(self, text: str, *, filling: bool = False
+                ) -> tuple[list, str, bool, int]:
+        """一帧节点树 → 本帧**新增**的消息单元。
+
+        返回 ``(单元列表, 说明, 是否要补全, 扣住毫秒数)``。扣住毫秒数 > 0
+        表示这一帧的新消息**没有投递**，请手机过这么多毫秒重报一帧 ——
+        见下面 garbled 分支的说明。
 
         解析失败**不能**回 4xx/5xx：手机端收到错误会重传同一帧，而这一帧的
         形状问题是重传解决不了的，只会把日志刷满。所以记一条 WARNING、
@@ -973,7 +996,7 @@ class _Handler(BaseHTTPRequestHandler):
             frame = parse_frame(text)
         except ParseError as exc:
             log.warning("手机画面解析失败（这一帧跳过）：%s", exc)
-            return [], "解析失败", False
+            return [], "解析失败", False, 0
 
         if not frame.is_chat:
             # 用户点开了 @ 面板、群信息、搜索页 —— 屏上是一排排人名和身份标签，
@@ -999,7 +1022,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "现在一条消息都不会转发。用 tools/android_capture.py "
                         "抓一帧看 page_reason", self.ctx.skip_streak, frame.page_reason)
                     self.ctx.last_skip_note = note
-            return [], note, False
+            return [], note, False, 0
 
         self.ctx.skip_streak = 0
         self.ctx.last_skip_note = ""
@@ -1018,9 +1041,43 @@ class _Handler(BaseHTTPRequestHandler):
         # 就能把真正的补全内容挑出来；而补全内容天然只会是那条长消息的另外几段，
         # 不会把历史灌进群。
         if filling:
-            return self._ingest_fill(frame)
+            return (*self._ingest_fill(frame), 0)
 
-        diff = differ.feed(frame.units)
+        # ── H5 卡片渲染中：扣住待稳 ─────────────────────────────────
+        # 钉钉机器人消息是 H5 卡片，节点坐标常年是坏的（frame.garbled），
+        # 而且**内容分批长出来**：第一帧可能只有标题，表格单元要再过几百毫秒
+        # 才渲染完。抓到半成品就转发，群里收到的就是「有标题没数据」的残废
+        # 消息（2026-10-17 拦截跟单日报真机事故）；等渲染完的那一帧锚点又
+        # 对不上（气泡指纹变了）被静默重建基线，缺的那部分永远补不回来。
+        #
+        # 所以 garbled 帧改走 peek（不推进锚点）：
+        #   · 新内容第一次见 → 扣住，回 hold 让手机 800ms 后重报；
+        #   · **同样的内容第二次见**（渲染稳定了）→ commit + 正常投递；
+        #   · 内容一直变、或基线/锚点一直建不起来 → HOLD_MAX 眼内放行兜底
+        #     （宁可发一条可能不完整的，也不能永远不发）。
+        # 原生消息（坐标正常）不经过这条路，延迟零增加。
+        garbled = frame.garbled
+        diff = differ.peek(frame.units) if garbled else differ.feed(frame.units)
+
+        if garbled and (diff.baseline or diff.anchor_lost):
+            # 基线/锚点先不建：现在记住的是半成品，渲染完就「锚点丢失」了。
+            key = "B" if diff.baseline else "L"
+            seen = self.ctx.hold_seen + 1 if self.ctx.hold_key == key else 1
+            self.ctx.hold_key, self.ctx.hold_seen = key, seen
+            self.ctx.hold_total += 1
+            if seen < 2 and self.ctx.hold_total < HOLD_MAX:
+                what = "基线先不建" if diff.baseline else "锚点先不重建"
+                log.info("安卓画面解析：屏上有 H5 卡片还在渲染，%s（第 %d 眼）",
+                         what, seen)
+                return [], f"H5 渲染中，{what}", False, HOLD_MS
+            differ.commit(frame.units)
+            self.ctx.hold_key, self.ctx.hold_seen, self.ctx.hold_total = "", 0, 0
+            if diff.baseline:
+                log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
+                         "此后只转发基线之后的新消息", len(frame.units))
+                return [], "已建立基线", False, 0
+            log.warning("安卓画面解析：锚点丢失，基线已重建到当前画面")
+            return [], "锚点丢失", False, 0
 
         if diff.baseline:
             log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
@@ -1031,22 +1088,46 @@ class _Handler(BaseHTTPRequestHandler):
             why = needs_scroll(frame)
             if why:
                 log.info("安卓画面解析：当前屏有消息没显示全（%s）", why)
-            return [], "已建立基线", False
+            return [], "已建立基线", False, 0
         if diff.anchor_lost:
             log.warning("安卓画面解析：上一帧的锚点在本帧里找不到（翻历史／换群／"
                         "一屏全换）—— 本帧不转发，基线已重建到当前画面")
-            return [], "锚点丢失", False
+            return [], "锚点丢失", False, 0
+
+        new = list(diff.units)
+        if garbled and new:
+            # 新消息在 H5 卡片里：同一批指纹见到第二眼（内容没再长）才投递。
+            key = "\n".join(u.fp for u in new)
+            seen = self.ctx.hold_seen + 1 if self.ctx.hold_key == key else 1
+            self.ctx.hold_key, self.ctx.hold_seen = key, seen
+            self.ctx.hold_total += 1
+            if seen < 2 and self.ctx.hold_total < HOLD_MAX:
+                log.info("安卓画面解析：新消息在 H5 卡片里，扣住等渲染稳定"
+                         "（第 %d 眼，%d 条）", seen, len(new))
+                return [], "H5 渲染中，扣住待稳", False, HOLD_MS
+            differ.commit(frame.units)
+            self.ctx.hold_key, self.ctx.hold_seen, self.ctx.hold_total = "", 0, 0
+            if seen >= 2:
+                log.info("安卓画面解析：H5 卡片内容已稳定（连续两帧一致），"
+                         "投递 %d 条", len(new))
+            else:
+                log.warning("安卓画面解析：H5 渲染等待超限，按现状投递 %d 条"
+                            "（可能不完整）", len(new))
+        else:
+            # 原生帧照常推进；garbled 但没有新内容（旧卡片停在屏上）也推进 ——
+            # 锚点留在半成品上没有意义。
+            differ.commit(frame.units)
+            self.ctx.hold_key, self.ctx.hold_seen, self.ctx.hold_total = "", 0, 0
 
         # 一屏装不下的长消息：树里只有屏幕上那截，滚出去的部分根本不存在。
         # 现在照常转发（用户要的是「几分钟内到」），同时请手机往上翻一屏补全 ——
         # 补全那一帧会作为**新的一帧**再进来，届时产生的新单元照常走投递。
         why = needs_scroll(frame)
-        new = list(diff.units)
         if why and new:
             log.warning("安卓画面解析：%s —— 这一屏新转的消息可能不完整，"
                         "已请手机往上翻一屏补全", why)
-            return new, "消息可能不完整", True
-        return new, "", False
+            return new, "消息可能不完整", True, 0
+        return new, "", False, 0
 
     def _ingest_fill(self, frame) -> tuple[list, str, bool]:
         """上翻补全帧：把「锚点上方、此前没见过」的内容挑出来。

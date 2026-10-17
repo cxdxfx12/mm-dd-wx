@@ -912,6 +912,50 @@ class TestClipped(unittest.TestCase):
             self.assertEqual(clipped_units(f), [], f"{path.name} 误报截断")
 
 
+class TestGarbled(unittest.TestCase):
+    """坏坐标文本节点 = 钉钉 H5 卡片的标志，网关要靠它「扣住待稳」。
+
+    真机实测（2026-10-17 拦截跟单日报）：H5 卡片里**所有**文字节点 bounds
+    都是 ``[x,265][x,负数]``，right 会小于 left。但屏幕底边被裁掉的原生行
+    也会贡献 1~3 个（121843 帧=3 个）—— 所以阈值是 ≥4（GARBLED_MIN）。
+    """
+
+    def _xml_with(self, bounds: str, n: int = 1) -> str:
+        """在一条正常消息的气泡里塞 n 个指定 bounds 的 TextView。"""
+        raw = dt_frame(dt_item("今天 16:31", dt_message(
+            "履约跟单专员", ["正文一句"], 300)))
+        badge = "".join(
+            f'<node text="坏节点{i}" class="android.widget.TextView" '
+            f'package="{PKG}" bounds="{bounds}"></node>'
+            for i in range(n))
+        return raw.replace(
+            '</node></node></node></hierarchy>',
+            badge + '</node></node></node></hierarchy>', 1)
+
+    def test_webview_card_bounds_are_flagged(self):
+        f = parse_frame(self._xml_with('[0,265][100,-50]', n=5))
+        self.assertGreaterEqual(f.garbled_count, 4)
+        self.assertTrue(f.garbled)
+
+    def test_crossed_right_left_is_flagged(self):
+        f = parse_frame(self._xml_with('[1416,265][964,-1418]', n=5))
+        self.assertTrue(f.garbled)
+
+    def test_few_garbled_nodes_are_not_h5(self):
+        """屏幕底边裁掉的原生行（1~3 个坏文本节点）不算 H5。
+
+        夹具自己的时间条也贡献 1 个坏文本节点，所以塞 2 个凑成 3 个 ——
+        正好是实测原生帧的上限。
+        """
+        f = parse_frame(self._xml_with('[238,2517][794,2480]', n=2))
+        self.assertLess(f.garbled_count, 4)
+        self.assertFalse(f.garbled)
+
+    def test_normal_frame_is_clean(self):
+        f = parse_frame(self._xml_with('[0,265][100,315]'))
+        self.assertFalse(f.garbled)
+
+
 # ------------------------------------------------------------------ 单元 → 消息
 
 class TestUnitsToMessages(unittest.TestCase):

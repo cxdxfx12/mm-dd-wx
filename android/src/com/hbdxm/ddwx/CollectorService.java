@@ -346,6 +346,7 @@ public class CollectorService extends AccessibilityService {
             Log.i(TAG, "上报成功 #" + posts + " 文本 " + tree.texts.size()
                     + " 字节 " + xml.length());
             maybeFillTruncated(r.body, token);
+            maybeHoldConfirm(r.body, token);
         } else {
             failures++;
             lastResult = "上报失败：" + r.detail;
@@ -394,6 +395,52 @@ public class CollectorService extends AccessibilityService {
         } finally {
             filling.set(false);
         }
+    }
+
+    // -------------------------------------------------------------- H5 渲染等待
+
+    /**
+     * 电脑侧说「这一帧里有 H5 卡片还在渲染（hold: 毫秒）」，等一会儿再报一帧。
+     *
+     * <p>钉钉机器人消息是网页卡片，内容分批渲染：第一帧往往只有标题，表格
+     * 单元格要再过几百毫秒才长全。电脑侧扣住新内容不放，等这里重报的帧里
+     * 内容稳定了才投递 —— 手机只做「听话」，怎么判稳是电脑的事。
+     *
+     * <p>电脑侧见到同样的内容第二次就会放行（或超限兜底），所以这里每收到
+     * 一次 hold 只重报一次，不会死循环。
+     */
+    private void maybeHoldConfirm(String resp, String token) {
+        if (!resp.contains("\"hold\"")) {
+            return;
+        }
+        final long ms = parseHoldMs(resp);
+        final String tok = token;
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Thread.sleep(ms);
+                } catch (InterruptedException ignored) {
+                }
+                postCurrentFrame(tok, "hold-confirm");
+            }
+        });
+        t.setName("ddwx-hold");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** 从响应里抠 hold 的毫秒数，抠不到或离谱就用默认 800。 */
+    private static long parseHoldMs(String resp) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\"hold\"\\s*:\\s*(\\d+)").matcher(resp);
+        if (m.find()) {
+            long v = Long.parseLong(m.group(1));
+            if (v > 0 && v <= 5000) {
+                return v;
+            }
+        }
+        return 800L;
     }
 
     private void doFillTruncated(String token) {

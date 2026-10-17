@@ -251,6 +251,13 @@ class Frame:
     page: str = "chat"                                   # chat | other | unknown
     page_reason: str = ""
     view: tuple[int, int, int, int] = (0, 0, 0, 0)       # 消息列表的可视范围
+    # 树里「坏坐标」文本节点（right<left 或 bottom<top）的个数。钉钉机器人
+    # 消息是 H5 卡片，卡片里**所有**文字节点的坐标都是坏的（top 恒等于列表
+    # 顶、bottom 是负数）—— 而且卡片渲染期间内容会一批一批长出来。达到
+    # ``GARBLED_MIN`` 才算 H5 帧（frame.garbled）：屏幕底边被裁掉的原生行
+    # 也会产生 1~3 个坏坐标文本节点（实测 121843 帧=3 个），不能误伤。
+    garbled_count: int = 0
+    garbled: bool = False
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -861,6 +868,8 @@ def parse_frame(text: str) -> Frame:
 
     all_nodes = list(walk(root))
     frame.texts = sum(1 for n in all_nodes if n.label)
+    frame.garbled_count = _garbled_text_nodes(all_nodes)
+    frame.garbled = frame.garbled_count >= GARBLED_MIN
     pkgs = {n.pkg for n in all_nodes if n.pkg}
     if TARGET_PKG not in pkgs:
         frame.warnings.append(
@@ -907,6 +916,36 @@ def parse_frame(text: str) -> Frame:
 
 
 # ------------------------------------------------------------------ 截断检测
+
+# 坏坐标**文本**节点达到几个才认定屏上有 H5 卡片。真机数据
+# （2026-10-17 实测 8 个存档帧 + 1 个 H5 帧）：
+#   · 纯原生帧 0~3 个（屏幕底边被裁掉的行也会贡献 1~3 个，121843 帧=3）；
+#   · 带 H5 卡片的帧 5、6、16、74 个（卡片多大就有多少）。
+# 阈值取 4：宁可漏掉「只有一个标题的小卡片」也别把原生帧拖进扣住流程。
+GARBLED_MIN = 4
+
+
+def _garbled_text_nodes(nodes: list[Node]) -> int:
+    """坏坐标**文本**节点数 —— 钉钉 H5 卡片（机器人消息）的标志。
+
+    实测（2026-10-17 拦截跟单日报一帧）：H5 卡片里所有文字节点的 bounds
+    都是 ``[x, 265][x, 负数]`` —— top 恒等于列表可视区顶、bottom 是负数，
+    right 甚至会小于 left。正常的原生消息没有这种形状（屏幕底边被裁掉的行
+    只有 1~3 个，见 ``GARBLED_MIN`` 的注释）。
+
+    为什么关心它：H5 卡片是**分批渲染**的 —— 第一帧往往只有标题和栏头，
+    表格单元格在之后几百毫秒里才一批批长出来。抓到半成品就转发，微信群那边
+    收到的就是「有标题没数据」的残废消息；而等渲染完的那一帧锚点又对不上
+    （气泡指纹变了）被静默重建基线，内容永远补不回来。网关看到 garbled 帧
+    会**扣住新消息**，等手机重报、内容稳定后再投递（见 android_gateway）。
+    """
+    n = 0
+    for node in nodes:
+        l, t, r, b = node.bounds
+        if node.text and (r < l or b < t):
+            n += 1
+    return n
+
 
 def clipped_units(frame: Frame, *, tol: int = 24) -> list[Unit]:
     """哪几条消息在屏幕上**被切掉了**（只有一部分进得来）。
@@ -982,27 +1021,43 @@ class FrameDiffer:
 
     # --- 对外 ---
 
-    def feed(self, units: list[Unit]) -> Diff:
-        self.frames += 1
+    def _decide(self, units: list[Unit]) -> Diff:
+        """纯判定：**不动任何状态**。feed/peek 共用这一份逻辑。"""
         if not units:
             # 读空的一帧（切到别的 App、锁屏、节点树还没渲染完）。**什么都不做**：
             # 既不建基线也不动锚点。若在这里「记住空帧」，锚点会被清成空列表，
             # 之后每一帧都判成锚点丢失 —— 表现为程序在跑但一条都不转发。
             return Diff()
         if not self.baseline_built:
-            self._remember(units)
             return Diff(baseline=True)
-
         idx = self._locate(units)
         if idx < 0:
-            # 锚点没了（换群、清缓存、一屏全换）。这一帧不发，把锚点重建到
-            # 当前帧 —— 不重建的话锚点会永久失效，之后每一帧都发不出去。
-            self._remember(units)
+            # 锚点没了（换群、清缓存、一屏全换）。这一帧不发。
             return Diff(anchor_lost=True)
+        return Diff(units=units[idx + 1:])
 
-        new = units[idx + 1:]
-        self._remember(units)
-        return Diff(units=new)
+    def feed(self, units: list[Unit]) -> Diff:
+        """判定并记住（锚点推进到本帧）。常规帧走这条路。"""
+        self.frames += 1
+        diff = self._decide(units)
+        if units:
+            self._remember(units)
+        return diff
+
+    def peek(self, units: list[Unit]) -> Diff:
+        """只判定、**不推进锚点** —— 给「扣住待稳」的帧用。
+
+        H5 卡片渲染期间同一气泡的内容会变（指纹跟着变），如果照常 feed，
+        锚点会记成半成品；渲染完的那一帧锚点对不上就被当成「换屏」静默
+        重建基线，长出来的那部分永远发不出去。peek 让网关先看判定结果，
+        等内容稳定（连续两帧一致）再 ``commit``。
+        """
+        return self._decide(units)
+
+    def commit(self, units: list[Unit]) -> None:
+        """把锚点推进到本帧（配合 peek 用，等价于 feed 的记忆动作）。"""
+        if units:
+            self._remember(units)
 
     def reset(self) -> None:
         """换群/重启采集时清空基线（下一帧重新建基线，不会补发历史）。"""

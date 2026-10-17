@@ -28,7 +28,7 @@ from bridge.config import Config, DingTalkConfig, RouteConfig, StorageConfig, We
 from bridge.fingerprint import fp_of, norm_sender, unit_fp
 from bridge.service import BridgeService
 from bridge.sources.android_gateway import (
-    HEARTBEAT_GRACE, MAX_BATCH, MAX_SCREEN_BODY, OFFLINE_REMIND_EVERY,
+    HEARTBEAT_GRACE, HOLD_MAX, MAX_BATCH, MAX_SCREEN_BODY, OFFLINE_REMIND_EVERY,
     AndroidGatewaySource, _Ctx, _find_apk, _online_now, _watchdog_step,
     build_messages, lan_ips, set_apk_dirs,
 )
@@ -944,6 +944,72 @@ class TestScreenParse(GatewayCase):
                                            self.row("新消息B", 700)))
         self.assertEqual(body["messages"], 1)
         self.assertEqual(self.received[-1].content, "新消息B")
+
+    # ---- H5 卡片「扣住待稳」 --------------------------------------------
+    #
+    # 真机事故（2026-10-17 拦截跟单日报）：机器人消息是 H5 卡片，内容分批
+    # 渲染。抓到半成品就转发，群里收到的就是「有标题没数据」的残废消息；
+    # 渲染完的那一帧锚点又对不上被静默重建基线，缺的内容永远补不回来。
+
+    def garbled(self, xml: str) -> str:
+        """往帧里塞一批坏坐标文本节点 —— 钉钉 H5 卡片的标志形状。
+
+        实测真机帧里 H5 卡片的文字节点全是 ``bounds="[x,265][x,负数]"``，
+        right 甚至小于 left。这里复制 5 个 ``[0,265][100,-50]``（阈值 4）。
+        """
+        badge = "".join(
+            f'<node text="h5占位{i}" class="android.widget.TextView" '
+            f'package="{self.PKG}" bounds="[0,265][100,-50]"></node>'
+            for i in range(5))
+        return xml.replace('</node></hierarchy>', badge + '</node></hierarchy>')
+
+    def test_garbled_frame_holds_then_delivers_when_stable(self):
+        """H5 新消息：第一次见扣住，同样内容第二次见才投递。"""
+        xml = self.garbled(self.screen(self.row("旧消息A", 400),
+                                       self.row("H5报表正文", 700)))
+        b1 = self.post_frame(xml)
+        self.assertEqual(b1["messages"], 0)          # 基线被扣住
+        self.assertIn("hold", b1)
+        b2 = self.post_frame(xml)
+        self.assertEqual(b2["messages"], 0)          # 基线建立（第 2 眼）
+        self.assertNotIn("hold", b2)
+        b3 = self.post_frame(xml)
+        self.assertEqual(b3["messages"], 0)          # 没有新内容
+        self.assertNotIn("hold", b3)
+
+        xml2 = self.garbled(self.screen(self.row("旧消息A", 400),
+                                        self.row("H5报表正文", 700),
+                                        self.row("拦截跟单日报 表格数据", 980)))
+        b4 = self.post_frame(xml2)
+        self.assertEqual(b4["messages"], 0)          # 新内容第 1 眼：扣住
+        self.assertEqual(b4.get("hold"), 800)
+        b5 = self.post_frame(xml2)
+        self.assertEqual(b5["messages"], 1)          # 第 2 眼：内容稳定，投递
+        self.assertEqual(self.received[-1].content, "拦截跟单日报 表格数据")
+
+    def test_h5_content_growing_is_delivered_by_total_cap(self):
+        """内容一直长（key 一直变）也不能永远扣 —— 总眼数到顶就放行。"""
+        base = self.screen(self.row("旧消息A", 400))
+        self.post_frame(self.garbled(base))          # 扣
+        self.post_frame(self.garbled(base))          # 基线
+        prev = base
+        delivered = 0
+        for i in range(HOLD_MAX + 2):
+            prev = self.screen(self.row("旧消息A", 400),
+                               self.row(f"长到第{i}段", 700))
+            body = self.post_frame(self.garbled(prev))
+            delivered += body.get("messages", 0)
+        self.assertEqual(delivered, 1)               # 到顶放行，只发一次
+        self.assertIn("长到第", self.received[-1].content)
+
+    def test_native_frame_has_zero_extra_latency(self):
+        """原生消息（坐标正常）不扣：一次上报直接投递。"""
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        body = self.post_frame(self.screen(self.row("旧消息A", 400),
+                                           self.row("普通消息B", 700)))
+        self.assertEqual(body["messages"], 1)
+        self.assertNotIn("hold", body)
+        self.assertEqual(self.received[-1].content, "普通消息B")
 
 
 # --------------------------------------------------------------- 手机装 App
