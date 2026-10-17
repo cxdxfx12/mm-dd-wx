@@ -8,6 +8,10 @@
                                    不加这个 flag 很可能什么都读不到
     · flagRetrieveInteractiveWindows 允许拿多窗口内容
 
+  canPerformGestures 是**长消息补全**的前提：一条超过一屏的消息，滚出屏幕的部分
+  在节点树里根本不存在，只能靠手指真的划一下再读。没有这个权限
+  dispatchGesture() 会直接失败（Scroller 会把它记进日志，不会静默失效）。
+
   packageNames 限定只监听钉钉：既省电，也确保服务不会去碰别的应用。
 -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
@@ -15,6 +19,7 @@
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagDefault|flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
     android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
     android:description="@string/service_desc"
     android:notificationTimeout="200"
     android:packageNames="com.alibaba.android.rimet" />

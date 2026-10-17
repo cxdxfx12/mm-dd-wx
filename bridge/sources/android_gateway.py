@@ -697,8 +697,12 @@ class _Handler(BaseHTTPRequestHandler):
             # 内存计算（几毫秒），占锁时间可控。
             pending: list = []
             note = ""
+            scroll = False
             if self.ctx.parse and self.ctx.on_message is not None:
-                pending, note = self._ingest(text)
+                # 手机端上翻补全后重报的那一帧会带 reason=scroll-fill。
+                # 它必须走另一套判定 —— 见 _ingest 里的说明。
+                pending, note, scroll = self._ingest(
+                    text, filling=(screen["reason"] == "scroll-fill"))
 
         # 记「手机还活着」。必须在锁外调：touch 走的是另一把锁，
         # 但把它放在这里能让 hold 锁的时间只包含解析。
@@ -725,22 +729,29 @@ class _Handler(BaseHTTPRequestHandler):
             body["messages"] = emitted
             if note:
                 body["note"] = note
+            # 这是给手机端的**指令**：屏上有消息被切掉了，请往上翻一屏再报。
+            # 手机端见 android/.../CollectorService.maybeFillTruncated。
+            if scroll:
+                body["scroll"] = True
         self._reply(200, body)
 
     # --- 画面解析（仅 dingtalk.android_parse = true）---
 
-    def _ingest(self, text: str) -> tuple[list, str]:
-        """一帧节点树 → 本帧**新增**的消息单元。返回 ``(单元列表, 说明)``。
+    def _ingest(self, text: str, *, filling: bool = False) -> tuple[list, str, bool]:
+        """一帧节点树 → 本帧**新增**的消息单元。返回 ``(单元列表, 说明, 是否要补全)``。
 
         解析失败**不能**回 4xx/5xx：手机端收到错误会重传同一帧，而这一帧的
         形状问题是重传解决不了的，只会把日志刷满。所以记一条 WARNING、
         照常回 200，让采集继续。
+
+        第三个返回值是给手机端的指令：True = 这一屏有消息被屏幕边界切掉，
+        请往上翻一屏再报一次（见 ``android/.../Scroller.java``）。
         """
         try:
             frame = parse_frame(text)
         except ParseError as exc:
             log.warning("手机画面解析失败（这一帧跳过）：%s", exc)
-            return [], "解析失败"
+            return [], "解析失败", False
 
         if not frame.is_chat:
             # 用户点开了 @ 面板、群信息、搜索页 —— 屏上是一排排人名和身份标签，
@@ -766,38 +777,93 @@ class _Handler(BaseHTTPRequestHandler):
                         "现在一条消息都不会转发。用 tools/android_capture.py "
                         "抓一帧看 page_reason", self.ctx.skip_streak, frame.page_reason)
                     self.ctx.last_skip_note = note
-            return [], note
+            return [], note, False
 
         self.ctx.skip_streak = 0
         self.ctx.last_skip_note = ""
         differ = self.ctx.differ
         if differ is None:
             differ = self.ctx.differ = FrameDiffer()
+
+        # ── 上翻补全帧 ──────────────────────────────────────────────
+        # 这一帧是手机按我们的要求往上翻一屏后报回来的，它与常规帧**方向相反**：
+        # 常规帧的新消息在锚点**下方**（列表底部），补全帧的新内容在锚点**上方**
+        # （被切掉的那半截长消息）。FrameDiffer 只会取 anchor 之后的部分，
+        # 所以补全帧直接喂给它等于白翻 —— 实测「新增 0 条」。
+        #
+        # 这里绕开锚点，改用一条更保守的规则：**只转发当前屏里从未见过的那些
+        # 单元**（靠已入库的指纹判断）。滚动时旧消息会重新出现，靠「没见过」
+        # 就能把真正的补全内容挑出来；而补全内容天然只会是那条长消息的另外几段，
+        # 不会把历史灌进群。
+        if filling:
+            return self._ingest_fill(frame)
+
         diff = differ.feed(frame.units)
 
         if diff.baseline:
             log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
                      "此后只转发基线之后的新消息", len(frame.units))
-            # 基线同样要报截断：新装/重启那一刻，屏上可能正好卡着一条长消息，
-            # 不补的话要等下一次滚动才看得见。
+            # 基线帧也要报截断：新装/重启那一刻屏上可能正好卡着一条长消息，
+            # 不补的话要等到下次滚动才看得见。但**不让手机滚动** —— 建基线
+            # 时滚动会把刚记下的基线弄脏，得不偿失，只记日志。
             why = needs_scroll(frame)
             if why:
                 log.info("安卓画面解析：当前屏有消息没显示全（%s）", why)
-            return [], "已建立基线"
+            return [], "已建立基线", False
         if diff.anchor_lost:
             log.warning("安卓画面解析：上一帧的锚点在本帧里找不到（翻历史／换群／"
                         "一屏全换）—— 本帧不转发，基线已重建到当前画面")
-            return [], "锚点丢失"
+            return [], "锚点丢失", False
 
         # 一屏装不下的长消息：树里只有屏幕上那截，滚出去的部分根本不存在。
-        # 现在照常转发（用户要的是「几分钟内到」），但同时记一条 WARNING ——
-        # 微信那边收到的可能是半截话，得让人知道。
+        # 现在照常转发（用户要的是「几分钟内到」），同时请手机往上翻一屏补全 ——
+        # 补全那一帧会作为**新的一帧**再进来，届时产生的新单元照常走投递。
         why = needs_scroll(frame)
         new = list(diff.units)
         if why and new:
-            log.warning("安卓画面解析：%s —— 这一屏新转的消息可能不完整", why)
-            return new, "消息可能不完整"
-        return new, ""
+            log.warning("安卓画面解析：%s —— 这一屏新转的消息可能不完整，"
+                        "已请手机往上翻一屏补全", why)
+            return new, "消息可能不完整", True
+        return new, "", False
+
+    def _ingest_fill(self, frame) -> tuple[list, str, bool]:
+        """上翻补全帧：把「锚点上方、此前没见过」的内容挑出来。
+
+        为什么不能用 ``FrameDiffer``：它只会取锚点**之后**（下方）的部分，
+        而补全帧要的恰恰是锚点**之前**（上方）—— 直接喂进去实测「新增 0 条」，
+        等于白翻一屏。
+
+        安全性靠两层：
+          1. **必须有锚点**。锚点（上一帧的最后若干条）在本帧里找得到，说明
+             这一帧确实只是「同一段对话往上滚动了一下」，不是换了群/翻了历史；
+          2. **只取锚点上方的**。锚点下方那些本来就会被常规帧处理，重复捡会重发。
+
+        仍然可能有误判：手机往上翻得多、翻出了从没转过的历史消息，它们会被
+        当成补全内容发出去。所以手机端只翻一屏（62% 高度），且同一屏只补一次 ——
+        这个量级下最多露出「长消息的另外几段」，不会翻出历史。
+
+        补全帧**不动基线**：基线要留给「手机翻回原位」之后的那一帧。
+        """
+        if not frame.units:
+            return [], "补全帧空", False
+        differ = self.ctx.differ
+        if differ is None or not differ.baseline_built:
+            return [], "补全帧但没有基线，跳过", False
+
+        at = differ._locate(frame.units)
+        if at < 0:
+            # 锚点找不到 = 这一屏跟上一帧对不上（多半是翻过头了）。
+            # 不转发、也不动基线，等手机翻回来。
+            return [], "补全帧对不上锚点，跳过", False
+
+        above = [u for u in frame.units[:at]]
+        # 去掉锚点里已有的（保守起见再挡一次重复）
+        known = set(differ._anchor)
+        above = [u for u in above if u.fp not in known]
+        if not above:
+            return [], "补全帧没有新内容", False
+        log.info("安卓画面解析：上翻补全到 %d 条此前没看到的内容", len(above))
+        return above, "补全帧", False
 
     def _emit(self, units: list) -> int:
         """把消息单元交给下游，返回成功条数。"""

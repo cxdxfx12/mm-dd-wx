@@ -345,11 +345,131 @@ public class CollectorService extends AccessibilityService {
             lastResult = "已上报：" + r.detail;
             Log.i(TAG, "上报成功 #" + posts + " 文本 " + tree.texts.size()
                     + " 字节 " + xml.length());
+            maybeFillTruncated(r.body, token);
         } else {
             failures++;
             lastResult = "上报失败：" + r.detail;
             Log.w(TAG, "上报失败：" + r.detail);
         }
+    }
+
+    // -------------------------------------------------------------- 长消息补全
+
+    /** 同一屏最多补一次。重复补会把屏幕来回拉，还可能把基线搞乱。 */
+    private String filledFor = "";
+
+    /**
+     * 正在补全中。补全会自己触发一串无障碍事件（滚动、重绘），
+     * 不挡住的话会递归回到 {@link #captureAndSend}，在补全过程中再补一次。
+     */
+    private final AtomicBoolean filling = new AtomicBoolean(false);
+
+    /**
+     * 电脑侧说「这一屏有消息没显示全」时，往上翻一屏、把那一屏也报上去、再翻回来。
+     *
+     * <p>为什么由电脑侧发起而不是手机自己判断：截断的判据（消息越出不越出列表
+     * 可视区）在 Python 那边有现成的解析和回归测试，手机端再写一份必然会漂移。
+     * 手机只做「听话」这一件事。
+     *
+     * <p>三个必须守住的点：
+     * <ol>
+     *   <li><b>翻完一定要回来</b> —— 不回来基线就错位，表现为锚点丢失、整屏停转；</li>
+     *   <li><b>回来后重置 sentMd5</b> —— 否则回到原位时 md5 跟 sentMd5 相同，
+     *       新消息不会被发现（实际不会同，但留一手更稳）；</li>
+     *   <li><b>同一屏不重复补</b> —— 用触发时的 md5 记账。</li>
+     * </ol>
+     */
+    private void maybeFillTruncated(String resp, String token) {
+        if (!resp.contains("\"scroll\"")) {
+            return;
+        }
+        if (lastMd5.equals(filledFor)) {
+            return;                       // 这一屏已经补过
+        }
+        if (!filling.compareAndSet(false, true)) {
+            return;                       // 上一次补全还没收尾
+        }
+        try {
+            doFillTruncated(token);
+        } finally {
+            filling.set(false);
+        }
+    }
+
+    private void doFillTruncated(String token) {
+        filledFor = lastMd5;
+        AccessibilityNodeInfo root = safeRoot();
+        if (root == null) {
+            return;
+        }
+        AccessibilityNodeInfo list = findScrollable(root);
+        if (list == null) {
+            lastResult += " ｜ 想补全长消息但没找到可滚动区域";
+            return;
+        }
+        if (!Scroller.canSwipe(this)) {
+            lastResult += " ｜ 系统不支持注入手势，长消息补不了";
+            return;
+        }
+
+        // ① 往下滑 = 内容往回走（露出更早的消息）。聊天页默认停在最新处，
+        //    被切掉的正是最新那条消息的前半截，它在上面。
+        boolean ok = Scroller.swipe(this, list, false);
+        if (!ok) {
+            lastResult += " ｜ 滑动被系统拒绝（没给 canPerformGestures 权限）";
+            return;
+        }
+        Scroller.settle();
+        postCurrentFrame(token, "scroll-fill");
+
+        // ② 回到底：再反方向滑一次。这一步不能省 —— 不回来基线就错位，
+        //    下一条新消息到来时会判「锚点丢失」，整屏停转。
+        AccessibilityNodeInfo root2 = safeRoot();
+        AccessibilityNodeInfo list2 = root2 == null ? null : findScrollable(root2);
+        if (list2 != null) {
+            Scroller.swipe(this, list2, true);
+            Scroller.settle();
+        }
+        // 回到原位后画面必然还是老样子，把指纹清掉让下一帧照常上报。
+        sentMd5 = "";
+        lastResult += " ｜ 已上翻一屏补全长消息并复位";
+    }
+
+    /** 把「当前这一屏」原样发上去（不判重、不动 sentMd5 —— 由调用方决定）。 */
+    private void postCurrentFrame(String token, String reason) {
+        AccessibilityNodeInfo root = safeRoot();
+        if (root == null) {
+            return;
+        }
+        UiTree tree = UiTree.capture(root);
+        if (tree.texts.isEmpty()) {
+            return;
+        }
+        String xml = tree.xml.toString();
+        Uploader.postScreen(Prefs.host(this), Prefs.port(this), token,
+                xml, md5(xml), tree.texts.size(), reason);
+    }
+
+    /** 找到消息列表那一层的可滚动节点（滚动要落在它身上才有效）。 */
+    private AccessibilityNodeInfo findScrollable(AccessibilityNodeInfo node) {
+        if (node == null) {
+            return null;
+        }
+        if (node.isScrollable()) {
+            return node;
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo c = node.getChild(i);
+            if (c == null) {
+                continue;
+            }
+            AccessibilityNodeInfo hit = findScrollable(c);
+            if (hit != null) {
+                return hit;
+            }
+            c.recycle();          // 没命中的子节点必须还回去，否则遍历大界面会泄漏
+        }
+        return null;
     }
 
     private AccessibilityNodeInfo safeRoot() {

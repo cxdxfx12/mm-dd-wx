@@ -50,11 +50,22 @@ final class Uploader {
         final boolean ok;
         final int code;
         final String detail;
+        /**
+         * 服务端原样返回的 JSON 正文。上位机要**回话**给手机（比如「这一屏有消息
+         * 没显示全，请往上翻一屏」），只靠 {@link #detail} 里截断过的可读串解析
+         * 太脆 —— 日志文案一改就断。所以原始 body 单独留着。
+         */
+        final String body;
 
         Result(boolean ok, int code, String detail) {
+            this(ok, code, detail, "");
+        }
+
+        Result(boolean ok, int code, String detail, String body) {
             this.ok = ok;
             this.code = code;
             this.detail = detail;
+            this.body = body == null ? "" : body;
         }
     }
 
@@ -89,9 +100,9 @@ final class Uploader {
             String resp = readBody(code >= 400 ? conn.getErrorStream() : conn.getInputStream());
             if (code >= 200 && code < 300) {
                 return new Result(true, code, "HTTP " + code + " " + trim(resp, 120)
-                        + "（" + body.length + " 字节）");
+                        + "（" + body.length + " 字节）", resp);
             }
-            return new Result(false, code, "HTTP " + code + " " + trim(resp, MAX_BODY));
+            return new Result(false, code, "HTTP " + code + " " + trim(resp, MAX_BODY), resp);
         } catch (Exception e) {
             return new Result(false, 0, describe(e));
         } finally {

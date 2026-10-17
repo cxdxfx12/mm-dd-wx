@@ -851,6 +851,97 @@ class TestScreenParse(GatewayCase):
         cfg = make_cfg(free_port(), TOKEN)
         self.assertFalse(cfg.dingtalk.android_parse)
 
+    # --- 长消息补全指令 ---
+    #
+    # getRootInActiveWindow() 只给可见节点：一条超过一屏的消息，滚出去的部分
+    # 在树里根本不存在。网关认出「被切掉了」之后要在响应里发 scroll 指令，
+    # 手机端才知道该往上翻一屏（见 android/.../CollectorService）。
+
+    def long_row(self, sender: str, top: int, bottom: int,
+                 body: str = "很长的正文……") -> str:
+        """一条很高的消息 —— 底边越过列表下沿 2100。"""
+        return (f'<node class="android.widget.LinearLayout" package="{self.PKG}" '
+                f'bounds="[60,{top}][1020,{bottom}]">'
+                f'<node text="{sender}" class="android.widget.TextView" '
+                f'package="{self.PKG}" bounds="[80,{top}][420,{top + 60}]"></node>'
+                f'<node text="{body}" class="android.widget.TextView" '
+                f'package="{self.PKG}" bounds="[80,{top + 70}][1000,{bottom - 10}]">'
+                f'</node></node>')
+
+    def test_long_message_asks_phone_to_scroll(self):
+        self.post_frame(self.screen(self.row("第一条", 400, "签收跟单专员")))
+        body = self.post_frame(self.screen(
+            self.row("第一条", 400, "签收跟单专员"),
+            self.long_row("履约跟单专员", 700, 3200)))     # 底边 3200 > 2100
+        self.assertTrue(body.get("scroll"), "长消息没让手机补全")
+
+    def test_normal_message_does_not_ask_to_scroll(self):
+        """短消息绝不能让手机滑动 —— 群聊一直在来消息，滑起来就收不住了。"""
+        self.post_frame(self.screen(self.row("第一条", 400, "签收跟单专员")))
+        body = self.post_frame(self.screen(
+            self.row("第一条", 400, "签收跟单专员"),
+            self.row("第二条", 700, "签收跟单专员")))
+        self.assertNotIn("scroll", body)
+
+    def test_baseline_frame_never_asks_to_scroll(self):
+        """建基线时不许滚：刚记下的基线会被自己滚脏。"""
+        body = self.post_frame(self.screen(
+            self.long_row("履约跟单专员", 400, 3200)))
+        self.assertEqual(body["note"], "已建立基线")
+        self.assertNotIn("scroll", body)
+
+    # --- 上翻补全帧 ---
+    #
+    # 补全帧和常规帧**方向相反**：常规帧的新消息在锚点下方，补全帧要的是
+    # 锚点上方那半截长消息。直接喂给 FrameDiffer 会「新增 0 条」，白翻一屏。
+
+    def post_fill(self, xml: str):
+        """模拟手机端上翻一屏后重报（带 reason=scroll-fill）。"""
+        req = urllib.request.Request(self.url("/screen"), data=xml.encode("utf-8"),
+                                     method="POST")
+        req.add_header("X-Bridge-Token", self.token)
+        req.add_header("X-Ddwx-Reason", "scroll-fill")
+        req.add_header("Content-Type", "text/plain; charset=utf-8")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def test_fill_frame_delivers_the_upper_part(self):
+        """上翻后锚点上方的内容要真的转发出去，且已发过的不重复发。"""
+        self.post_frame(self.screen(self.row("旧消息A", 400, "签收跟单专员")))
+        self.post_frame(self.screen(self.row("旧消息A", 400, "签收跟单专员"),
+                                    self.long_row("履约跟单专员", 700, 3200)))
+        self.assertEqual([m.content for m in self.received], ["很长的正文……"])
+
+        body = self.post_fill(self.screen(
+            self.long_row("前半截", 300, 1200, body="这是被切掉的前半截"),
+            self.long_row("履约跟单专员", 700, 3200)))
+        self.assertEqual(body["note"], "补全帧")
+        self.assertEqual(body["messages"], 1)
+        self.assertEqual(self.received[-1].content, "这是被切掉的前半截")
+        # 长消息本身不能因为补全再发第二遍
+        self.assertEqual(
+            sum(1 for m in self.received if m.content == "很长的正文……"), 1)
+
+    def test_fill_frame_with_unknown_anchor_is_dropped(self):
+        """翻过头（对不上锚点）时一条都不许发 —— 那是历史消息。"""
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        body = self.post_fill(self.screen(
+            self.row("很久以前的历史1", 300), self.row("很久以前的历史2", 600)))
+        self.assertEqual(body["messages"], 0)
+        self.assertIn("对不上锚点", body["note"])
+        self.assertEqual(self.received, [])
+
+    def test_fill_frame_does_not_move_the_baseline(self):
+        """补全帧不能改基线：基线要留给「翻回原位」之后的那一帧。"""
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        self.post_fill(self.screen(self.row("补全内容", 300),
+                                   self.row("旧消息A", 700)))
+        # 翻回原位后，照常的新消息仍要能发出来
+        body = self.post_frame(self.screen(self.row("旧消息A", 400),
+                                           self.row("新消息B", 700)))
+        self.assertEqual(body["messages"], 1)
+        self.assertEqual(self.received[-1].content, "新消息B")
+
 
 # --------------------------------------------------------------- 心跳与失联
 #
