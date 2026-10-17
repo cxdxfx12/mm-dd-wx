@@ -92,6 +92,23 @@ TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                 "%m-%d %H:%M", "%H:%M")
 
 
+def _online_now(ctx: "_Ctx") -> bool:
+    """此刻手机算不算在线 —— 按「最后一次心跳距今多久」算，不是「曾经连上过」。
+
+    这里踩过一次：早先写成 ``bool(ctx.last_seen)``，于是手机锁屏八分钟、一次
+    心跳都没有的时候，``/ping`` 还在回 ``online: true``，把排查的人（连我自己）
+    引到「网络没问题，是不是电脑侧卡了」的错误方向上。字段名既然叫 online，
+    就必须回答「现在」，而不是「历史上」。
+    """
+    last = ctx.last_seen
+    if last <= 0.0:
+        return False
+    span = ctx.offline_after
+    if span <= 0.0:          # 关掉失联检测时，只能退回「收到过就算在线」
+        return True
+    return (time.monotonic() - last) <= span
+
+
 # --------------------------------------------------------------- 失联看门狗
 
 def _fmt_span(seconds: float) -> str:
@@ -499,7 +516,8 @@ class _Handler(BaseHTTPRequestHandler):
                                heartbeat=True)
         self._reply(200, {"ok": True, "source": "android",
                           "chat_name": self.ctx.chat_name,
-                          "online": bool(self.ctx.last_seen),
+                          "online": _online_now(self.ctx),
+                          "state": self.ctx.state,
                           "last_seen": self.ctx.last_seen_wall,
                           "device": self.ctx.last_device,
                           "heartbeat": self.ctx.heard_heartbeat,
@@ -914,7 +932,7 @@ class AndroidGatewaySource(Source):
             server.server_close()
             self._server = None
             self.count = dict(ctx.count)
-            self.online = bool(ctx.last_seen)
+            self.online = _online_now(ctx)   # 语义同 /ping：退出那一刻是否还在线
 
     def stop(self) -> None:
         self._stop.set()

@@ -14,6 +14,7 @@ import logging
 import socket
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -26,7 +27,7 @@ from bridge.fingerprint import fp_of, norm_sender, unit_fp
 from bridge.service import BridgeService
 from bridge.sources.android_gateway import (
     MAX_BATCH, MAX_SCREEN_BODY, OFFLINE_REMIND_EVERY, AndroidGatewaySource,
-    _Ctx, _watchdog_step, build_messages, lan_ips,
+    _Ctx, _online_now, _watchdog_step, build_messages, lan_ips,
 )
 from bridge.sources.base import Source
 from bridge.sources.factory import build_source
@@ -931,6 +932,53 @@ class TestHeartbeatEndpoint(GatewayCase):
         _, state = self.get()
         self.assertTrue(state["online"])
         self.assertFalse(state["heartbeat"])
+
+
+class TestOnlineNow(unittest.TestCase):
+    """``/ping`` 的 online 必须回答「现在」，不是「历史上连上过」。
+
+    真机上吃过一次亏：手机锁屏八分钟、心跳一次都没来，而 /ping 仍回
+    ``online: true``（旧实现是 ``bool(last_seen)``），排查方向直接被带偏到
+    「电脑侧是不是卡了」。字段名既然叫 online，就不能拿历史当现状。
+    """
+
+    def new_ctx(self) -> _Ctx:
+        return _Ctx(token="t", chat_name="数字质控")
+
+    def test_never_seen_is_offline(self):
+        self.assertFalse(_online_now(self.new_ctx()))
+
+    def test_fresh_heartbeat_is_online(self):
+        c = self.new_ctx()
+        c.touch(device="PAL-AL00", heartbeat=True)
+        self.assertTrue(_online_now(c))
+
+    def test_stale_heartbeat_is_offline(self):
+        """锁屏八分钟那种情形：心跳停在很久以前，必须报不在线。"""
+        c = self.new_ctx()
+        c.touch(heartbeat=True)
+        c.last_seen = time.monotonic() - 480
+        self.assertFalse(_online_now(c))
+
+    def test_exactly_at_threshold_still_online(self):
+        """边界上不算失联（与看门狗口径一致：超过阈值才算）。"""
+        c = self.new_ctx()
+        c.touch(heartbeat=True)
+        c.last_seen = time.monotonic() - 299
+        self.assertTrue(_online_now(c))
+
+    def test_detection_off_falls_back_to_ever_seen(self):
+        """关掉失联检测（offline_after=0）时没有阈值可用，退回「收到过」。
+
+        注意这里不能写 ``time.monotonic() - 99999``：monotonic 是**开机**以来的
+        秒数，机器刚开机时减掉一个大数会变成负值，落到「从没收到过」分支上，
+        测试就成了假绿/假红。用 1.0（开机的第一秒）表达「很久以前」才稳。
+        """
+        c = self.new_ctx()
+        c.offline_after = 0.0
+        c.touch(heartbeat=True)
+        c.last_seen = 1.0
+        self.assertTrue(_online_now(c))
 
 
 class TestWatchdog(unittest.TestCase):
