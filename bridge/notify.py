@@ -61,6 +61,22 @@ DEFAULT_TEST_TEXT = (
     "如果你在群里看到这条消息，说明配置没问题。"
 )
 
+# 程序**自动**发出的运维通知（启动/停止/报告/告警）统一带这个前缀。
+# 加它的理由不是好看，是防止回环：这些通知本身发在钉钉群里，而采集端只认
+# 「群里有新消息」，分不清是机器人还是人 —— 不标记的话，「转发桥已启动」
+# 「手机端失联」会被当成群消息原样转进微信业务群（真机上发生过）。
+# 人工测试（send_custom / --notify-say / --notify-test）**故意不带**，
+# 因为用户常靠那条消息验证整条链路通不通。
+SYSTEM_PREFIX = "【系统】"
+
+
+def mark_system(content: str) -> str:
+    """给自动通知加统一前缀，幂等（重复调用不会叠成两个前缀）。"""
+    if content.lstrip().startswith(SYSTEM_PREFIX):
+        return content
+    return f"{SYSTEM_PREFIX}{content}"
+
+
 # 钉钉接口返回的错误码，挑几个常见且值得给出人话解释的
 ERR_HINTS = {
     300001: "消息发送太快，被钉钉限流了",
@@ -428,7 +444,19 @@ class DingTalkNotifier:
 
     # -------------------------------------------------- 对外接口
 
-    def send_text(self, content: str, at: bool = False) -> tuple[bool, str]:
+    def send_text(self, content: str, at: bool = False,
+                  system: bool = False) -> tuple[bool, str]:
+        """发纯文本。``system=True`` 表示这是**程序自己**的运维通知，加统一前缀。
+
+        为什么需要这个标记：通知是发到钉钉群里的，而采集端只认「群里有新消息」，
+        不区分发消息的是机器人还是人。不加标记的话，「转发桥已启动」这类运维
+        文案会被原样转发给微信业务群（真机上发生过）。人工用 ``send_custom``
+        或 ``--notify-say`` 发的测试消息**不带**前缀，照常参与转发 —— 用户常靠
+        它验证整条链路是否通。
+        """
+        if system:
+            content = mark_system(content)
+
         def build(rb: RobotSpec) -> dict:
             payload = {"msgtype": "text",
                        "text": {"content": self._finalize(content, rb)}}
@@ -450,11 +478,15 @@ class DingTalkNotifier:
 
         return self._broadcast(build)
 
-    def alert(self, key: str, content: str, at: bool = True) -> bool:
+    def alert(self, key: str, content: str, at: bool = True,
+              system: bool = True) -> bool:
         """带冷却去重的告警。
 
         同一个 key 在 cooldown 秒内只发一次 —— 采集窗口被切走时，
         OCR 每个轮询周期都会打一条同样的 WARNING，不去重会瞬间刷屏。
+
+        ``system`` 默认为 True：告警都是程序自己产生的，必须带前缀，
+        否则「手机端失联」这种告警会被采集端当成群消息转进业务群。
         """
         now = time.time()
         with self._lock:
@@ -463,7 +495,7 @@ class DingTalkNotifier:
                 log.debug("告警「%s」处于冷却期（%.0fs），跳过", key, self.cooldown)
                 return False
             self._last_sent[key] = now
-        ok, detail = self.send_text(content, at=at)
+        ok, detail = self.send_text(content, at=at, system=system)
         if not ok:
             with self._lock:              # 发失败就释放冷却，下一轮还能再试
                 self._last_sent.pop(key, None)

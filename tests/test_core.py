@@ -206,5 +206,57 @@ class TestService(unittest.TestCase):
         self.assertIn("已发送 1", self.svc.summary())
 
 
+class TestOwnNoticeNotForwarded(unittest.TestCase):
+    """程序自己发在钉钉群里的运维文案，不能被当成群消息转给微信。
+
+    真实事故：采集端切换到手机之后，启动通知「▶️ 转发桥已启动 模式：正式发送
+    采集：…」被手机读到并原样发进了「申通五星业务员培训群」。运维文案进业务群
+    既难看又误导，所以自动通知统一带【系统】前缀，采集端据此拦掉。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(
+            storage=type("S", (), {"db_path": str(Path(self.tmp.name) / "s.db")})(),
+            wechat=WeChatConfig(dry_run=True, interval=0.0, targets=["测试群"]),
+            routes=[RouteConfig(name="t", companies=[], targets=["测试群"],
+                                template="{content}")],
+        )
+        self.cfg._base_dir = Path(self.tmp.name)
+        self.target = FakeTarget()
+        self.svc = BridgeService(self.cfg, target=self.target)
+
+    def tearDown(self):
+        self.svc.close()
+        self.tmp.cleanup()
+
+    def test_startup_notice_is_stored_but_not_sent(self):
+        m = msg(sender_name="服务诊断专员", raw_id="own1",
+                content="【系统】▶️ 转发桥已启动\n模式：正式发送")
+        self.assertTrue(self.svc.handle(m))
+        self.assertEqual(len(self.target.sent), 0, "自身通知被投递出去了")
+        self.assertEqual(self.svc.counter["filtered"], 1)
+        # 留痕：仍然入库，事后能查到程序在那个时刻发过什么
+        self.assertEqual(self.svc.storage.stats()["total_messages"], 1)
+
+    def test_force_does_not_bypass_the_guard(self):
+        """手动补发（force=True）也不该把这些运维文案补进业务群。"""
+        m = msg(raw_id="own2", content="【系统】⏹ 转发桥已停止")
+        self.svc.handle(m, force=True)
+        self.assertEqual(len(self.target.sent), 0)
+
+    def test_normal_message_still_goes_through(self):
+        """护栏不能误伤正常业务消息 —— 前缀只认行首。"""
+        m = msg(raw_id="ok1", content="今天还有1票拦截单没完成退单打印")
+        self.svc.handle(m)
+        self.assertEqual(len(self.target.sent), 1)
+
+    def test_prefix_not_at_line_start_is_kept(self):
+        """正文中间出现【系统】是正常文字，不能当通知拦掉。"""
+        m = msg(raw_id="ok2", content="请转告【系统】组，今晚加派两个人")
+        self.svc.handle(m)
+        self.assertEqual(len(self.target.sent), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

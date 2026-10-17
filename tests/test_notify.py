@@ -699,7 +699,14 @@ class TestServiceAlerts(unittest.TestCase):
     def test_lifecycle_and_report_go_through_notifier(self):
         svc, spy, _ = self._service(NotifyConfig(enabled=True, webhook="https://x"))
         svc.sent: list[str] = []
-        spy.send_text = lambda content, at=False: (svc.sent.append(content), (True, "ok"))[1]  # type: ignore
+        flags: list[bool] = []
+
+        def _capture(content, at=False, system=False):  # type: ignore
+            svc.sent.append(content)
+            flags.append(system)          # 生命周期/报告必须标 system=True
+            return True, "ok"
+
+        spy.send_text = _capture
         svc.announce_start("钉钉OCR")
         svc.handle(self._msg("一条"))
         svc.send_report("每小时")
@@ -709,12 +716,16 @@ class TestServiceAlerts(unittest.TestCase):
         self.assertIn("📊 每小时", svc.sent[1])
         self.assertIn("已停止", svc.sent[2])
         self.assertIn("收到 1", svc.sent[2])
+        # 三条都是程序自己的运维通知：必须带标记，否则会被采集端当群消息
+        # 转发到微信业务群（真机事故，见 test_core.TestOwnNoticeNotForwarded）
+        self.assertEqual(flags, [True, True, True])
 
     def test_lifecycle_can_be_switched_off(self):
         svc, spy, _ = self._service(NotifyConfig(enabled=True, webhook="https://x",
                                                  notify_start=False))
         svc.sent: list[str] = []
-        spy.send_text = lambda content, at=False: (svc.sent.append(content), (True, "ok"))[1]  # type: ignore
+        spy.send_text = lambda content, at=False, system=False: (
+            svc.sent.append(content), (True, "ok"))[1]  # type: ignore
         svc.announce_start()
         svc.announce_stop()
         self.assertEqual(svc.sent, [])
@@ -764,6 +775,53 @@ class TestServiceAlerts(unittest.TestCase):
                                                  log_alerts=False))
         svc.start_watchdog()
         self.assertIsNone(svc._alert_handler)
+
+
+class TestSystemPrefix(unittest.TestCase):
+    """自动通知带【系统】前缀，人工测试消息不带。
+
+    这个区分的唯一目的是让采集端能把「程序自己的运维文案」从群消息里择出去
+    （否则启动通知、失联告警都会被转发到微信业务群），同时用户用
+    「发送消息到钉钉群」手工验证链路时那条消息仍能被正常转发。
+    """
+
+    def test_system_text_gets_prefix(self):
+        rec = _Recorder()
+        notifier(rec).send_text("▶️ 转发桥已启动", system=True)
+        self.assertEqual(rec.body()["text"]["content"], "【系统】▶️ 转发桥已启动")
+
+    def test_prefix_is_idempotent(self):
+        from bridge.notify import mark_system, SYSTEM_PREFIX
+        once = mark_system("x")
+        self.assertEqual(mark_system(once), once)
+        self.assertTrue(once.startswith(SYSTEM_PREFIX))
+
+    def test_leading_whitespace_still_detected(self):
+        rec = _Recorder()
+        notifier(rec).send_text("  \n【系统】已经带前缀了", system=True)
+        # 不能因为前面有空白就再叠一个前缀
+        self.assertEqual(rec.body()["text"]["content"].count("【系统】"), 1)
+
+    def test_default_has_no_prefix(self):
+        rec = _Recorder()
+        notifier(rec).send_text("普通文本")
+        self.assertNotIn("【系统】", rec.body()["text"]["content"])
+
+    def test_custom_message_has_no_prefix(self):
+        """人工测试消息必须原样发出 —— 用户靠它验证端到端链路。"""
+        rec = _Recorder()
+        notifier(rec).send_custom("测试一下")
+        self.assertEqual(rec.body()["text"]["content"], "测试一下")
+
+    def test_alert_gets_prefix_by_default(self):
+        rec = _Recorder()
+        notifier(rec).alert("k1", "手机端失联：已经 5 分钟 没有心跳")
+        self.assertTrue(rec.body()["text"]["content"].startswith("【系统】"))
+
+    def test_test_message_has_no_prefix(self):
+        rec = _Recorder()
+        notifier(rec).test()
+        self.assertNotIn("【系统】", rec.body()["text"]["content"])
 
 
 if __name__ == "__main__":

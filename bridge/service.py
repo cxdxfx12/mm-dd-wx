@@ -14,7 +14,8 @@ from datetime import datetime
 from .config import Config
 from .formatter import DEFAULT_TEMPLATE, render
 from .models import Message
-from .notify import DingTalkNotifier, in_hhmm_window, install_alert_handler
+from .notify import (DingTalkNotifier, SYSTEM_PREFIX, in_hhmm_window,
+                     install_alert_handler)
 from .router import Router
 from .storage import Storage
 from .targets import build_target
@@ -71,6 +72,16 @@ class BridgeService:
         self._last_activity = time.time()
         self._last_msg_desc = f"{msg.sender_name}：{(msg.content or '')[:40]}"
         self._idle_alerted = False
+
+        # 程序自己发的运维通知（启动/停止/报告/告警）长在业务群里，采集端只看
+        # 文本不看发送者 —— 不拦住就会把「转发桥已启动」「手机端失联」原样转给
+        # 微信业务群。仍然入库留痕，只是不投递；force（手动补发）同样拦，因为
+        # 人工补发的意图是「补那几条业务消息」，不包括运维文案。
+        if (msg.content or "").lstrip().startswith(SYSTEM_PREFIX):
+            self.counter["filtered"] += 1
+            log.info("自身通知不转发（%s）：%s", msg.sender_name,
+                     (msg.content or "").replace("\n", " ")[:40])
+            return True
 
         matched = self.router.match(msg)
         if not matched.targets:
@@ -131,7 +142,7 @@ class BridgeService:
         """发一条通知（不带冷却去重），用于开始/停止这类一次性事件。"""
         if not self.notifier:
             return False
-        ok, _ = self.notifier.send_text(text)
+        ok, _ = self.notifier.send_text(text, system=True)
         return ok
 
     def announce_start(self, source_desc: str = "") -> None:
@@ -180,7 +191,7 @@ class BridgeService:
     def send_report(self, period: str = "手动查询") -> bool:
         if not self.notifier:
             return False
-        ok, _ = self.notifier.send_text(self.report_text(period))
+        ok, _ = self.notifier.send_text(self.report_text(period), system=True)
         return ok
 
     def db_report_text(self, period: str = "手动查询") -> str:
@@ -201,7 +212,7 @@ class BridgeService:
     def send_db_report(self, period: str = "手动查询") -> bool:
         if not self.notifier:
             return False
-        ok, _ = self.notifier.send_text(self.db_report_text(period))
+        ok, _ = self.notifier.send_text(self.db_report_text(period), system=True)
         return ok
 
     # ---------- 看门狗 ----------
