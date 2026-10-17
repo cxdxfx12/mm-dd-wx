@@ -107,7 +107,18 @@ ROBOT_TAG_RE = re.compile(r"\s+机器人$")
 # 「选择要@的人」面板被解析成 9 条消息）。所以在切分**之前**先判页面类型，
 # 判不准就一帧都不解析，也不动基线。
 #
-# 正向信号：聊天页底部输入区的提示语。这条最稳 —— 别的页面没有输入框。
+# 最强的正向信号：聊天页的**专有布局 id 链**。真机实测稳定存在
+#   list_and_tip_content → list_content → ListView#list_view
+# 而「选择要@的人」那一屏里这三个 id 一个都没有。resource-id 是钉钉自己写的
+# 语义名（不是混淆串），比界面文案耐改版；文案会变、会被键盘挡住。
+#
+# 为什么不能只靠文案：现场真机上有一段帧的输入区提示语读不到（键盘顶起 /
+# 上报落在动画中间态），于是整帧被判成 unknown 丢掉 —— 漏消息比误转更难
+# 发现。要求**同时命中两个**才采信，避免单个通用 id 偶然出现在别的页面。
+CHAT_LAYOUT_IDS = ("list_and_tip_content", "list_content", "list_view")
+CHAT_LAYOUT_NEED = 2
+
+# 正向信号：聊天页底部输入区的提示语。这条对「人」最直观，但对时机最敏感。
 CHAT_HINTS = ("发消息或按住说话", "按住说话", "发送消息…", "发送消息...")
 # 备用正向信号：底部工具条上的固定入口。提示语文案被改掉时还能认出来。
 CHAT_TOOL_LABELS = frozenset({"表情", "图片", "更多"})
@@ -251,8 +262,8 @@ def detect_page(root: Node) -> tuple[str, str]:
     塞满人名和身份标签的滚动列表 —— 结构与消息列表几乎一样。不先判页面，
     这些人名就会被当成群消息发进微信群（真机第二帧正是这种情况）。
 
-    判定顺序：反向信号一票否决 → 正向信号 → 兜底 ``unknown``（一律按「不是
-    聊天页」处理，即不解析、不动基线）。
+    判定顺序：反向信号一票否决 → 布局 id 链 → 输入区提示语 → 工具条 →
+    兜底 ``unknown``（一律按「不是聊天页」处理，即不解析、不动基线）。
     """
     labels = [n.label for n in walk(root) if n.label]
     joined = "\n".join(labels)
@@ -261,6 +272,12 @@ def detect_page(root: Node) -> tuple[str, str]:
         if marker in joined:
             return "other", f"页面上出现「{marker}」"
 
+    rid_hits = {i for i in CHAT_LAYOUT_IDS
+                if any(i == n.rid.rsplit("/", 1)[-1] for n in walk(root))}
+    if len(rid_hits) >= CHAT_LAYOUT_NEED:
+        return "chat", "聊天列表的布局 id 链（" + " → ".join(
+            i for i in CHAT_LAYOUT_IDS if i in rid_hits) + "）"
+
     for hint in CHAT_HINTS:
         if hint in joined:
             return "chat", f"输入区提示语「{hint}」"
@@ -268,7 +285,7 @@ def detect_page(root: Node) -> tuple[str, str]:
     if CHAT_TOOL_LABELS.issubset(set(labels)):
         return "chat", "底部工具条齐全（表情/图片/更多）"
 
-    return "unknown", "既没有输入区提示语，也没有已识别的非聊天页文案"
+    return "unknown", "既没有聊天列表的布局 id 链，也没有输入区提示语"
 
 
 def _leaves(node: Node) -> list[Node]:

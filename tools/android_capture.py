@@ -217,7 +217,14 @@ def watch_incremental(base: str, token: str, first: Path | None,
             if not fr.is_chat:
                 # @面板、群信息这些页面会在手机上报里出现，后台解析会整帧跳过；
                 # 这里保持一致，否则「预览说会发、线上不发」又是一次白排查。
-                print(f"  {stamp} · 不是聊天页（{fr.page_reason}）→ 后台会整帧跳过")
+                #
+                # 顺手把帧存下来：判「不是聊天页」有两种情况 —— 真的不是（用户
+                # 点开了 @ 面板），和**认错了**（聊天页的判据没命中）。前者看
+                # 一眼就知道，后者不看帧根本无从查，而它意味着这一帧的消息全丢。
+                # 现场已经踩过一次：连续两帧聊天页被判 unknown，帧没存，只能靠猜。
+                kept = _dump(raw, now_count)
+                tail = f"｜已存帧 {kept.name}" if kept else ""
+                print(f"  {stamp} · 不是聊天页（{fr.page_reason}）→ 后台会整帧跳过{tail}")
                 continue
 
             diff = differ.feed(fr.units)
@@ -232,6 +239,33 @@ def watch_incremental(base: str, token: str, first: Path | None,
                     print(f"      + 发送者={unit.sender or '(空)'} :: {body_txt[:60]}")
     except KeyboardInterrupt:
         print("\n（结束）")
+
+
+# 跳过帧最多留几个。用户点开 @ 面板会连着报好几帧，全存下来会把 data/ 灌满；
+# 而排障只需要「一两个样本」。
+SKIP_DUMP_MAX = 20
+_skip_dumped = 0
+
+
+def _dump(raw: bytes, count: int) -> Path | None:
+    """把被判「不是聊天页」的帧存下来，供事后复盘；超上限就不再存（返回 None）。
+
+    存盘失败不能影响监视（这本来只是个取证动作），所以整体兜住异常 ——
+    现场唯一不能出现的是「为了写个日志把网关弄崩」。
+    """
+    global _skip_dumped
+    if _skip_dumped >= SKIP_DUMP_MAX:
+        return None
+    stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+    out = BASE_DIR / "data" / f"screen-{stamp}_skip{count}.xml"
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(raw)
+        _skip_dumped += 1
+    except OSError as exc:
+        print(f"  （存帧失败，不影响继续：{exc}）")
+        return None
+    return out
 
 
 def save_frame(base: str, token: str, args) -> Path | None:

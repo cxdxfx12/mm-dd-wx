@@ -168,9 +168,18 @@ def dt_frame(*items: str, menu: bool = True) -> str:
         '<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0">'
         f'<node index="0" text="" class="android.widget.FrameLayout" package="{PKG}" '
         f'bounds="[0,0][1176,2480]">'
+        # 真机上聊天页的列表被这两层包着（实测 id 就是这两个语义名，不是混淆串）。
+        # 造树必须带上 —— 这是页面判定里最耐改版的一条依据。
+        f'<node index="49" text="" resource-id="{PKG}:id/list_and_tip_content" '
+        f'class="android.widget.FrameLayout" package="{PKG}" '
+        f'bounds="[0,265][1176,2018]">'
+        f'<node index="48" text="" resource-id="{PKG}:id/list_content" '
+        f'class="android.widget.LinearLayout" package="{PKG}" '
+        f'bounds="[0,265][1176,2018]">'
         f'<node index="50" text="" resource-id="{PKG}:id/list_view" '
         f'class="android.widget.ListView" package="{PKG}" scrollable="true" '
         f'bounds="[0,265][1176,2018]">{"".join(items)}</node>'
+        f'</node></node>'
         f'{menu_xml}{INPUT_BAR}</node></hierarchy>')
 
 
@@ -544,6 +553,55 @@ class TestPageGuard(unittest.TestCase):
                f'{row_simple("hi", 300)}</node></node></hierarchy>')
         f = parse_frame(xml)
         self.assertEqual(f.page, "unknown")
+        self.assertEqual(f.units, [])
+
+    def test_chat_page_detected_by_layout_ids_without_input_area(self):
+        """输入区读不到时，靠布局 id 链仍要认出聊天页。
+
+        现场踩过：连续两帧的输入区提示语没读到（键盘顶起／上报落在动画中间态），
+        整帧被判 unknown 丢掉 —— 那两帧里的新消息一条都不会转发，而且日志只有
+        一句 INFO，比误转更难发现。布局 id 链不依赖界面文案、也不依赖动画时机。
+        """
+        xml = (f'<hierarchy rotation="0"><node index="0" class="android.widget.FrameLayout" '
+               f'package="{PKG}" bounds="[0,0][1176,2480]">'
+               f'<node index="49" resource-id="{PKG}:id/list_and_tip_content" '
+               f'class="android.widget.FrameLayout" package="{PKG}" bounds="[0,265][1176,2018]">'
+               f'<node index="48" resource-id="{PKG}:id/list_content" '
+               f'class="android.widget.LinearLayout" package="{PKG}" bounds="[0,265][1176,2018]">'
+               f'<node index="50" resource-id="{PKG}:id/list_view" class="android.widget.ListView" '
+               f'package="{PKG}" scrollable="true" bounds="[0,265][1176,2018]">'
+               f'{row_simple("正文", 320)}</node></node></node></node></hierarchy>')      # 无输入区
+        f = parse_frame(xml)
+        self.assertEqual(f.page, "chat")
+        self.assertIn("list_content", f.page_reason)
+        self.assertEqual([u.content for u in f.units], ["正文"])
+
+    def test_single_generic_layout_id_is_not_enough(self):
+        """只出现一个通用 id（如别处也叫 list_view 的列表）不足以采信。"""
+        xml = (f'<hierarchy rotation="0"><node index="0" class="android.widget.FrameLayout" '
+               f'package="{PKG}" bounds="[0,0][1176,2480]">'
+               f'<node index="50" resource-id="{PKG}:id/list_view" class="android.widget.ListView" '
+               f'package="{PKG}" scrollable="true" bounds="[0,265][1176,2018]">'
+               f'{row_simple("张三", 320)}</node></node></hierarchy>')
+        f = parse_frame(xml)
+        self.assertEqual(f.page, "unknown")
+        self.assertEqual(f.units, [])
+
+    def test_at_panel_wins_over_layout_ids(self):
+        """反向信号一票否决：@ 面板即使混进聊天页的布局 id 也不能放行。"""
+        xml = (f'<hierarchy rotation="0"><node index="0" class="android.widget.FrameLayout" '
+               f'package="{PKG}" bounds="[0,0][1176,2480]">'
+               f'<node index="1" text="选择要@的人" class="android.widget.TextView" '
+               f'package="{PKG}" bounds="[400,200][800,260]"></node>'
+               f'<node index="49" resource-id="{PKG}:id/list_and_tip_content" '
+               f'class="android.widget.FrameLayout" package="{PKG}" bounds="[0,265][1176,2018]">'
+               f'<node index="48" resource-id="{PKG}:id/list_content" '
+               f'class="android.widget.LinearLayout" package="{PKG}" bounds="[0,265][1176,2018]">'
+               f'<node index="50" resource-id="{PKG}:id/list_view" class="android.widget.ListView" '
+               f'package="{PKG}" scrollable="true" bounds="[0,265][1176,2018]">'
+               f'{row_simple("服务诊断专员", 320)}</node></node></node></node></hierarchy>')
+        f = parse_frame(xml)
+        self.assertEqual(f.page, "other")
         self.assertEqual(f.units, [])
 
     def test_group_info_page_is_not_chat(self):
