@@ -118,6 +118,12 @@ ROBOT_TAG_RE = re.compile(r"\s+机器人$")
 CHAT_LAYOUT_IDS = ("list_and_tip_content", "list_content", "list_view")
 CHAT_LAYOUT_NEED = 2
 
+# 消息列表容器的 resource-id 短名（取 ``包名:id/`` 之后那一段）。
+# 有它就直接认容器，不再拿面积和条数去猜 —— 真机事故：一张表格消息的
+# HorizontalScrollView 靠「切出 1 条 + 占屏 40%」赢了只露出 2 条的 ListView，
+# 导致锚点每帧失效、整屏消息停止转发。
+MESSAGE_LIST_IDS = ("list_view", "chatting_listview", "message_list")
+
 # 正向信号：聊天页底部输入区的提示语。这条对「人」最直观，但对时机最敏感。
 CHAT_HINTS = ("发消息或按住说话", "按住说话", "发送消息…", "发送消息...")
 # 备用正向信号：底部工具条上的固定入口。提示语文案被改掉时还能认出来。
@@ -362,6 +368,27 @@ def find_message_list(root: Node) -> Node | None:
     if not cands:
         return None
 
+    # 第 0 步（最高优先）：按已知的消息列表 id 直接认。
+    #
+    # 真机事故（2026-10-17）：群里来了一条**表格消息**，它在树里是个
+    # ``HorizontalScrollView``，面积占整屏 40%、还被切成 1 条「消息」，于是在
+    # 「条数优先」的比较里**赢了真正的 ListView**（那一刻列表只露出 2 条）。
+    # 后果不是格式变乱，是锚点每帧失效 → 整屏消息停止转发。
+    # id 是钉钉自己写的语义名，比面积/条数这些间接信号可靠得多，所以提到最前面。
+    by_id = [c for c in cands if c.rid.rsplit("/", 1)[-1] in MESSAGE_LIST_IDS]
+    if by_id:
+        by_id = [c for c in by_id if _container_units(c)]
+        if by_id:
+            best_id = max(by_id, key=lambda c: (len(_container_units(c)), _area(c)))
+            drilled = _drill_into(best_id, cands)
+            return drilled or best_id
+
+    # 没有语义 id 时（id 改版 / 别的页面）才退回启发式。
+    # 但先把「气泡里的横滑表格」剔掉：它们又宽又矮，且几乎总是嵌在某个里层。
+    cands = [c for c in cands if not _looks_like_inline_table(c, cands)]
+    if not cands:
+        cands = _candidates(root) or []
+
     # 先按面积筛一道：消息列表基本占满屏幕，而底部功能条、气泡里的横滑表格
     # 都只是窄窄一截。真机实测这一条最有效 —— 功能条同样是 RecyclerView，
     # 它下面有 4 个带文本的子节点，按「条数」比它反而赢过只有 2 组消息的列表。
@@ -374,19 +401,53 @@ def find_message_list(root: Node) -> Node | None:
 
     top = [c for c in cands if not any(_is_inside(o, c) for o in cands if o is not c)]
     best = max(top or cands, key=lambda c: (len(units_of(c)), _area(c)))
+    return _drill_into(best, cands) or (best if units_of(best) else None)
 
+
+def _drill_into(best: Node, cands: list[Node]) -> Node | None:
+    """外层只是壳时往里钻一层（``ScrollView > RecyclerView`` 是常见写法）。
+
+    ⚠ 别钻进「气泡里的横滑表格」：它嵌在消息列表里、文本量也够，但它不是列表。
+    真机事故就是从这个方向钻进去的（表格 60 个叶子 vs 列表 74 个，过了「一半」）。
+    """
     for _ in range(4):
         outer_leaves = len(_leaves(best))
         inner = [c for c in cands
                  if _is_inside(best, c)
+                 and not _looks_like_inline_table(c, cands)
                  and not any(_is_inside(c, o) for o in cands
                              if o is not c and _is_inside(best, o))]
         inner = [c for c in inner
-                 if units_of(c) and len(_leaves(c)) * 2 >= max(1, outer_leaves)]
+                 if _container_units(c) and len(_leaves(c)) * 2 >= max(1, outer_leaves)]
         if not inner:
             break
         best = max(inner, key=lambda c: (len(_leaves(c)), _area(c)))
-    return best if units_of(best) else None
+    return best
+
+
+def _looks_like_inline_table(node: Node, cands: list[Node]) -> bool:
+    """这个可滚动容器像不像「气泡里的横滑表格」。
+
+    判据：水平可滚动 + 被另一个候选容器包住 + 子节点在水平方向明显溢出。
+
+    ⚠ 溢出不能用「子节点 right > 自身 right」判断 —— 真机上钉钉会把容器
+    bounds 裁剪到屏幕宽度（表格 752px 宽，`right` 报 964），而**子节点的
+    left 却老实停留在 4252**。所以看子节点左边界是否越过容器右边界。
+    """
+    if "Horizontal" not in node.cls:
+        return False
+    if not any(_is_inside(o, node) for o in cands if o is not node):
+        return False
+    left, _, right, _ = node.bounds
+    width = max(0, right - left)
+    if width <= 0:
+        return False
+    reach = 0
+    for k in node.children:
+        for n in walk(k):
+            reach = max(reach, n.bounds[0], n.bounds[2])
+    return reach > right + width * 0.25
+
 
 
 def _labeled_children(node: Node) -> list[Node]:
@@ -591,6 +652,87 @@ def _bubble_and_sender(node: Node) -> tuple[Node | None, str]:
     return bubble, sender
 
 
+def _table_rows(nodes: list[Node]) -> list[list[str]]:
+    """气泡里的表格节点 → 二维表（按坐标还原，不是按文档顺序）。
+
+    真机（2026-10-17 16:31 那张「标签履约月累计达成」卡片）：
+    表格是 ``HorizontalScrollView`` 里的一堆 ``LinearLayout`` 网格，无障碍把它
+    读成**列优先**的一竖排 —— 10 个列名、然后每个网点的 9 个值，混在正文里
+    无法分辨哪个数是哪个指标。但坐标是准的（同一行 y 相同、同一列 x 递增）。
+
+    做法：先按 x 把**表格区域**挑出来（普通气泡每行一个文本节点、left 恒等；
+    表格那一排有多个不同 left），再在区域内按 y 聚行、行内按 x 排序。
+
+    返回空列表 = 这不是表格，调用方保持原样。
+    """
+    boxes = []
+    for n in nodes:
+        left, top, right, bottom = n.bounds
+        # ⚠ 表格格的真机形状是 ``[2058,659][964,770]`` —— left 是真实的列坐标
+        # （250/702/1154…，每列 +452），right 却被裁剪成屏幕宽度。
+        # 所以：**left 必须原样用**（拿 min/max 归一化会把 2058 变成 964，
+        # 列序全乱、数值对错列名）；只有「宽度」用 abs 判断。
+        if abs(right - left) <= 0 or abs(bottom - top) <= 0:
+            continue
+        t, b = min(top, bottom), max(top, bottom)
+        if b - t <= 0:
+            continue
+        boxes.append((left, t, right, b, n.label.strip()))
+    if len(boxes) < 6:
+        return []
+
+    # 表格的一排有 ≥3 个不同 left；普通正文每行 left 都一样（真机实测全是 212）。
+    if len({b[0] for b in boxes}) < 3:
+        return []
+
+    # 按行中心聚类。真机上同一行的格子 y 会差几十像素（网格自己没对齐：
+    # 表头 659~770、数据 810~869），但同一行的格子**垂直区间一定互相重叠**，
+    # 所以用「与行内已有盒子重叠」作为同行判据，不能用固定容差。
+    boxes.sort(key=lambda b: (b[1] + b[3]) / 2)
+    rows: list[list[tuple]] = []
+    for b in boxes:
+        placed = False
+        for r in reversed(rows[-3:]):               # 只看最近几行，避免误并
+            if any(min(b[3], x[3]) - max(b[1], x[1]) > 0 for x in r):
+                r.append(b)
+                placed = True
+                break
+        if not placed:
+            rows.append([b])
+
+    # 行内只按 left 排序 —— 真机上格子的 right 全被裁剪成屏幕宽度（都报 964），
+    # 左边界才是可信的列位置（实测 250 / 702 / 1154 …，每列递增 452）。
+    grid = [sorted(r, key=lambda b: b[0]) for r in rows]
+    grid = [r for r in grid if len(r) >= 3]
+    if len(grid) < 2:
+        return []
+
+    # 表头 = 列数最多的那一行；只保留列数与它一致的行（挡掉正文行）。
+    cols = max(len(r) for r in grid)
+    head_at = next(i for i, r in enumerate(grid) if len(r) == cols)
+    grid = [r for r in grid[head_at:] if len(r) == cols]
+    return grid if len(grid) >= 2 else []
+
+
+def _render_table(grid: list[list[tuple]]) -> str:
+    """二维表 → 文本。首行当表头，每行渲染成 ``列名: 值`` 用 ｜ 连接。
+
+    为什么不做成对齐的等宽表格：微信里是正文字体（比例字体），空格对齐必然
+    错位；``列名: 值`` 的形式在任何字体下都能读懂，也方便直接抄数字。
+    """
+    head = [b[4] for b in grid[0]]
+    body = grid[1:] or grid
+    lines = []
+    for row in body:
+        cells = [b[4] for b in row]
+        if grid[1:]:
+            pairs = [f"{h}: {v}" for h, v in zip(head, cells)]
+            lines.append(" ｜ ".join(pairs))
+        else:
+            lines.append(" ｜ ".join(cells))
+    return "\n".join(lines)
+
+
 def split_row(row: Node) -> Unit:
     """一个「消息行」→ 一个 :class:`Unit`（时间分隔条也会返回，kind="time"）。
 
@@ -610,18 +752,28 @@ def split_row(row: Node) -> Unit:
 
     sender = ""
     body = labels
+    body_nodes = parts
     node = _unwrap(row)
     bubble, name = _bubble_and_sender(node)
     if bubble is not None:
-        inner = [p.label for p in _clean_leaves(bubble)]
-        if inner:
-            sender, body = name, inner
+        leaves = _clean_leaves(bubble)
+        if leaves:
+            sender, body, body_nodes = name, [p.label for p in leaves], leaves
     else:
         struct = _split_by_structure(node)
         if struct is not None:
             sender, body = struct[0], [p.label for p in struct[1]]
+            body_nodes = struct[1]
         elif len(parts) >= 2 and _looks_like_sender(parts[0], parts[1]):
-            sender, body = labels[0], labels[1:]
+            sender, body, body_nodes = labels[0], labels[1:], parts[1:]
+
+    # 卡片消息里的表格：它被读成「列优先」的一竖排（10 个列名、然后 10 个值……），
+    # 直接发出去就是一堆对不上号的名字和数字。这里按坐标还原成一行一条记录。
+    grid = _table_rows(body_nodes)
+    if grid:
+        return Unit(sender=sender, content=_render_table(grid),
+                    kind="text", y0=y0, y1=y1)
+
 
     if all(PLACEHOLDER_RE.match(x) for x in body):
         return Unit(sender=sender, content=body[0],
@@ -665,6 +817,13 @@ def parse_frame(text: str) -> Frame:
             frame.separators.append(unit.content)
         else:
             units.append(unit)
+
+    if not units:
+        # 容器在、但一条都没切出来：空列表（刚进群还没消息）或结构又变了。
+        # 必须留一条 warning，否则现场表现成「静默不转发」，最难查。
+        frame.warnings.append(
+            f"消息列表容器 {container.short_class} 里没有切出任何消息"
+            "—— 可能是空列表，或行结构变了（用 android_capture.py --file 复盘）")
 
     # 列表子节点的文档顺序一般就是上→下，但嵌套布局偶尔不保证；按 y 再排一次。
     # （行级 bounds 在真机上是准的；只有深层子节点的 bounds 会失真，见

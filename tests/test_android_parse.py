@@ -682,6 +682,153 @@ class TestFrameDiffer(unittest.TestCase):
         self.assertEqual([u.content for u in diff.units], ["3"])
 
 
+# ------------------------------------------------------------------ 表格消息
+
+def dt_table(rows: list[list[str]], *, top: int, left: int = 212,
+             cell: int = 452) -> str:
+    """气泡里的横滑表格（真机 2026-10-17 16:31 那一帧的形状）。
+
+    真机的两个反直觉之处，这里都照实复现：
+
+    1. 每个格子的 bounds 是 ``[left,y][964,y+h]`` —— **right 恒等于屏幕宽度**
+       （被裁剪），left 才是真正的列坐标（250 / 702 / 1154 …）。
+       拿 min/max 归一化会把 left 变成 964，列序全乱、数值对错列名。
+    2. 表头与数据行的 y 区间不整齐（659~770 / 810~869），同一行的格子
+       垂直区间重叠但中心不相等。
+    3. 格子前面夹着 8px 宽的装饰 View（无文本）。
+    """
+    idx = 80
+    parts = []
+    for r, cells in enumerate(rows):
+        y = top + 151 * r
+        for c, text in enumerate(cells):
+            x = left + 38 + c * cell
+            if c:     # 列分隔装饰
+                parts.append(
+                    f'<node index="{idx}" text="" class="android.view.View" '
+                    f'package="{PKG}" bounds="[{x - 8},{y}][964,{y + 149}]"></node>')
+                idx += 1
+            h = 59 if r == 0 else 111
+            parts.append(
+                f'<node index="{idx}" text="" class="android.widget.LinearLayout" '
+                f'package="{PKG}" bounds="[{x},{y}][964,{y + h}]">'
+                f'<node index="{idx + 1}" text="{text}" '
+                f'class="android.widget.TextView" package="{PKG}" '
+                f'bounds="[{x},{y}][964,{y + 59}]"></node></node>')
+            idx += 2
+    height = 151 * len(rows) + 20
+    return ('<node index="70" text="" class="android.widget.HorizontalScrollView" '
+            f'package="{PKG}" scrollable="true" bounds="[{left},{top}]'
+            f'[964,{top + height}]">'
+            f'<node index="71" text="" class="android.widget.FrameLayout" '
+            f'package="{PKG}" bounds="[{left},{top}][964,{top + height}]">'
+            + "".join(parts) + '</node></node>')
+
+
+def dt_card_message(sender: str, body: str, top: int) -> str:
+    """卡片消息行：气泡里包着一个 ``card_view_container``，表格在卡片里。
+
+    真机结构（2026-10-17 16:31）：
+        RelativeLayout(行) › [头像, 昵称块, 气泡 › card_view_container › 表格]
+    """
+    h = 1200
+    return (
+        f'<node index="1" text="" class="android.widget.RelativeLayout" package="{PKG}" '
+        f'bounds="[0,{top}][1176,{top + h}]">'
+        f'<node index="2" text="" class="android.widget.FrameLayout" package="{PKG}" '
+        f'bounds="[9,{top}][153,{top + 144}]">'
+        f'<node index="3" text="" class="android.widget.ImageView" package="{PKG}" '
+        f'content-desc="{sender}" bounds="[24,{top}][137,{top + 113}]"></node></node>'
+        f'<node index="4" text="" class="android.view.ViewGroup" package="{PKG}" '
+        f'bounds="[178,{top + 20}][1006,{top + 64}]">'
+        f'<node index="5" text="{sender}" class="android.widget.TextView" package="{PKG}" '
+        f'bounds="[178,{top + 20}][406,{top + 64}]"></node></node>'
+        f'<node index="7" text="" class="android.widget.FrameLayout" package="{PKG}" '
+        f'resource-id="{PKG}:id/chat_bubble_container" '
+        f'bounds="[174,{top + 80}][1002,{top + h - 10}]">'
+        f'<node index="12" text="" class="android.widget.FrameLayout" package="{PKG}" '
+        f'resource-id="{PKG}:id/card_view_container" '
+        f'bounds="[174,{top + 80}][1002,{top + h - 10}]">{body}</node>'
+        f'</node></node>')
+
+
+class TestCardTable(unittest.TestCase):
+    """卡片里的表格必须按行还原，而不是一竖排。
+
+    真机事故（2026-10-17 15:16 之后）：群里来了一张表格，它在树里是个
+    ``HorizontalScrollView``（占屏 40%、被切成 1 条「消息」），把真正的
+    ``ListView`` 挤了下去 —— 锚点于是每帧失效，**整屏消息停止转发**，
+    日志刷出一串「上一帧的锚点在本帧里找不到」。
+
+    修好容器之后还有第二层问题：表格内容被读成**列优先**的一竖排
+    （10 个列名 + 每个网点 9 个值），看不出哪个数是哪个指标。
+    """
+
+    ROWS = [["网点名称", "打标量", "履约量", "履约率"],
+            ["浙江杭州萧山区大江东公司", "3855", "3840", "99.61%"],
+            ["浙江萧山区衙前镇营业部(311209)", "4538", "4327", "95.35%"]]
+
+    def test_table_does_not_steal_the_message_list(self):
+        item = dt_item("今天 16:31",
+                       dt_card_message("履约跟单专员",
+                                       dt_table(self.ROWS, top=640), 320),
+                       dt_message("签收跟单专员", ["新的一条"], 1560))
+        f = parse_frame(dt_frame(item))
+        self.assertEqual(f.container, "ListView")
+        self.assertEqual(len(f.units), 2)
+        self.assertEqual(f.units[0].sender, "履约跟单专员")
+        self.assertEqual(f.units[1].content, "新的一条")
+
+    def test_table_is_rendered_row_by_row(self):
+        """列名与数值必须一一对上 —— 这是这次最核心的断言。"""
+        item = dt_item("今天 16:31",
+                       dt_card_message("履约跟单专员",
+                                       dt_table(self.ROWS, top=640), 320))
+        body = parse_frame(dt_frame(item)).units[0].content
+        self.assertIn("网点名称: 浙江杭州萧山区大江东公司 ｜ 打标量: 3855 "
+                      "｜ 履约量: 3840 ｜ 履约率: 99.61%", body)
+        self.assertIn("履约率: 95.35%", body)
+        # 每个网点一行
+        self.assertEqual(body.count("网点名称:"), 2)
+
+    def test_plain_multiline_message_is_not_turned_into_a_table(self):
+        """普通多行正文（每行一个文本、left 相同）不能被误判成表格。"""
+        item = dt_item("今天 16:31",
+                       dt_message("签收跟单专员", ["第一行", "第二行", "第三行"], 320))
+        body = parse_frame(dt_frame(item)).units[0].content
+        self.assertEqual(body, "第一行\n第二行\n第三行")
+
+    def test_anchor_survives_a_persistent_table(self):
+        """表格一直挂在屏上时，连续几帧都不能判锚点丢失。"""
+        item = dt_item("今天 16:31",
+                       dt_card_message("履约跟单专员",
+                                       dt_table(self.ROWS, top=640), 320))
+        d = FrameDiffer()
+        for i in range(4):
+            diff = d.feed(parse_frame(dt_frame(item)).units)
+            self.assertFalse(diff.anchor_lost, f"第 {i + 1} 帧误判锚点丢失")
+            if i == 0:
+                self.assertTrue(diff.baseline)
+
+    def test_list_id_beats_a_bigger_inner_scroller(self):
+        """语义 id 优先于「条数 / 面积」——这是这次事故的直接修法。"""
+        item = dt_item("今天 16:31",
+                       dt_card_message("履约跟单专员",
+                                       dt_table(self.ROWS, top=640), 320))
+        f = parse_frame(dt_frame(item))
+        self.assertEqual(f.container, "ListView")
+        self.assertEqual(len(f.units), 1)
+
+    def test_table_without_list_id_still_excluded(self):
+        """id 改版（没有 list_view）时，靠「水平溢出」也要能把表格剔掉。"""
+        item = dt_item("今天 16:31",
+                       dt_card_message("履约跟单专员",
+                                       dt_table(self.ROWS, top=640), 320))
+        xml = dt_frame(item).replace(":id/list_view", ":id/some_future_id")
+        f = parse_frame(xml)
+        self.assertNotEqual(f.container, "HorizontalScrollView")
+
+
 # ------------------------------------------------------------------ 单元 → 消息
 
 class TestUnitsToMessages(unittest.TestCase):
