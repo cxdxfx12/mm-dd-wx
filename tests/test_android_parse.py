@@ -24,6 +24,16 @@ from bridge.sources.android_parse import (                     # noqa: E402
 
 PKG = "com.alibaba.android.rimet"
 
+# 聊天页底部的输入区。**页面判定靠它**：@ 面板、群信息、搜索页这些「也是带一堆
+# 文本的滚动列表」的页面没有输入框，靠这一条把它们与聊天页区分开。
+# 造树工具一律带上它 —— 不带就不是聊天页，解析器（正确地）一帧都不切。
+INPUT_BAR = (
+    f'<node index="70" text="" class="android.widget.LinearLayout" package="{PKG}" '
+    f'bounds="[0,2180][1176,2300]">'
+    f'<node index="71" text="发消息或按住说话..." class="android.widget.TextView" '
+    f'package="{PKG}" bounds="[182,2191][981,2262]"></node></node>'
+)
+
 
 # ------------------------------------------------------------------ 造树工具
 
@@ -68,7 +78,8 @@ def frame(*rows: str, pkg: str = PKG) -> str:
         f'bounds="[0,0][1080,2340]">'
         f'<node index="1" text="" class="androidx.recyclerview.widget.RecyclerView" '
         f'package="{pkg}" scrollable="true" bounds="[0,200][1080,2100]">'
-        f'{body}</node></node></hierarchy>'
+        f'{body}</node>'
+        f'{INPUT_BAR}</node></hierarchy>'
     )
 
 
@@ -159,7 +170,7 @@ def dt_frame(*items: str, menu: bool = True) -> str:
         f'<node index="50" text="" resource-id="{PKG}:id/list_view" '
         f'class="android.widget.ListView" package="{PKG}" scrollable="true" '
         f'bounds="[0,265][1176,2018]">{"".join(items)}</node>'
-        f'{menu_xml}</node></hierarchy>')
+        f'{menu_xml}{INPUT_BAR}</node></hierarchy>')
 
 
 # ------------------------------------------------------------------ 解析
@@ -242,7 +253,7 @@ class TestParseFrame(unittest.TestCase):
             f'<node index="3" class="androidx.recyclerview.widget.RecyclerView" scrollable="true" '
             f'package="{PKG}" bounds="[0,300][1080,2000]">'
             f'{row_simple("第一条", 320)}{row_simple("第二条", 600)}'
-            f'</node></node></node></hierarchy>')
+            f'</node></node>{INPUT_BAR}</node></hierarchy>')
         f = parse_frame(xml)
         self.assertEqual(f.container, "RecyclerView")
         self.assertEqual([u.content for u in f.units], ["第一条", "第二条"])
@@ -374,6 +385,99 @@ class TestFingerprintDrift(unittest.TestCase):
 
     def test_norm_sender_only_strips_trailing_robot(self):
         self.assertEqual(norm_sender("机器人小助手"), "机器人小助手")
+
+
+# ------------------------------------------------------------------ 页面判定
+
+def at_panel_frame() -> str:
+    """「选择要@的人」面板 —— 真机第二帧的还原。
+
+    这一屏与聊天页几乎一样：一个 RecyclerView，里面一排排带文本的行。差别只在
+    顶部是「取消 / 选择要@的人 / 多选」+ 搜索框，**没有输入区**。不判页面就会把
+    这些人名和「机器人」「群主」身份标签当成 9 条群消息转发出去。
+    """
+    mem = ""
+    for i, (name, tag) in enumerate([
+        ("浙江杭州萧山区大江东公司-刘思卫", "群主"),
+        ("服务诊断专员", "机器人"),
+        ("签收跟单专员", "机器人"),
+        ("浙江杭州萧山区大江东公司-屈雅平", ""),
+    ]):
+        top = 626 + i * 188
+        mem += (f'<node index="{10 + i}" text="" class="android.widget.LinearLayout" '
+                f'package="{PKG}" bounds="[0,{top}][1176,{top + 188}]">'
+                f'<node index="{20 + i}" text="{name}" class="android.widget.TextView" '
+                f'package="{PKG}" bounds="[151,{top + 40}][901,{top + 98}]"></node>'
+                f'<node index="{30 + i}" text="{tag}" class="android.widget.TextView" '
+                f'package="{PKG}" bounds="[969,{top + 39}][1101,{top + 94}]"></node></node>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0">'
+        f'<node index="0" text="" class="android.widget.FrameLayout" package="{PKG}" '
+        f'bounds="[0,0][1176,2480]">'
+        f'<node index="1" text="取消" class="android.widget.TextView" package="{PKG}" '
+        f'bounds="[50,332][138,420]"></node>'
+        f'<node index="2" text="选择要@的人" class="android.widget.TextView" package="{PKG}" '
+        f'bounds="[430,341][747,412]"></node>'
+        f'<node index="3" text="多选" class="android.widget.TextView" package="{PKG}" '
+        f'bounds="[972,334][1126,397]"></node>'
+        f'<node index="4" text="搜索名字或群身份" class="android.widget.AutoCompleteTextView" '
+        f'package="{PKG}" bounds="[156,482][1126,594]"></node>'
+        f'<node index="5" text="" class="androidx.recyclerview.widget.RecyclerView" '
+        f'scrollable="true" package="{PKG}" bounds="[0,626][1176,2480]">{mem}</node>'
+        f'</node></hierarchy>')
+
+
+class TestPageGuard(unittest.TestCase):
+    """不是聊天页就一帧都不解析 —— 这类误判的后果是把人名当消息发出去。"""
+
+    def test_at_panel_is_not_chat(self):
+        f = parse_frame(at_panel_frame())
+        self.assertEqual(f.page, "other")
+        self.assertEqual(f.units, [], "「选择要@的人」面板被切成了消息")
+        self.assertIn("选择要@的人", f.page_reason)
+
+    def test_chat_page_detected_by_input_hint(self):
+        f = parse_frame(frame(row_simple("hi", 300)))
+        self.assertEqual(f.page, "chat")
+        self.assertIn("发消息或按住说话", f.page_reason)
+
+    def test_chat_page_detected_without_hint_when_toolbar_full(self):
+        """输入区提示语的文案被改掉时，靠底部工具条仍能认出聊天页。"""
+        bars = "".join(
+            f'<node index="{80 + i}" text="{t}" class="android.widget.TextView" '
+            f'package="{PKG}" bounds="[{100 + i * 100},2300][{180 + i * 100},2380]"></node>'
+            for i, t in enumerate(["表情", "图片", "更多"]))
+        xml = (f'<hierarchy rotation="0"><node index="0" class="android.widget.FrameLayout" '
+               f'package="{PKG}" bounds="[0,0][1080,2340]">'
+               f'<node index="1" class="androidx.recyclerview.widget.RecyclerView" '
+               f'scrollable="true" package="{PKG}" bounds="[0,200][1080,2100]">'
+               f'{row_simple("hi", 300)}</node>{bars}</node></hierarchy>')
+        f = parse_frame(xml)
+        self.assertEqual(f.page, "chat")
+        self.assertEqual([u.content for u in f.units], ["hi"])
+
+    def test_unknown_page_does_not_split(self):
+        """既没输入区也没识别出页面 → 按「不是聊天页」处理（安全优先）。"""
+        xml = (f'<hierarchy rotation="0"><node index="0" class="android.widget.FrameLayout" '
+               f'package="{PKG}" bounds="[0,0][1080,2340]">'
+               f'<node index="1" class="androidx.recyclerview.widget.RecyclerView" '
+               f'scrollable="true" package="{PKG}" bounds="[0,200][1080,2100]">'
+               f'{row_simple("hi", 300)}</node></node></hierarchy>')
+        f = parse_frame(xml)
+        self.assertEqual(f.page, "unknown")
+        self.assertEqual(f.units, [])
+
+    def test_group_info_page_is_not_chat(self):
+        xml = (f'<hierarchy rotation="0"><node index="0" class="android.widget.FrameLayout" '
+               f'package="{PKG}" bounds="[0,0][1080,2340]">'
+               f'<node index="1" text="搜索名字或群身份" class="android.widget.AutoCompleteTextView" '
+               f'package="{PKG}" bounds="[50,300][1030,400]"></node>'
+               f'<node index="2" class="androidx.recyclerview.widget.RecyclerView" '
+               f'scrollable="true" package="{PKG}" bounds="[0,420][1080,2100]">'
+               f'{row_simple("张三", 500)}</node></node></hierarchy>')
+        f = parse_frame(xml)
+        self.assertEqual(f.page, "other")
+        self.assertEqual(f.units, [])
 
 
 # ------------------------------------------------------------------ 帧差分

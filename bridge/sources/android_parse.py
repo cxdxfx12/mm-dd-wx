@@ -88,6 +88,29 @@ MAX_SPLIT_DEPTH = 6
 # 不该带它 —— 指纹那边也会把尾部的「机器人」去掉，这里提前对齐，展示才一致。
 ROBOT_TAG_RE = re.compile(r"\s+机器人$")
 
+# ---------------------------------------------------------------- 页面类型
+#
+# 手机端是「界面变就上报」，用户点开 @ 面板、群信息、搜索成员、会话列表时
+# 报上来的同样是**一个带很多文本的滚动列表**。这些人名/身份标签一旦被当成
+# 群消息转发到微信群，就是实打实的内容外泄（真机第二帧就是这么来的：
+# 「选择要@的人」面板被解析成 9 条消息）。所以在切分**之前**先判页面类型，
+# 判不准就一帧都不解析，也不动基线。
+#
+# 正向信号：聊天页底部输入区的提示语。这条最稳 —— 别的页面没有输入框。
+CHAT_HINTS = ("发消息或按住说话", "按住说话", "发送消息…", "发送消息...")
+# 备用正向信号：底部工具条上的固定入口。提示语文案被改掉时还能认出来。
+CHAT_TOOL_LABELS = frozenset({"表情", "图片", "更多"})
+# 反向信号：这些文案只在非聊天页出现，命中即一票否决。
+# 刻意只收**绝不会出现在聊天页**的字符串：
+#   · 不收「群聊信息」—— 它在聊天页是右上角图标的 content-desc；
+#   · 不收「搜索」「群管理」这类 —— 聊天页的菜单/图标也会带，
+#     误杀聊天页的后果是「程序在跑但一条不转」，比误转更难发现。
+# 用有序元组而不是集合：@ 面板同时含「选择要@的人」和「搜索名字或群身份」，
+# 集合的遍历顺序不定，日志里报哪个就不定 —— 排障时人会被误导。
+NON_CHAT_MARKERS = (
+    "选择要@的人", "搜索名字或群身份", "发起群聊", "选择联系人",
+)
+
 
 class ParseError(ValueError):
     """节点树不是 uiautomator 的形状 —— 让调用方给用户一句人话。"""
@@ -197,11 +220,44 @@ class Frame:
     container: str = ""
     rows: int = 0                                        # 列表子节点总数
     texts: int = 0                                       # 全树的带文本节点数
+    page: str = "chat"                                   # chat | other | unknown
+    page_reason: str = ""
     warnings: list[str] = field(default_factory=list)
 
     @property
     def fps(self) -> list[str]:
         return [u.fp for u in self.units]
+
+    @property
+    def is_chat(self) -> bool:
+        return self.page == "chat"
+
+
+def detect_page(root: Node) -> tuple[str, str]:
+    """判断这一屏是不是**聊天消息页**。返回 ``(kind, 依据)``。
+
+    手机端「界面变就上报」，用户点开 @ 面板／群信息／搜索时，报上来的是一个
+    塞满人名和身份标签的滚动列表 —— 结构与消息列表几乎一样。不先判页面，
+    这些人名就会被当成群消息发进微信群（真机第二帧正是这种情况）。
+
+    判定顺序：反向信号一票否决 → 正向信号 → 兜底 ``unknown``（一律按「不是
+    聊天页」处理，即不解析、不动基线）。
+    """
+    labels = [n.label for n in walk(root) if n.label]
+    joined = "\n".join(labels)
+
+    for marker in NON_CHAT_MARKERS:
+        if marker in joined:
+            return "other", f"页面上出现「{marker}」"
+
+    for hint in CHAT_HINTS:
+        if hint in joined:
+            return "chat", f"输入区提示语「{hint}」"
+
+    if CHAT_TOOL_LABELS.issubset(set(labels)):
+        return "chat", "底部工具条齐全（表情/图片/更多）"
+
+    return "unknown", "既没有输入区提示语，也没有已识别的非聊天页文案"
 
 
 def _leaves(node: Node) -> list[Node]:
@@ -534,6 +590,13 @@ def parse_frame(text: str) -> Frame:
         frame.warnings.append(
             f"这棵树里没有钉钉的包名 {TARGET_PKG}（看到的是 "
             f"{'、'.join(sorted(pkgs)) or '无'}）—— 手机端当时可能不在钉钉里")
+
+    # 先判页面，再切消息：@面板/群信息这些页面同样是「带很多文本的滚动列表」，
+    # 不判就会把人名、身份标签当成群消息原样发出去。
+    frame.page, frame.page_reason = detect_page(root)
+    if not frame.is_chat:
+        frame.warnings.append(f"当前不是聊天页（{frame.page_reason}）——本帧不解析")
+        return frame
 
     container = find_message_list(root)
     if container is None:

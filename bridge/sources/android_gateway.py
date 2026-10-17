@@ -78,6 +78,9 @@ DEFAULT_PORT = 8765
 # 每收到这么多帧画面打一条 INFO。帧率可能到 0.5/s，全打会把日志淹掉；
 # 全不打又会让「手机到底还在不在上报」变成一个查不出来的问题。
 SCREEN_LOG_EVERY = 30
+# 连续这么多帧都认不出「聊天页」→ 升到 WARNING（会触发钉钉告警）。
+# 认不出意味着一条都不转发，属于「程序在跑但静默失效」，必须让人知道。
+UNKNOWN_PAGE_ALERT_AFTER = 3
 
 TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                 "%m-%d %H:%M", "%H:%M")
@@ -248,6 +251,11 @@ class _Ctx:
     # 锚点，用来判「哪几条是新的」，所以必须跟 ctx 一起走、由同一把锁保护。
     parse: bool = False
     differ: FrameDiffer | None = None
+    # 上一次「不是聊天页，本帧跳过」的说明。用户点开 @ 面板会连着报好几帧，
+    # 内容一样就没必要重复写日志（日志是滚动文件，刷满了会盖掉真问题）。
+    last_skip_note: str = ""
+    # 连续多少帧认不出聊天页。只数「认不出来」，明确的 @ 面板/群信息不计。
+    skip_streak: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -516,6 +524,34 @@ class _Handler(BaseHTTPRequestHandler):
             log.warning("手机画面解析失败（这一帧跳过）：%s", exc)
             return [], "解析失败"
 
+        if not frame.is_chat:
+            # 用户点开了 @ 面板、群信息、搜索页 —— 屏上是一排排人名和身份标签，
+            # 结构和消息列表几乎一样。必须整帧丢掉，**连基线都不能动**：
+            # 拿这些人名当基线，回到聊天页时会把整屏旧消息判成新消息。
+            note = f"不是聊天页（{frame.page_reason}），本帧跳过"
+            if frame.page == "other":
+                # 明确的非聊天页（认出了「选择要@的人」这类文案）：这是用户的
+                # 正常操作，日志只能到 INFO —— WARNING 会被钉钉告警处理器抓走，
+                # 用户每点一次 @ 就收到一条手机告警。
+                self.ctx.skip_streak = 0
+                if note != self.ctx.last_skip_note:
+                    log.info("安卓画面解析：%s", note)
+                    self.ctx.last_skip_note = note
+            else:
+                # 认不出来的页面才是真问题：多半是钉钉改版把输入区文案改了，
+                # 那样会「程序在跑、一条不转」。连续几帧都认不出就升级成
+                # WARNING —— 让它进钉钉告警，别静默失效。
+                self.ctx.skip_streak += 1
+                if self.ctx.skip_streak == UNKNOWN_PAGE_ALERT_AFTER:
+                    log.warning(
+                        "连续 %d 帧认不出聊天页（%s）—— 钉钉可能改版了，"
+                        "现在一条消息都不会转发。用 tools/android_capture.py "
+                        "抓一帧看 page_reason", self.ctx.skip_streak, frame.page_reason)
+                    self.ctx.last_skip_note = note
+            return [], note
+
+        self.ctx.skip_streak = 0
+        self.ctx.last_skip_note = ""
         differ = self.ctx.differ
         if differ is None:
             differ = self.ctx.differ = FrameDiffer()

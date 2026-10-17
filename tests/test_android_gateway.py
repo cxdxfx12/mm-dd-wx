@@ -770,12 +770,16 @@ class TestScreenParse(GatewayCase):
 
     def screen(self, *rows):
         body = "".join(rows)
+        # 输入区必须在：解析器先判页面类型，认不出聊天页就一帧都不切
+        # （防的是「@面板的人名被当成群消息」）。
+        bar = (f'<node class="android.widget.TextView" package="{self.PKG}" '
+               f'text="发消息或按住说话..." bounds="[182,2191][981,2262]"></node>')
         return ('<?xml version="1.0" encoding="UTF-8"?><hierarchy rotation="0">'
                 f'<node class="android.widget.FrameLayout" package="{self.PKG}" '
                 f'bounds="[0,0][1080,2340]">'
                 f'<node class="androidx.recyclerview.widget.RecyclerView" '
                 f'package="{self.PKG}" scrollable="true" bounds="[0,200][1080,2100]">'
-                f'{body}</node></node></hierarchy>')
+                f'{body}</node>{bar}</node></hierarchy>')
 
     def post_frame(self, xml: str):
         req = urllib.request.Request(self.url("/screen"), data=xml.encode("utf-8"),

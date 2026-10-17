@@ -142,10 +142,15 @@ def preview_parse(path: Path, top: int = 20) -> None:
 
     for warn in frame.warnings:
         print(f"  ⚠ {warn}")
+    print(f"  页面类型 {frame.page}（{frame.page_reason}）")
     print(f"  容器 {frame.container or '(未找到)'} · 列表子节点 {frame.rows} 个 · "
           f"带文本节点 {frame.texts} 个")
     print(f"  识别出消息 {len(frame.units)} 条 · 时间分隔条 {len(frame.separators)} 个"
           f"{'（' + '、'.join(frame.separators[:5]) + '）' if frame.separators else ''}")
+    if not frame.is_chat:
+        print("  → 这一帧不是聊天页，后台解析会整帧跳过（这是对的：@面板/群信息里的人名"
+              "被当成消息转发出去，就是把不该发的发出去）")
+        return
     if not frame.units:
         print("  ⚠ 这一屏没有识别出任何消息 —— 多半停在会话列表页，或正文没被抓到")
         return
@@ -158,6 +163,75 @@ def preview_parse(path: Path, top: int = 20) -> None:
         print(f"    …（还有 {len(frame.units) - top} 条）")
     print("  说明：这只是**预览**，不会发任何东西。真开启后台解析时，"
           "第一帧只建基线（一条都不发）。")
+
+
+def watch_incremental(base: str, token: str, first: Path | None,
+                      count: int, md5: str) -> None:
+    """逐帧跑差分，打印「这一帧会新增几条」。
+
+    这是**唯一**能在不上线的前提下验证「不转发历史」的办法：手机每变一次
+    画面就报一帧，而真正决定发什么的是 :class:`FrameDiffer`。基线一帧、
+    增量一帧，两帧就能看出「第二条消息有没有被重复转发」。
+
+    刻意不发任何东西 —— 想看真实转发得开 ``android_parse``，那是另一回事。
+    """
+    from bridge.sources.android_parse import FrameDiffer, ParseError, parse_frame
+
+    differ = FrameDiffer()
+    if first is not None and first.exists():
+        try:
+            fr = parse_frame(first.read_text(encoding="utf-8"))
+        except (ParseError, OSError) as exc:
+            print(f"  起始帧读不出来（不影响后续）：{exc}")
+        else:
+            if fr.is_chat:
+                d = differ.feed(fr.units)
+                print(f"  [{datetime.now():%H:%M:%S}] 第 {count} 帧作基线："
+                      f"{len(fr.units)} 条（真开启时一条都不发）")
+
+    seen = count
+    try:
+        while True:
+            time.sleep(2.0)
+            code, body = get_screen(base, token)
+            if code != 200:
+                print(f"  网关回 {code}")
+                continue
+            meta = json.loads(body.decode("utf-8"))
+            now_count = int(meta.get("count", 0))
+            if now_count == seen:
+                continue
+            seen = now_count
+
+            stamp = f"[{datetime.now():%H:%M:%S}] 第 {now_count} 帧"
+            code, raw = get_screen(base, token, raw=True)
+            if code != 200:
+                print(f"  {stamp} · 取正文失败（{code}）")
+                continue
+            try:
+                fr = parse_frame(raw.decode("utf-8", "replace"))
+            except ParseError as exc:
+                print(f"  {stamp} · 解析失败：{exc}")
+                continue
+
+            if not fr.is_chat:
+                # @面板、群信息这些页面会在手机上报里出现，后台解析会整帧跳过；
+                # 这里保持一致，否则「预览说会发、线上不发」又是一次白排查。
+                print(f"  {stamp} · 不是聊天页（{fr.page_reason}）→ 后台会整帧跳过")
+                continue
+
+            diff = differ.feed(fr.units)
+            if diff.baseline:
+                print(f"  {stamp} · 基线重建：{len(fr.units)} 条，一条不发")
+            elif diff.anchor_lost:
+                print(f"  {stamp} · 锚点丢失（翻历史/换群/整屏换）→ 本帧不发，已重建基线")
+            else:
+                print(f"  {stamp} · 新增 {diff.count} 条（总 {len(fr.units)} 条）")
+                for unit in diff.units:
+                    body_txt = unit.content.replace("\n", "⏎")
+                    print(f"      + 发送者={unit.sender or '(空)'} :: {body_txt[:60]}")
+    except KeyboardInterrupt:
+        print("\n（结束）")
 
 
 def save_frame(base: str, token: str, args) -> Path | None:
@@ -189,7 +263,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--now", action="store_true",
                     help="不等，直接看当前最新一帧")
     ap.add_argument("--keep", action="store_true",
-                    help="收到后继续盯着（观察上报是否持续）")
+                    help="收到后继续盯着，并对每一帧跑差分：打印「这一帧会新增几条」"
+                         "（不上线也能验证「不转发历史」）")
     ap.add_argument("--out", default="", help="存到哪里，默认 data/screen-<时间>.xml")
     ap.add_argument("--file", default="",
                     help="不连手机：直接拿一个已存下的 XML 跑结构判定与解析预览"
@@ -340,25 +415,11 @@ def main(argv: list[str] | None = None) -> int:
         # --------------------------------------------------- 5. 继续盯
         if args.keep:
             print(LINE)
-            print("继续盯着（Ctrl+C 结束）")
-            last_count = int(first.get("count", 0))
-            last_md5 = str(first.get("md5", ""))
-            try:
-                while True:
-                    time.sleep(2.0)
-                    code, body = get_screen(base, token)
-                    if code != 200:
-                        print(f"  网关回 {code}")
-                        continue
-                    meta = json.loads(body.decode("utf-8"))
-                    count = int(meta.get("count", 0))
-                    if count != last_count:
-                        mark = "变化" if meta.get("md5") != last_md5 else "同前"
-                        print(f"  [{datetime.now():%H:%M:%S}] 第 {count} 帧 · {mark} · "
-                              f"{meta.get('texts', 0)} 条文本")
-                        last_count, last_md5 = count, str(meta.get("md5", ""))
-            except KeyboardInterrupt:
-                print("\n（结束）")
+            print("继续盯着（Ctrl+C 结束）—— 每来一帧都用正式解析器跑一遍差分，")
+            print("看「这一帧会新增几条」。**这不会发任何东西**，只打印判定结果。")
+            print(LINE)
+            watch_incremental(base, token, out, int(first.get("count", 0)),
+                              str(first.get("md5", "")))
         return 0
 
     finally:
