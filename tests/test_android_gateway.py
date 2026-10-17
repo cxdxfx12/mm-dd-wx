@@ -1011,6 +1011,46 @@ class TestScreenParse(GatewayCase):
         self.assertNotIn("hold", body)
         self.assertEqual(self.received[-1].content, "普通消息B")
 
+    # ---- 同一条卡片换了渲染形态，不许发第二遍 --------------------------
+    #
+    # 用户原话：「我手机往上翻页，会发重复的」。
+    # 真机（2026-10-17 拦截跟单日报）：同一张机器人卡片，表格有时解析成
+    # 横排「列名: 值 ｜ 列名: 值」，有时退化成一格一行。指纹不同 → uid 不同
+    # → 下游 is_duplicate 挡不住 → 18:07:03 和 18:07:07 各发了一次。
+
+    # 形态 A：表格识别成功（横排）
+    CARD_A = ("@所有人拦截跟单日报\n时间 2026/10/17 · 浙江杭州萧山区大江东公司\n"
+              "跟单概况\n指标\n10/13\n10/14\n10/15\n10/16\n10/17\n"
+              "跟单任务数\n30\n21\n23\n20\n17\n完成率\n93.33%\n90.48%\n"
+              "考核预警（近5日）\n未及时转出量\n0 票\n预计考核金额\n0 元")
+    # 形态 B：表格识别失败（一格一行，列顺序被打散）
+    CARD_B = ("@所有人拦截跟单日报\n时间 2026/10/17 · 浙江杭州萧山区大江东公司\n"
+              "跟单概况\n指标\n跟单任务数\n10/13\n30\n10/14\n21\n10/15\n23\n"
+              "10/16\n20\n10/17\n17\n完成率\n93.33%\n90.48%\n"
+              "考核预警（近5日）\n未及时转出量\n0 票\n预计考核金额\n0 元")
+
+    def test_reshaped_card_is_delivered_only_once(self):
+        """同一条卡片的两种渲染只能发一次 —— 这是用户报的那个重复。"""
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        a = self.post_frame(self.screen(self.row("旧消息A", 400),
+                                        self.row(self.CARD_A, 700)))
+        self.assertEqual(a["messages"], 1)
+        b = self.post_frame(self.screen(self.row("旧消息A", 400),
+                                        self.row(self.CARD_B, 700)))
+        self.assertEqual(b["messages"], 0, "换了渲染形态的同一条卡片又被发了一遍")
+        self.assertEqual(len(self.received), 1)
+
+    def test_different_report_with_new_numbers_still_goes_out(self):
+        """隔天的日报格式一样、数字不同 —— 必须照发（判重不能吃掉真消息）。"""
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        self.post_frame(self.screen(self.row("旧消息A", 400),
+                                    self.row(self.CARD_A, 700)))
+        changed = self.CARD_A.replace("93.33%", "88.10%")
+        body = self.post_frame(self.screen(self.row("旧消息A", 400),
+                                           self.row(changed, 700)))
+        self.assertEqual(body["messages"], 1)
+        self.assertEqual(len(self.received), 2)
+
 
 # --------------------------------------------------------------- 手机装 App
 

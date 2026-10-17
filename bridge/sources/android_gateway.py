@@ -63,7 +63,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from ..config import Config
-from ..fingerprint import fp_of
+from ..fingerprint import fp_of, is_same_message, norm_sender
 from ..models import MSG_TYPES, Message
 from .android_parse import (FrameDiffer, ParseError, needs_scroll, parse_frame,
                             units_to_messages)
@@ -88,6 +88,11 @@ UNKNOWN_PAGE_ALERT_AFTER = 3
 # 一条可能不完整的，也不能永远不发）。原生消息不经过这条路，延迟零增加。
 HOLD_MS = 800
 HOLD_MAX = 4
+# 「同一条卡片换了渲染形态」的近似去重窗口（秒）。
+# 实测两种形态的间隔：几分钟内来回切（上翻重绘、卡片重新渲染）。取 10 分钟
+# 足以覆盖，又短到不会误伤「人工故意在十分钟后再发一条一样的话」。
+# 机器人日报每天格式相同、数字不同，content_key 会保留全部数字，不会撞。
+NEAR_DUP_WINDOW = 600.0
 # 看门狗多久检查一次「手机还在不在」（秒）。比心跳间隔（手机端 60s）小得多，
 # 所以失联的发现延迟最多是「心跳间隔 + 这个 tick」。
 OFFLINE_TICK = 10.0
@@ -567,6 +572,10 @@ class _Ctx:
     hold_seen: int = 0
     # 不管 key 换没换都累计 —— 防「内容一直在长」导致永远扣住。
     hold_total: int = 0
+    # 最近投递过的消息 → (归一化发送者, 正文, 投递时刻)。用来拦「同一条卡片
+    # 换了渲染形态又被当成新消息」的重复转发：横排表格和一格一行的指纹不同、
+    # uid 不同，is_duplicate 挡不住，只能按**内容片段重合度**在时间窗内再挡一次。
+    recent_keys: dict = field(default_factory=dict)
     companies: list[str] = field(default_factory=list)
     on_message: MessageHandler | None = None
     count: dict = field(default_factory=lambda: {"requests": 0, "accepted": 0,
@@ -1169,16 +1178,47 @@ class _Handler(BaseHTTPRequestHandler):
         return above, "补全帧", False
 
     def _emit(self, units: list) -> int:
-        """把消息单元交给下游，返回成功条数。"""
+        """把消息单元交给下游，返回成功条数。
+
+        投递前多一道**近似去重**（见 ``fingerprint.is_same_message``）：同一条
+        钉钉机器人卡片在手机上会换渲染形态（表格横排 ↔ 一格一行），指纹跟着
+        变、uid 跟着变，下游的 ``is_duplicate`` 完全挡不住 —— 实测
+        2026-10-17 18:07:03 与 18:07:07 同一条「拦截跟单日报」被发了两遍，
+        用户的原话是「我手机往上翻页，会发重复的」。
+
+        只在 ``NEAR_DUP_WINDOW`` 秒内拦：机器人日报每天的**数字**不同
+        （判据保留全部数字，不会撞），但人工连发两条一样的「收到」是正常
+        操作，过了窗口就该照发。
+        """
         if not units or self.ctx.on_message is None:
             return 0
         msgs = units_to_messages(units, chat_name=self.ctx.chat_name or "",
                                  companies=self.ctx.companies)
+        now = time.monotonic()
         emitted = 0
         for msg in msgs:
+            sender = norm_sender(msg.sender_name)
+            with self.ctx.lock:
+                # 顺手清理过期的，dict 不会因为长期运行而无限长
+                for k, (_, _, at) in list(self.ctx.recent_keys.items()):
+                    if now - at > NEAR_DUP_WINDOW:
+                        del self.ctx.recent_keys[k]
+                dup_age = next(
+                    (now - at for s, old, at in self.ctx.recent_keys.values()
+                     if s == sender and is_same_message(old, msg.content)),
+                    None)
+            if dup_age is not None:
+                log.info("同一卡片换了渲染形态（%.0f 秒前已发过同一条），跳过：%s",
+                         dup_age, msg.content[:40].replace("\n", " "))
+                with self.ctx.lock:
+                    self.ctx.count["rejected"] += 1
+                continue
             try:
                 self.ctx.on_message(msg)
                 emitted += 1
+                with self.ctx.lock:
+                    self.ctx.recent_keys[msg.uid] = (sender, msg.content,
+                                                     time.monotonic())
             except Exception:                                  # 单条出错不拖垮整帧
                 log.exception("下游处理消息失败：%s", msg.uid)
         with self.ctx.lock:
