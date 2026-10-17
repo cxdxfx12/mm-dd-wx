@@ -943,6 +943,54 @@ class TestScreenParse(GatewayCase):
         self.assertEqual(self.received[-1].content, "新消息B")
 
 
+# --------------------------------------------------------------- 手机装 App
+
+class TestAppDownload(GatewayCase):
+    """``/app``（下载页）与 ``/app.apk``（安装包）。
+
+    为什么要走网关而不是让用户开个文件服务器：手机第一次装的时候**还没有
+    token**（token 要靠装完 App 才能填），所以这两个端点必须免鉴权；
+    而装完要手填的三项（IP / 端口 / token）直接印在页面上，
+    省掉「用肉眼把 24 位 token 从电脑抄到手机」这步最容易错的操作。
+    """
+
+    def get(self, path: str) -> tuple[int, str, bytes]:
+        with urllib.request.urlopen(self.url(path), timeout=5) as r:
+            return r.status, r.headers.get("Content-Type", ""), r.read()
+
+    def test_app_page_needs_no_token_and_shows_the_settings(self):
+        status, ctype, raw = self.get("/app")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", ctype)
+        html = raw.decode("utf-8")
+        # 三样必须能照着填
+        self.assertIn("IP 地址", html)
+        # 端口要印**本次实际监听的**那个，不能是写死的常量：
+        # 用户在设置里改过端口时，页面照着旧值显示，手机上填了必然连不上，
+        # 而且从 App 的报错里也看不出是端口错了。
+        self.assertIn(str(self.port), html)
+        self.assertNotIn(">8765<", html)
+        self.assertIn(self.token, html)
+
+    def test_apk_is_served_as_package_archive(self):
+        status, ctype, raw = self.get("/app.apk")
+        self.assertEqual(status, 200)
+        # 必须是 android 安装包的 MIME —— 否则手机浏览器会把它当文本打开
+        self.assertEqual(ctype, "application/vnd.android.package-archive")
+        self.assertEqual(raw[:2], b"PK")        # APK 就是 zip
+
+    def test_unknown_path_still_404(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.get("/nope")
+        self.assertEqual(ctx.exception.code, 404)
+
+    def test_screen_endpoint_still_requires_token(self):
+        """加下载页不能顺手把别的端点也放开 —— 画面里有群消息正文。"""
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.url("/screen"), timeout=5)
+        self.assertEqual(ctx.exception.code, 401)
+
+
 # --------------------------------------------------------------- 心跳与失联
 #
 # 这一层解决的是「程序在跑、但一条都不转，而且没人发现」——手机端 App 被系统
@@ -958,7 +1006,6 @@ MIN_FRAME = ('<?xml version="1.0" encoding="UTF-8"?><hierarchy rotation="0">'
 
 class TestHeartbeatEndpoint(GatewayCase):
     """心搏端点的行为锁死：谁能刷新「在线」，谁不能。"""
-
     def post_ping(self, token: str | None = TOKEN, device: str = "PAL-AL00"):
         req = urllib.request.Request(self.url("/ping"), data=b"{}",
                                      method="POST")

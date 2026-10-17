@@ -144,7 +144,12 @@ def build_payload(app_exe: Path) -> Path:
             continue
         dst = payload / item.name
         if item.is_dir():
-            expected |= {f"{item.name}/{r}" for r in copy_tree(item, dst)}
+            # android/dist 里是全套历史 APK（含旧版本）。安装版只需要第 4 步
+            # 挑出来的那一个，其余都是白占体积，而且旧包一旦被点到就会装上
+            # 缺手势权限的版本 —— 长消息补全当场失效。源码本身留着（才几十 KB），
+            # 出问题时能对着看。
+            ex = {"dist"} if item.name == "android" else None
+            expected |= {f"{item.name}/{r}" for r in copy_tree(item, dst, ex)}
         elif want(item):
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, dst)
@@ -158,6 +163,24 @@ def build_payload(app_exe: Path) -> Path:
     # 3) 主程序 exe
     shutil.copy2(app_exe, payload / app_exe.name)
     expected.add(app_exe.name)
+
+    # 4) 手机端 APK —— 放进 app/ 目录
+    #
+    # 手机装 App 走的是网关的 /app 页面（浏览器打开就能下），而安装版里
+    # 没有 android/ 源码目录，所以 APK 必须随安装包一起发下去。
+    # 位置与 gateway._apk_search_dirs() 里的「exe 同级 app/」一致。
+    apk_src = ROOT / "android" / "dist"
+    apks = sorted(apk_src.glob("*.apk"), key=lambda p: p.stat().st_mtime) \
+        if apk_src.is_dir() else []
+    if apks:
+        latest = apks[-1]
+        (payload / "app").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(latest, payload / "app" / latest.name)
+        expected.add(f"app/{latest.name}")
+        print(f"    手机端 APK：{latest.name}（{latest.stat().st_size // 1024} KB）")
+    else:
+        print("    ⚠ 没有找到 android/dist/*.apk —— 手机将无法用 /app 页面下载。"
+              "先在 android 目录跑一次 python build.py")
     total = len(expected)
 
     # 清掉上一轮遗留、本轮不再需要的文件（精准删除，不做整目录清除）

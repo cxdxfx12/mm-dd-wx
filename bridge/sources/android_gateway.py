@@ -52,11 +52,13 @@ import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -95,6 +97,151 @@ HEARTBEAT_GRACE = 120.0
 
 TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                 "%m-%d %H:%M", "%H:%M")
+
+
+# ------------------------------------------------------------------ 手机端下载
+
+def _find_apk() -> "Path | None":
+    """找最新编出来的 APK。
+
+    取 mtime 最新的那个 —— 重新编过之后不用再手动拷来拷去。
+    ``_APK_DIRS`` 为空时（比如单元测试里直接调）退回到自动探测，
+    不要因为「还没调 set_apk_dirs」就返回 None。
+    """
+    dirs = _APK_DIRS or _apk_search_dirs()
+    cands: list[Path] = []
+    for d in dirs:
+        try:
+            if d.is_dir():
+                cands.extend(p for p in d.glob("*.apk") if p.is_file())
+        except OSError:
+            continue
+    if not cands:
+        return None
+    return max(cands, key=lambda p: p.stat().st_mtime)
+
+
+_APK_DIRS: "list[Path]" = []
+
+
+def set_apk_dirs(dirs) -> None:
+    """由采集端在启动时告诉网关「去哪儿找 APK」。
+
+    不在这里直接算路径，是因为「程序目录在哪」是采集端才知道的事
+    （打包成 exe 之后与源码目录完全不同）。网关只负责吐文件。
+    """
+    global _APK_DIRS
+    _APK_DIRS = [Path(str(d)) for d in dirs]
+
+
+def _apk_search_dirs() -> list[Path]:
+    """可能放着 APK 的目录，按「越可能是最新的」排前面。
+
+    三种运行形态都要覆盖：
+      · 源码跑（``python -m ...``）—— 仓库里的 ``android/dist``；
+      · 安装版（PyInstaller exe）—— exe 同级的 ``app/``（安装时把 APK 放这里）；
+      · 开发机上直接用安装版 —— 两者都在，取 mtime 最新的那个。
+
+    ⚠ 不能用 ``__file__`` 推程序目录：打包后它指向临时解包目录，
+    用户往里放 APK 是白放。
+    """
+    out: list[Path] = []
+    here = Path(__file__).resolve()
+    # 源码：.../ddwx-bridge/bridge/sources/android_gateway.py → 上溯到仓库根
+    root = here.parents[2] if len(here.parents) > 2 else here.parent
+    out.append(root / "android" / "dist")
+    exe_dir = Path(sys.executable).resolve().parent
+    out.append(exe_dir / "app")
+    out.append(exe_dir)
+    # 去重且保序
+    seen, uniq = set(), []
+    for d in out:
+        key = str(d).lower()
+        if key not in seen:
+            seen.add(key)
+            uniq.append(d)
+    return uniq
+
+
+def _app_page(apk: "Path | None", ctx) -> str:
+    """手机浏览器打开的那个下载页。
+
+    刻意把「IP / 端口 / token」三样东西**直接印在页面上**：手机装完 App 要手填
+    这三项，而 token 是 24 位随机串，用肉眼从电脑抄到手机是最容易错的一步。
+    页面就在这里，照着抄（或长按复制）即可。
+    """
+    ips = lan_ips()
+    host = ips[0] if ips else "（没探测到，请在电脑上 ipconfig 查看）"
+    token = ctx.token or ""
+    if apk is not None:
+        size = apk.stat().st_size
+        when = time.strftime("%m-%d %H:%M", time.localtime(apk.stat().st_mtime))
+        download = f"""
+        <a class="btn" href="/app.apk?t={int(time.time())}">下载并安装 {apk.name}</a>
+        <p class="meta">{size // 1024} KB ｜ 编译于 {when}</p>
+        <p class="tip">下载完成后，在通知栏或「文件管理 → 下载」里点开这个文件安装。<br>
+        若提示「禁止安装未知应用」，按提示允许「浏览器」安装即可。</p>"""
+    else:
+        download = """
+        <div class="warn">电脑上还没找到 APK。<br>
+        请在 <code>ddwx-bridge/android</code> 下执行 <code>python build.py</code>
+        编译一次，然后刷新本页。</div>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>喵喵采集端 · 安装</title>
+<style>
+  :root {{ color-scheme: light; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; padding:20px 16px 40px; background:#f5f6f8; color:#1f2328;
+         font:16px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }}
+  .card {{ max-width:520px; margin:0 auto; background:#fff; border-radius:14px;
+           padding:22px 20px; box-shadow:0 1px 3px rgba(0,0,0,.08); }}
+  h1 {{ font-size:19px; margin:0 0 4px; }}
+  .sub {{ color:#6b7280; font-size:13px; margin:0 0 18px; }}
+  .btn {{ display:block; text-align:center; background:#07c160; color:#fff;
+          text-decoration:none; padding:15px; border-radius:10px;
+          font-weight:600; font-size:17px; margin:6px 0 10px; }}
+  .btn:active {{ background:#06ad56; }}
+  .meta {{ text-align:center; color:#9ca3af; font-size:12px; margin:0 0 14px; }}
+  .tip {{ color:#6b7280; font-size:13px; background:#f9fafb; padding:12px;
+          border-radius:8px; margin:0; }}
+  .warn {{ background:#fff7ed; color:#9a3412; padding:14px; border-radius:8px;
+           font-size:14px; }}
+  h2 {{ font-size:15px; margin:24px 0 10px; padding-top:18px;
+        border-top:1px solid #eef0f3; }}
+  .row {{ display:flex; align-items:center; padding:11px 0;
+          border-bottom:1px solid #f3f4f6; }}
+  .row:last-child {{ border-bottom:none; }}
+  .k {{ color:#6b7280; font-size:13px; width:88px; flex:none; }}
+  .v {{ font-family:ui-monospace,Menlo,Consolas,monospace; font-size:16px;
+        font-weight:600; word-break:break-all; user-select:all; }}
+  ol {{ padding-left:20px; margin:8px 0 0; color:#374151; font-size:14px; }}
+  ol li {{ margin:7px 0; }}
+  code {{ background:#f3f4f6; padding:1px 5px; border-radius:4px; font-size:13px; }}
+</style></head>
+<body><div class="card">
+  <h1>喵喵采集端</h1>
+  <p class="sub">把钉钉群消息自动转到微信的那台手机的采集程序</p>
+  {download}
+
+  <h2>装完后在 App 里填这三项</h2>
+  <div class="row"><span class="k">IP 地址</span><span class="v">{host}</span></div>
+  <div class="row"><span class="k">端口</span><span class="v">{ctx.port}</span></div>
+  <div class="row"><span class="k">token</span><span class="v">{token}</span></div>
+  {'<p class="meta" style="text-align:left;margin-top:10px">其它地址：' + "、".join(ips[1:]) + '</p>' if len(ips) > 1 else ''}
+
+  <h2>装好之后</h2>
+  <ol>
+    <li>打开 App，填上面三项，点「测试连接」，看到绿色「连通」即可。</li>
+    <li>点「打开系统无障碍设置」，打开「喵喵采集端·读钉钉」。</li>
+    <li><b>把无障碍开关关掉再重新打开一次</b> —— 新版加了手势权限，
+        不重开会导致长消息补全失败。</li>
+    <li>回 App，滚到底部把「保活」两个按钮都点一遍。</li>
+  </ol>
+</div></body></html>"""
 
 
 def _online_now(ctx: "_Ctx") -> bool:
@@ -382,6 +529,10 @@ def _screen_meta(screen: dict | None) -> dict:
 class _Ctx:
     token: str
     chat_name: str
+    # 网关实际监听的端口，`/app` 下载页要把这个数字印给用户看。
+    # 不能写死 8765：用户在设置里改过端口时，页面照着旧值显示，
+    # 手机上填了就是连不上，而且他没法从 App 里看出错在哪。
+    port: int = DEFAULT_PORT
     companies: list[str] = field(default_factory=list)
     on_message: MessageHandler | None = None
     count: dict = field(default_factory=lambda: {"requests": 0, "accepted": 0,
@@ -507,8 +658,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:                                 # noqa: N802
         path = self._path()
-        if path not in ("/", "/ping", "/screen"):
+        if path not in ("/", "/ping", "/screen", "/app", "/app.apk"):
             self._reply(404, {"ok": False, "error": "未知路径"})
+            return
+        # 下载页与 APK 本身**不要求 token**：手机第一次装的时候还没有 token
+        # （token 要靠装完 App 才能填），要求鉴权就永远装不上。
+        # 这两个端点只吐两个固定文件，不暴露任何消息内容，没有鉴权风险。
+        if path in ("/app", "/app.apk"):
+            self._serve_app(path)
             return
         if not self._auth_ok():
             self._reject_auth()
@@ -533,6 +690,50 @@ class _Handler(BaseHTTPRequestHandler):
                           "offline_after": self.ctx.offline_after,
                           "screen": _screen_meta(self.ctx.screen),
                           "stats": dict(self.ctx.count)})
+
+    # --- 手机端 APK 下载 ---
+
+    def _serve_app(self, path: str) -> None:
+        """``/app`` 给下载页，``/app.apk`` 给 APK 本体。
+
+        为什么放在网关里而不是起一个文件服务器：手机只要能在浏览器里打开
+        ``http://<电脑IP>:8765/``（本来就要填这个地址），就应该能顺手把 App 装好，
+        不必再传数据线、也不必修一个 FTP。
+        """
+        apk = _find_apk()
+        if path == "/app.apk":
+            if apk is None:
+                self._reply(404, {
+                    "ok": False, "error": "电脑上还没有 APK",
+                    "hint": "在 ddwx-bridge/android 下编译一次：python build.py"})
+                return
+            data = apk.read_bytes()
+            try:
+                self.send_response(200)
+                # 必须是 apk 专属 MIME：手机浏览器认这个才肯下载安装，
+                # 给成 octet-stream 有的 ROM 会存成无扩展名的文件。
+                self.send_header("Content-Type",
+                                 "application/vnd.android.package-archive")
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{apk.name}"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        self._html(200, _app_page(apk, self.ctx))
+
+    def _html(self, code: int, html: str) -> None:
+        data = html.encode("utf-8")
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _get_screen(self) -> None:
         """取最新一帧节点树。默认给 JSON 摘要，``?raw=1`` 给 XML 正文。"""
@@ -965,9 +1166,14 @@ class AndroidGatewaySource(Source):
             raise RuntimeError(why)
 
         ctx = _Ctx(token=self.token, chat_name=self.chat_name,
+                   port=self.port,
                    companies=self.companies, on_message=on_message,
                    parse=self.parse, offline_after=self.offline_after,
                    differ=FrameDiffer() if self.parse else None)
+
+        # 手机端 APK 下载（/app、/app.apk）。目录在这里算而不是写死在模块里：
+        # 打包成 exe 后模块文件在临时解包目录下，与用户看到的程序目录无关。
+        set_apk_dirs(_apk_search_dirs())
         self._stop.clear()
         try:
             server = _GatewayServer((self.host, self.port), _make_handler(ctx))
@@ -990,6 +1196,16 @@ class AndroidGatewaySource(Source):
                  self.port)
         log.info("  收消息 POST /messages ｜ 收画面 POST /screen ｜ "
                  "本机查最新画面 GET /screen?token=<token>&raw=1")
+        # 手机装 App 只需这一条地址：手机浏览器打开它就能下载，页面上还印着
+        # 该填的 IP / 端口 / token，省掉「用肉眼从电脑抄 24 位 token」这一步。
+        apk = _find_apk()
+        if apk is not None:
+            log.info("  手机装 App：浏览器打开 http://%s:%d/app  （当前包 %s，%d KB）",
+                     ips[0] if ips else "<本机IP>", self.port,
+                     apk.name, apk.stat().st_size // 1024)
+        else:
+            log.info("  手机装 App：/app 页面已就绪，但电脑上还没编出 APK —— "
+                     "在 android 目录跑一次 python build.py")
         if self.parse:
             log.info("  画面解析已开启（dingtalk.android_parse = true）："
                      "第一帧只建基线不转发，之后只转发基线之后的新消息")
