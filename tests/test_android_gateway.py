@@ -61,6 +61,7 @@ def make_cfg(port: int, token: str = TOKEN, **kw) -> Config:
         gateway_token=token,
         chat_names=kw.pop("chat_names", ["数字质控"]),
         companies=kw.pop("companies", []),
+        android_parse=kw.pop("android_parse", False),
     )
     return Config(dingtalk=dt, **kw)
 
@@ -227,10 +228,12 @@ class GatewayCase(unittest.TestCase):
     """起一个真网关，跑真 HTTP 请求。"""
 
     token = TOKEN
+    parse = False                       # 子类置 True 即开启画面解析
 
     def setUp(self):
         self.port = free_port()
-        self.source = AndroidGatewaySource(make_cfg(self.port, self.token))
+        self.source = AndroidGatewaySource(
+            make_cfg(self.port, self.token, android_parse=self.parse))
         self.received: list = []
         self.thread = threading.Thread(
             target=self.source.run, args=(self.received.append,), daemon=True)
@@ -738,6 +741,107 @@ class TestEndToEnd(unittest.TestCase):
         }]})
         self.assertEqual(body["accepted"], 1)
         self.assertEqual(len(self.target.sent), 1)
+
+
+class TestScreenParse(GatewayCase):
+    """``dingtalk.android_parse = true``：画面 → 消息。
+
+    这组锁的是「不转发历史」在网关侧的**唯一**实现：第一帧只建基线，
+    之后只发锚点之后的。弄错了就是用户往上翻一次历史、微信群被灌几百条。
+    """
+
+    parse = True
+    PKG = "com.alibaba.android.rimet"
+
+    # --- 造帧 ---
+    def row(self, text, top, sender=None):
+        if sender is None:
+            return (f'<node text="{text}" class="android.widget.TextView" '
+                    f'package="{self.PKG}" bounds="[80,{top}][1000,{top + 90}]"></node>')
+        return (f'<node class="android.widget.LinearLayout" package="{self.PKG}" '
+                f'bounds="[60,{top}][1020,{top + 180}]">'
+                f'<node text="{sender}" class="android.widget.TextView" '
+                f'package="{self.PKG}" bounds="[80,{top}][420,{top + 60}]"></node>'
+                f'<node class="android.widget.LinearLayout" package="{self.PKG}" '
+                f'bounds="[80,{top + 70}][1000,{top + 170}]">'
+                f'<node text="{text}" class="android.widget.TextView" '
+                f'package="{self.PKG}" bounds="[100,{top + 75}][980,{top + 165}]"></node>'
+                f'</node></node>')
+
+    def screen(self, *rows):
+        body = "".join(rows)
+        return ('<?xml version="1.0" encoding="UTF-8"?><hierarchy rotation="0">'
+                f'<node class="android.widget.FrameLayout" package="{self.PKG}" '
+                f'bounds="[0,0][1080,2340]">'
+                f'<node class="androidx.recyclerview.widget.RecyclerView" '
+                f'package="{self.PKG}" scrollable="true" bounds="[0,200][1080,2100]">'
+                f'{body}</node></node></hierarchy>')
+
+    def post_frame(self, xml: str):
+        req = urllib.request.Request(self.url("/screen"), data=xml.encode("utf-8"),
+                                     method="POST")
+        req.add_header("X-Bridge-Token", self.token)
+        req.add_header("Content-Type", "text/plain; charset=utf-8")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    # --- 用例 ---
+    def test_first_frame_only_builds_baseline(self):
+        body = self.post_frame(self.screen(
+            self.row("普通件滞留7天 96票", 400, "签收跟单专员"),
+            self.row("客户声音履约风险提醒", 700)))
+        self.assertEqual(body["messages"], 0)
+        self.assertEqual(body["note"], "已建立基线")
+        self.assertEqual(self.received, [])
+
+    def test_second_frame_with_new_message_is_forwarded_once(self):
+        base = self.screen(self.row("第一条", 400, "签收跟单专员"))
+        self.post_frame(base)
+        more = self.screen(self.row("第一条", 400, "签收跟单专员"),
+                           self.row("第二条", 700, "签收跟单专员"))
+        body = self.post_frame(more)
+        self.assertEqual(body["messages"], 1)
+        self.assertEqual(len(self.received), 1)
+        msg = self.received[0]
+        self.assertEqual(msg.sender_name, "签收跟单专员")
+        self.assertEqual(msg.content, "第二条")
+
+    def test_same_frame_twice_forwards_nothing_extra(self):
+        base = self.screen(self.row("第一条", 400))
+        self.post_frame(base)
+        self.post_frame(base)
+        self.assertEqual(self.received, [])
+
+    def test_time_separator_never_forwarded(self):
+        self.post_frame(self.screen(self.row("第一条", 400)))
+        body = self.post_frame(self.screen(
+            self.row("第一条", 400),
+            '<node text="09:12" class="android.widget.TextView" '
+            f'package="{self.PKG}" bounds="[500,600][600,640]"></node>',
+            self.row("第二条", 700)))
+        self.assertEqual(body["messages"], 1)
+        self.assertEqual([m.content for m in self.received], ["第二条"])
+
+    def test_scrolling_back_does_not_flood(self):
+        self.post_frame(self.screen(self.row("第五条", 400)))
+        body = self.post_frame(self.screen(
+            self.row("第一条", 300), self.row("第二条", 500), self.row("第三条", 700)))
+        self.assertEqual(body["messages"], 0)
+        self.assertEqual(body["note"], "锚点丢失")
+        self.assertEqual(self.received, [])
+
+    def test_broken_xml_returns_200_not_error(self):
+        """解析失败要回 200：回 4xx 手机会一直重传同一帧，只会刷满日志。"""
+        self.post_frame(self.screen(self.row("第一条", 400)))
+        body = self.post_frame("<hierarchy rotation=\"0\"><node></hierarchy>")
+        self.assertEqual(body["ok"], True)
+        self.assertEqual(body["messages"], 0)
+        self.assertEqual(body["note"], "解析失败")
+
+    def test_parse_off_by_default(self):
+        """默认（android_parse 未开）时 /screen 一条都不产生 —— 只收不转。"""
+        cfg = make_cfg(free_port(), TOKEN)
+        self.assertFalse(cfg.dingtalk.android_parse)
 
 
 if __name__ == "__main__":

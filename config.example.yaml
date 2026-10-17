@@ -56,6 +56,14 @@ dingtalk:
   # 用 python -c "import secrets;print(secrets.token_urlsafe(24))" 生成。
   gateway_token: ""
 
+  # 是否把手机报来的节点树解析成消息并转发。
+  # false（默认）= 网关只负责「收」，程序不会转发任何东西 —— 手机报的只是画面。
+  # 开启前务必先用 tools/android_capture.py 看过一帧真实画面的「解析预览」：
+  #   python tools/android_capture.py
+  # 只有条数与屏幕上一致、发送者与正文分得开，才把这里改成 true。
+  # 开启后第一帧只建基线（一条都不发），之后只转发基线之后的新消息。
+  android_parse: false
+
 # 微信投递端
 wechat:
   # true = 只打印不真发，用于联调；确认无误后改 false

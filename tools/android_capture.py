@@ -125,6 +125,41 @@ def analyze(path: Path, top: int) -> None:
     an.report(an.load(path), top)
 
 
+def preview_parse(path: Path, top: int = 20) -> None:
+    """用**正式解析器**跑一遍这一帧，把「将来真会转发什么」摆出来。
+
+    结构判定（:func:`analyze`）回答「这棵树长什么样」，这里回答「它会变成
+    哪几条消息」——后者才是决定能不能开 ``android_parse`` 的依据。两者都跑，
+    是因为形状对但切分错（把昵称当正文、把时间条当消息）在现场极难发现。
+    """
+    from bridge.sources.android_parse import ParseError, parse_frame
+
+    try:
+        frame = parse_frame(path.read_text(encoding="utf-8"))
+    except (ParseError, OSError) as exc:
+        print(f"  这一帧解析不了：{exc}")
+        return
+
+    for warn in frame.warnings:
+        print(f"  ⚠ {warn}")
+    print(f"  容器 {frame.container or '(未找到)'} · 列表子节点 {frame.rows} 个 · "
+          f"带文本节点 {frame.texts} 个")
+    print(f"  识别出消息 {len(frame.units)} 条 · 时间分隔条 {len(frame.separators)} 个"
+          f"{'（' + '、'.join(frame.separators[:5]) + '）' if frame.separators else ''}")
+    if not frame.units:
+        print("  ⚠ 这一屏没有识别出任何消息 —— 多半停在会话列表页，或正文没被抓到")
+        return
+
+    for i, unit in enumerate(frame.units[:top]):
+        body = unit.content.replace("\n", "⏎")
+        print(f"    [{i}] 发送者={unit.sender or '(空)':<10s} 类型={unit.kind:<5s} "
+              f"{body[:60]}")
+    if len(frame.units) > top:
+        print(f"    …（还有 {len(frame.units) - top} 条）")
+    print("  说明：这只是**预览**，不会发任何东西。真开启后台解析时，"
+          "第一帧只建基线（一条都不发）。")
+
+
 def save_frame(base: str, token: str, args) -> Path | None:
     code, raw = get_screen(base, token, raw=True)
     if code != 200:
@@ -158,6 +193,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out", default="", help="存到哪里，默认 data/screen-<时间>.xml")
     ap.add_argument("--top", type=int, default=25, help="判定时打印前多少个文本节点")
     ap.add_argument("--no-analyze", action="store_true", help="只存不做结构判定")
+    ap.add_argument("--no-preview", action="store_true",
+                    help="不做解析预览（预览=用正式解析器跑一遍，看会切成哪几条消息）")
     return ap
 
 
@@ -268,6 +305,18 @@ def main(argv: list[str] | None = None) -> int:
             print("  · 消息被拆成一堆散落的 TextView（发送者、时间、正文各自独立、")
             print("    没有共同父节点）→ 得靠坐标聚类，先别写解析器，把这一帧发我")
             print("  · 一条文本都没有 → 钉钉在这一页没暴露节点树，回到 OCR 方案")
+
+        if out and not args.no_preview:
+            print(LINE)
+            print("解析预览（用正式解析器跑这一帧 —— 这才是决定能不能开 android_parse 的东西）")
+            print(LINE)
+            preview_parse(out, args.top)
+            print(LINE)
+            print("怎么判断能不能开：")
+            print("  · 条数与屏幕上肉眼看到的条数一致、发送者与正文分开 → 可以开")
+            print("    （config.yaml 的 dingtalk.android_parse 改成 true）")
+            print("  · 正文被切掉一行、或发送者里混着正文 → 先别开，把这一帧发我调判据")
+            print("  · 时间条（09:12 这类）出现在消息里 → 解析器有 bug，别开")
 
         # --------------------------------------------------- 5. 继续盯
         if args.keep:

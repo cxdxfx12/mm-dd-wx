@@ -21,10 +21,15 @@
     手机端没带 `fp` 时本模块用 `bridge.fingerprint` 补算 —— 与 OCR 路径
     **同一份实现**，避免两边算法漂移导致同一条消息被采两次。
 
-时间过滤
-    网关**不做**时间过滤，也不建基线 —— 这两件事由手机端完成（它自己知道
-    哪些是新消息）。服务端再判一次反而会把「手机离线一夜、恢复后补报」的
-    消息当历史丢掉。
+时间过滤与基线
+    走 ``/messages`` 时这两个判断由手机端完成（它自己知道哪些是新消息），本模块
+    不再判 —— 再判一次反而会把「手机离线一夜、恢复后补报」的消息当历史丢掉。
+
+    走 ``/screen`` 时情况相反：手机端只送「这一屏长什么样」，判新老只能在电脑侧做。
+    这时由 ``dingtalk.android_parse`` 开关决定是否启用
+    :class:`bridge.sources.android_parse.FrameDiffer` —— 它第一帧只建基线（一条
+    不发），之后只转发基线（锚点）之后的部分。默认关闭：没看过真机画面的解析
+    结果之前不要开，否则可能把认错的文本当真消息发进微信群。
 
 两个端点
     ``POST /messages``
@@ -32,9 +37,10 @@
 
     ``POST /screen``  /  ``GET /screen``
         手机端只把当前界面的**无障碍节点树 XML** 原样送上来（格式与
-        ``adb shell uiautomator dump`` 一致），解析、判新老、去重的活儿全留在
-        电脑侧。这条路的好处是改规则不用重装手机；``GET /screen`` 取最新一份
-        （``?raw=1`` 拿正文，不带就用 JSON 摘要），是排障和分析节点结构的入口。
+        ``adb shell uiautomator dump`` 一致）。``dingtalk.android_parse = true``
+        时本模块负责解析、判新老，再交给下游；= false 时只存不解析。
+        ``GET /screen`` 取最新一份（``?raw=1`` 拿正文，不带就用 JSON 摘要），
+        是排障和分析节点结构的入口。
 
     两条路可以同时存在，互不影响。
 """
@@ -57,6 +63,8 @@ from urllib.parse import parse_qs, urlparse
 from ..config import Config
 from ..fingerprint import fp_of
 from ..models import MSG_TYPES, Message
+from .android_parse import (FrameDiffer, ParseError, parse_frame,
+                            units_to_messages)
 from .base import MessageHandler, Source, infer_company
 
 log = logging.getLogger("bridge.source.android")
@@ -236,6 +244,10 @@ class _Ctx:
     # 最新一帧节点树。只留最新一份：这一层的语义就是「手机现在长什么样」，
     # 历史帧由解析器自己按需比对，网关不做序列缓存。
     screen: dict | None = None
+    # 帧解析（dingtalk.android_parse 才开启）。differ 有状态 —— 它记着上一帧的
+    # 锚点，用来判「哪几条是新的」，所以必须跟 ctx 一起走、由同一把锁保护。
+    parse: bool = False
+    differ: FrameDiffer | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -444,6 +456,13 @@ class _Handler(BaseHTTPRequestHandler):
                 "count": count,
             }
             self.ctx.screen = screen
+            # 解析 + 判新老都在这把锁里：帧必须**按到达顺序**喂给 FrameDiffer，
+            # 否则两帧并发时锚点会错位，表现为偶尔漏发或重复发。这两步是纯
+            # 内存计算（几毫秒），占锁时间可控。
+            pending: list = []
+            note = ""
+            if self.ctx.parse and self.ctx.on_message is not None:
+                pending, note = self._ingest(text)
 
         if count == 1:
             log.info("收到第一帧手机画面：%d 字节，%d 条文本（来自 %s）",
@@ -455,8 +474,68 @@ class _Handler(BaseHTTPRequestHandler):
             log.debug("画面 #%d：%d 字节，%d 条文本，md5=%s",
                       count, length, texts, screen["md5"][:8])
 
-        self._reply(200, {"ok": True, "bytes": length, "count": count,
-                          "md5": screen["md5"]})
+        # 投递在锁外：下游 on_message 会同步等微信把消息发出去（可能几秒），
+        # 占着锁会把 GET /screen 和手机的下一次上报一起卡住。
+        emitted = self._emit(pending)
+
+        body = {"ok": True, "bytes": length, "count": count,
+                "md5": screen["md5"]}
+        if self.ctx.parse:
+            # 手机端日志里直接能看到「这一帧有没有产生转发」，省得两头对时间
+            body["messages"] = emitted
+            if note:
+                body["note"] = note
+        self._reply(200, body)
+
+    # --- 画面解析（仅 dingtalk.android_parse = true）---
+
+    def _ingest(self, text: str) -> tuple[list, str]:
+        """一帧节点树 → 本帧**新增**的消息单元。返回 ``(单元列表, 说明)``。
+
+        解析失败**不能**回 4xx/5xx：手机端收到错误会重传同一帧，而这一帧的
+        形状问题是重传解决不了的，只会把日志刷满。所以记一条 WARNING、
+        照常回 200，让采集继续。
+        """
+        try:
+            frame = parse_frame(text)
+        except ParseError as exc:
+            log.warning("手机画面解析失败（这一帧跳过）：%s", exc)
+            return [], "解析失败"
+
+        differ = self.ctx.differ
+        if differ is None:
+            differ = self.ctx.differ = FrameDiffer()
+        diff = differ.feed(frame.units)
+
+        if diff.baseline:
+            log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
+                     "此后只转发基线之后的新消息", len(frame.units))
+            return [], "已建立基线"
+        if diff.anchor_lost:
+            log.warning("安卓画面解析：上一帧的锚点在本帧里找不到（翻历史／换群／"
+                        "一屏全换）—— 本帧不转发，基线已重建到当前画面")
+            return [], "锚点丢失"
+        return list(diff.units), ""
+
+    def _emit(self, units: list) -> int:
+        """把消息单元交给下游，返回成功条数。"""
+        if not units or self.ctx.on_message is None:
+            return 0
+        msgs = units_to_messages(units, chat_name=self.ctx.chat_name or "",
+                                 companies=self.ctx.companies)
+        emitted = 0
+        for msg in msgs:
+            try:
+                self.ctx.on_message(msg)
+                emitted += 1
+            except Exception:                                  # 单条出错不拖垮整帧
+                log.exception("下游处理消息失败：%s", msg.uid)
+        with self.ctx.lock:
+            self.ctx.count["accepted"] += emitted
+        if emitted:
+            head = msgs[0].content[:40].replace("\n", " ")
+            log.info("安卓画面新增 %d 条消息：%s", emitted, head)
+        return emitted
 
 
 def _make_handler(ctx: _Ctx):
@@ -494,6 +573,7 @@ class AndroidGatewaySource(Source):
         except (TypeError, ValueError):
             self.port = DEFAULT_PORT
         self.token = str(getattr(dt, "gateway_token", "") or "").strip()
+        self.parse = bool(getattr(dt, "android_parse", False))
         self.chat_name = (dt.chat_names or [""])[0] if dt.chat_names else ""
         self.companies = list(dt.companies or [])
 
@@ -529,7 +609,9 @@ class AndroidGatewaySource(Source):
             raise RuntimeError(why)
 
         ctx = _Ctx(token=self.token, chat_name=self.chat_name,
-                   companies=self.companies, on_message=on_message)
+                   companies=self.companies, on_message=on_message,
+                   parse=self.parse,
+                   differ=FrameDiffer() if self.parse else None)
         self._stop.clear()
         try:
             server = _GatewayServer((self.host, self.port), _make_handler(ctx))
@@ -552,9 +634,15 @@ class AndroidGatewaySource(Source):
                  self.port)
         log.info("  收消息 POST /messages ｜ 收画面 POST /screen ｜ "
                  "本机查最新画面 GET /screen?token=<token>&raw=1")
-        log.warning("  注意：本模式**只负责收**。手机报上来的是消息还是画面，"
-                    "决定了下游有没有东西可转发 —— 只收到画面时程序不会自动解析，"
-                    "别把「网关在收」当成「业务在转」。")
+        if self.parse:
+            log.info("  画面解析已开启（dingtalk.android_parse = true）："
+                     "第一帧只建基线不转发，之后只转发基线之后的新消息")
+        else:
+            log.warning("  注意：本模式**只负责收**。手机报上来的是消息还是画面，"
+                        "决定了下游有没有东西可转发 —— 只收到画面时程序不会自动解析，"
+                        "别把「网关在收」当成「业务在转」。"
+                        "要开启解析：config.yaml 的 dingtalk.android_parse 设为 true"
+                        "（先用 tools/android_capture.py 看过一帧真实画面的解析结果）")
 
         try:
             server.serve_forever(poll_interval=0.5)
