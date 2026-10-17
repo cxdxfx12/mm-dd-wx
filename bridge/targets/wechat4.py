@@ -122,6 +122,42 @@ class WeChat4Target(Target):
         self._uia = uia
         return uia
 
+    @staticmethod
+    def _qt_shell_present() -> bool:
+        """屏幕上是否有一个「微信的 Qt 壳窗口」——有它却没 mmui 主窗口，是已知故障态。
+
+        实测（2026-10-17）：微信 4.1.15.13 在某些启动/托盘往返之后，主窗口会变成
+        ``Qt51514QWindowIcon`` 的**自绘壳**（里面嵌 ``MMUIRenderSubWindowHW``，
+        UI 自动化子树是空的）。此时屏幕上看得到微信、用起来一切正常，但程序一个
+        控件都读不到。**完全退出微信再重新打开**即恢复，不需要改代码。
+
+        没有这条判断，现场表现就是「读不到主窗口，请把窗口从托盘唤回」——而窗口
+        根本没在托盘里，人会把时间全花在按热键上。
+        """
+        if _user32 is None:
+            return False
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def cb(hwnd, _lparam):
+            try:
+                buf = ctypes.create_unicode_buffer(256)
+                _user32.GetClassNameW(hwnd, buf, 256)
+                cls = buf.value or ""
+            except Exception:
+                return True
+            if cls.startswith("Qt5") and cls.endswith("QWindowIcon"):
+                n = _user32.GetWindowTextLengthW(hwnd)
+                if n:
+                    title = ctypes.create_unicode_buffer(n + 1)
+                    _user32.GetWindowTextW(hwnd, title, n + 1)
+                    if "微信" in (title.value or ""):
+                        found.append(hwnd)
+            return True
+
+        _user32.EnumWindows(cb, 0)
+        return bool(found)
+
     def _window(self):
         """定位微信 4.x 主窗口，带缓存与重连。"""
         if self._wnd is not None:
@@ -134,6 +170,11 @@ class WeChat4Target(Target):
 
         wnd = self._find_window()
         if wnd is None:
+            if self._qt_shell_present():
+                raise RuntimeError(
+                    "微信窗口在屏幕上，但**自动化读不到里面的控件** —— 微信这次的"
+                    "主窗口是个自绘空壳（已知故障态）。请**完全退出微信**（托盘图标"
+                    "右键 → 退出）再重新打开，程序会自动恢复，不用改任何配置")
             raise RuntimeError(
                 f"未找到微信 4.x 主窗口（{self.WINDOW_CLASS}）。请确认微信已启动并登录，"
                 "且**主窗口没有被收进托盘**（按 Esc 或点最小化都会这样，窗口在系统里会"
@@ -143,9 +184,15 @@ class WeChat4Target(Target):
         return wnd
 
     def _find_window(self):
-        """找主窗口，找不到返回 None（不像 `_window` 那样抛异常）。"""
+        """找主窗口，找不到返回 None（不像 `_window` 那样抛异常）。
+
+        **只吞「找不到窗口」这一类异常**。``_load_uia`` 抛出的 ImportError /
+        FileNotFoundError 必须原样往上走 —— 那是「环境不对」，跟微信窗口无关；
+        以前一律 return None，现场就变成「读不到微信主窗口，请把窗口从托盘唤回」，
+        人照着点托盘、按热键折腾半天，真正的原因是解释器里没有 comtypes。
+        """
+        uia = self._load_uia()
         try:
-            uia = self._load_uia()
             wnd = uia.WindowControl(ClassName=self.WINDOW_CLASS, searchDepth=1)
         except Exception:
             return None
@@ -160,7 +207,11 @@ class WeChat4Target(Target):
             except Exception:
                 pass
             self._wnd = None
-        return self._find_window() is not None
+        try:
+            return self._find_window() is not None
+        except Exception:
+            # UI 自动化库都加载不了，谈不上「窗口在不在」；health_check 会先报这个。
+            return False
 
     # ---------- 窗口可见性护栏 ----------
 
@@ -801,9 +852,25 @@ class WeChat4Target(Target):
         未打开任何会话时右侧是占位页，输入框与消息列表都不存在——这是
         正常状态（发送时会先点击会话再输入），不能据此判失败。
         """
-        # 先区分「窗口根本不在/被最小化」——这两种状态下坐标和标题都是陈旧的，
+        # 先确认 UI 自动化库本身能用。这一条必须在「窗口在不在」之前判断：
+        # 环境不对时窗口明明好好的，报「窗口被收进托盘」会把排障方向带偏。
+        try:
+            self._load_uia()
+        except Exception as exc:
+            return False, (
+                f"UI 自动化库加载失败：{type(exc).__name__}: {exc} —— 这跟微信窗口"
+                f"无关，是**运行环境**问题：多半是当前 Python 解释器缺 comtypes，"
+                f"或 wxauto 路径配错了。请用 app/_env.json 里记录的 worker 解释器"
+                f"启动（安装版会自动选对）")
+
+        # 再区分「窗口根本不在/被最小化」——这两种状态下坐标和标题都是陈旧的，
         # 报一句「控件结构可能已变更」会把用户带偏。
         if not self._wnd_present():
+            if self._qt_shell_present():
+                return False, ("微信窗口在屏幕上，但**自动化读不到里面的控件** —— "
+                               "这次的主窗口是个自绘空壳（已知故障态）。请完全退出"
+                               "微信（托盘图标右键 → 退出）再重新打开，程序会自动"
+                               "恢复，不用改任何配置")
             return False, ("读不到微信主窗口 —— 多半是被收进了托盘（按 Esc 或点了"
                            "最小化都会这样）。请点开微信主窗口，或用「显示/隐藏"
                            "主窗口」快捷键唤回后重试")

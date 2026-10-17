@@ -464,6 +464,40 @@ class TestConfigPlumbing(unittest.TestCase):
             self.assertEqual(cfg.wechat.show_hotkey, WeChat4Target.DEFAULT_SHOW_HOTKEY)
 
 
+class TestHealthCheckDiagnosis(unittest.TestCase):
+    """探活必须把「环境不对」和「微信窗口不在」分开报。
+
+    现场踩过（2026-10-17）：用缺 comtypes 的解释器启动，UIA 加载失败被当成
+    「找不到窗口」，于是报「读不到微信主窗口，请把窗口从托盘唤回」。窗口明明
+    就在屏幕上，人照着点托盘、按热键折腾了二十分钟才找到真正原因。
+    错误信息的指向性本身就是可用性的一部分。
+    """
+
+    def test_missing_comtypes_is_reported_as_environment(self):
+        tgt = make_target()
+
+        def boom():
+            raise ModuleNotFoundError("No module named 'comtypes'")
+
+        tgt._load_uia = boom                       # type: ignore[assignment]
+        ok, why = tgt.health_check()
+        self.assertFalse(ok)
+        self.assertIn("comtypes", why)
+        self.assertIn("环境", why)
+        self.assertNotIn("托盘", why, "缺依赖被说成「窗口在托盘」会把排障带偏")
+
+    def test_find_window_does_not_swallow_import_error(self):
+        """_find_window 只吞「找不到窗口」，不能把 ImportError 一起吞掉。"""
+        tgt = make_target()
+
+        def boom():
+            raise ModuleNotFoundError("No module named 'comtypes'")
+
+        tgt._load_uia = boom                       # type: ignore[assignment]
+        with self.assertRaises(ModuleNotFoundError):
+            tgt._find_window()
+
+
 class TestConstants(unittest.TestCase):
     def test_sane_constants(self):
         self.assertGreater(MIN_WINDOW_SIDE, 50)
