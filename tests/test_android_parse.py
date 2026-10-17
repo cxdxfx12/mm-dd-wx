@@ -682,6 +682,61 @@ class TestFrameDiffer(unittest.TestCase):
         diff = d.feed(self.units(("a", "1"), ("a", "2"), ("a", "3")))
         self.assertEqual([u.content for u in diff.units], ["3"])
 
+    # ---- 锚点的**近似**匹配 ------------------------------------------
+    #
+    # 真机事故（2026-10-17，一小时 46 次锚点丢失）：H5 卡片重绘会让同一条
+    # 消息的正文变样 —— 表格有时横排「指标: 30 ｜ 21」、有时一格一行。
+    # 而这条卡片往往就是屏幕最后一条 = 锚点本身。它一变，锚点立刻「丢失」，
+    # 网关静默重建基线、这一屏不发。用户看到的是「消息没转过来，手动上翻
+    # 一下又转了」—— 上翻让卡片重新渲染，正好蒙对了某一种形态。
+
+    # 同一条卡片两种形态的真实正文（截取关键段，>30 字才会参与近似）
+    CARD_A = ("@所有人拦截跟单日报\n时间 2026/10/17 · 浙江杭州萧山区大江东公司\n"
+              "跟单概况\n指标\n10/13\n10/14\n10/15\n10/16\n10/17\n"
+              "跟单任务数\n30\n21\n23\n20\n17\n完成率\n93.33%\n90.48%")
+    CARD_B = ("@所有人拦截跟单日报\n时间 2026/10/17 · 浙江杭州萧山区大江东公司\n"
+              "跟单概况\n指标\n跟单任务数\n10/13\n30\n10/14\n21\n10/15\n23\n"
+              "10/16\n20\n10/17\n17\n完成率\n93.33%\n90.48%")
+
+    def test_anchor_survives_card_reshape(self):
+        """锚点卡片换了渲染形态，不能再判「锚点丢失」。"""
+        d = FrameDiffer()
+        d.feed(self.units(("拦截跟单专员", self.CARD_A)))
+        diff = d.feed(self.units(("拦截跟单专员", self.CARD_B)))
+        self.assertFalse(diff.anchor_lost, "卡片换形态被误判成锚点丢失")
+        self.assertEqual(diff.count, 0, "换形态不该产生新消息")
+
+    def test_reshape_then_new_message_still_emitted(self):
+        """换形态之后紧跟的新消息要照常发 —— 这才是用户看到的「漏发」。"""
+        d = FrameDiffer()
+        d.feed(self.units(("拦截跟单专员", self.CARD_A)))
+        new_msg = "@所有人 履约-客户声音晚报 · 10月17日，今天共处理 42 单，请核对。"
+        diff = d.feed(self.units(("拦截跟单专员", self.CARD_B),
+                                 ("履约跟单专员", new_msg)))
+        self.assertFalse(diff.anchor_lost)
+        self.assertEqual([u.content for u in diff.units], [new_msg])
+
+    def test_history_scroll_still_blocked_for_long_messages(self):
+        """近似匹配不能把「翻历史」放进来 —— 真正对不上时仍必须保护。"""
+        d = FrameDiffer()
+        d.feed(self.units(("a", "今天的最新消息，讲的是完全不同的内容，一共 42 单。"),
+                          ("a", "另一条也不同的消息，说的是明天要处理的 17 票。"),
+                          ("a", "再来一条不一样的，关于考核金额的说明与提醒事项。"),
+                          ("a", "最后一条也不太一样，告诉大家好今天已经全部完成。")))
+        diff = d.feed(self.units(("a", "很久以前的旧消息，内容是八月的积压情况一共 99 票。"),
+                                 ("a", "更早的一条，说的是七月的派送异常与处理结果。"),
+                                 ("a", "再早一点，六月的考核结果与奖惩说明写得比较长。")))
+        self.assertTrue(diff.anchor_lost, "翻历史被近似匹配放行了")
+        self.assertEqual(diff.count, 0)
+
+    def test_short_messages_do_not_get_near_matching(self):
+        """短消息不走近似 —— 否则「收到」「好的」会把锚点吸到错误的行上。"""
+        d = FrameDiffer()
+        d.feed(self.units(("a", "收到")))
+        diff = d.feed(self.units(("a", "好的"), ("a", "收到"), ("a", "新的正文内容")))
+        # 精确匹配应该命中「收到」这一条，而不是把「好的」误当锚点
+        self.assertEqual([u.content for u in diff.units], ["新的正文内容"])
+
 
 # ------------------------------------------------------------------ 表格消息
 

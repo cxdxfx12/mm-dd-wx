@@ -36,7 +36,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from ..fingerprint import unit_fp
+from ..fingerprint import is_same_message, norm_sender, unit_fp
 from ..models import Message
 from .base import infer_company
 
@@ -1016,6 +1016,9 @@ class FrameDiffer:
     def __init__(self, tail: int = 20):
         self.tail = max(1, tail)
         self._anchor: list[str] = []
+        # 锚点的**正文**（与 _anchor 一一对应）。精确指纹对不上时用它做近似
+        # 匹配 —— 见 _locate 里「锚点为什么需要近似」的说明。
+        self._anchor_text: list[tuple[str, str]] = []
         self.baseline_built = False
         self.frames = 0
 
@@ -1062,22 +1065,58 @@ class FrameDiffer:
     def reset(self) -> None:
         """换群/重启采集时清空基线（下一帧重新建基线，不会补发历史）。"""
         self._anchor = []
+        self._anchor_text = []
         self.baseline_built = False
 
     # --- 内部 ---
 
     def _remember(self, units: list[Unit]) -> None:
-        self._anchor = [u.fp for u in units[-self.tail:]]
+        tail = units[-self.tail:]
+        self._anchor = [u.fp for u in tail]
+        self._anchor_text = [(u.sender, u.content) for u in tail]
         self.baseline_built = True
 
     def _locate(self, units: list[Unit]) -> int:
-        """在 ``units`` 里找锚点（从尾部往前找，取最靠后的匹配）。"""
+        """在 ``units`` 里找锚点，返回它的下标；找不到返回 -1。
+
+        先做**精确**指纹匹配（快、零风险）；都不中再做一次**近似**匹配。
+
+        ── 锚点为什么需要近似 ──────────────────────────────────────
+        精确匹配要求「字面完全一样」，而真机上同一条消息的字面会变：
+
+          · **H5 卡片重绘**：同一条机器人消息，表格有时渲染成横排
+            「指标: 30 ｜ 21」、有时退化成一格一行「指标 / 30 / 21」。
+            而这条卡片往往就是屏幕最后一条 = 锚点本身。它一变，锚点立刻
+            「丢失」（实测 2026-10-17 一小时丢了 46 次）。
+          · **长消息**：卡片整体高度随渲染变化，把它推出/推入屏幕时，
+            露出来的那段正文也不一样。
+
+        锚点丢失的后果不是报错，而是**静默重建基线、这一屏不发**。用户
+        看到的现象就是「消息没转过来，手动上翻一下又转了」—— 上翻会让
+        卡片重新渲染，正好蒙对了某一种形态。这是碰运气，不是修复。
+
+        所以精确失败后，用 ``is_same_message``（片段集合完全相等）再找一次。
+        判据和投递口的近似去重是同一份实现 —— 不能这边认、那边不认，否则
+        会出现「锚点认出来了，但发出去又被自己判重复」这种自相矛盾的行为。
+        """
         if not units:
             return -1
         pos = {fp: i for i, fp in enumerate(u.fp for u in units)}   # 后出现的覆盖前面的
         for fp in reversed(self._anchor):
             if fp in pos:
                 return pos[fp]
+
+        # 精确全灭 → 近似兜底。
+        # 从最新的锚点往前试，每个锚点取**最靠前**的命中：锚点语义是「这段
+        # 对话的已知前缀」，同一段文字在屏上出现两次时（连续两条几乎一样的
+        # 机器人通知），要靠前的那条才是分界线 —— 取靠后的会把中间那条真
+        # 消息当成「已在锚点里」而漏发。
+        for sender, content in reversed(self._anchor_text):
+            ns = norm_sender(sender)
+            for i, u in enumerate(units):
+                if (norm_sender(u.sender) == ns
+                        and is_same_message(content, u.content)):
+                    return i
         return -1
 
 
