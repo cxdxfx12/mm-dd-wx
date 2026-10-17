@@ -126,11 +126,17 @@ class FakeUia:
 
 
 def make_target(**kw) -> WeChat4Target:
-    """构造一个不碰真实 UIA 的实例（uia 用假对象顶替）。"""
+    """构造一个不碰真实 UIA 的实例（uia 用假对象顶替）。
+
+    Win32 那一层也要一并顶掉 —— 测试机上微信常常是开着的，真去 FindWindow
+    会摸到真窗口，于是用例会去 ShowWindow 用户的微信（隐蔽副作用）。
+    """
     tgt = WeChat4Target(wxauto_path=".", dry_run=True, **kw)
     fake = FakeUia()
     tgt._load_uia = lambda: fake          # type: ignore[assignment]
     tgt._fake_uia = fake                  # type: ignore[attr-defined]
+    tgt._hwnd_by_class = lambda: 0        # type: ignore[assignment]
+    tgt._show_hidden = lambda h: None     # type: ignore[assignment]
     return tgt
 
 
@@ -383,6 +389,56 @@ class TestVisibilityRecovery(unittest.TestCase):
         tgt._window = lambda: FakeWnd()                  # type: ignore[assignment]
         tgt._is_minimized = lambda w: False              # type: ignore[assignment]
         tgt._wait_rendered = lambda timeout=0: True      # type: ignore[assignment]
+        with mock.patch("bridge.targets.wechat4.time.sleep"):
+            ok, why = tgt.ensure_visible()
+        self.assertTrue(ok, why)
+        self.assertEqual(tgt._fake_uia.sent, [WeChat4Target.DEFAULT_SHOW_HOTKEY])
+
+    def test_restores_hidden_window_by_hwnd(self):
+        """★ 首选项：按窗口类名拿句柄直接 ShowWindow，不发热键。
+
+        实测（2026-10-17）：把微信主窗口隐藏后，发 {Ctrl}{Alt}w **唤不回来**
+        （SendKeys 依赖输入队列/前台，热键又是开关，发错一次反而把窗口收起来）。
+        而 FindWindow 对隐藏窗口照样有效，ShowWindow 一次就亮出来。
+        """
+        tgt = make_target()
+        state = {"present": False}
+        shown = []
+
+        tgt._wnd_present = lambda: state["present"]        # type: ignore[assignment]
+        tgt._hwnd_by_class = lambda: 0x1234                # type: ignore[assignment]
+
+        def show(h):
+            shown.append(h)
+            state["present"] = True                        # ShowWindow 之后就看得见了
+
+        tgt._show_hidden = show                            # type: ignore[assignment]
+        tgt._window = lambda: FakeWnd()                    # type: ignore[assignment]
+        tgt._is_minimized = lambda w: False                # type: ignore[assignment]
+        tgt._wait_rendered = lambda timeout=0: True        # type: ignore[assignment]
+        with mock.patch("bridge.targets.wechat4.time.sleep"):
+            ok, why = tgt.ensure_visible()
+        self.assertTrue(ok, why)
+        self.assertEqual(shown, [0x1234], "隐藏窗口必须按句柄唤出")
+        self.assertEqual(tgt._fake_uia.sent, [], "句柄能唤回时不应再发热键（它是开关）")
+
+    def test_falls_back_to_hotkey_when_show_useless(self):
+        """按句柄 ShowWindow 没用（窗口被销毁/换了类名）时才发热键。"""
+        tgt = make_target()
+        state = {"present": False}
+
+        tgt._hwnd_by_class = lambda: 0x1234                # type: ignore[assignment]
+        tgt._show_hidden = lambda h: None                  # type: ignore[assignment]
+        tgt._wnd_present = lambda: state["present"]        # type: ignore[assignment]
+
+        def send_keys(keys, *a, **kw):
+            tgt._fake_uia.sent.append(keys)
+            state["present"] = True
+
+        tgt._fake_uia.SendKeys = send_keys
+        tgt._window = lambda: FakeWnd()                    # type: ignore[assignment]
+        tgt._is_minimized = lambda w: False                # type: ignore[assignment]
+        tgt._wait_rendered = lambda timeout=0: True        # type: ignore[assignment]
         with mock.patch("bridge.targets.wechat4.time.sleep"):
             ok, why = tgt.ensure_visible()
         self.assertTrue(ok, why)

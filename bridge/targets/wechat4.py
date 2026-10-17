@@ -60,6 +60,7 @@ except Exception:                      # pragma: no cover - 只在非 Windows �
 log = logging.getLogger("bridge.target.wechat4")
 
 SW_RESTORE = 9                         # ShowWindow 的还原指令
+SW_SHOW = 5                            # ShowWindow 的「显示」指令（隐藏的窗口用这个）
 MIN_WINDOW_SIDE = 200                  # 窗口矩形小于这个值视为「没渲染完」
 CLICK_RETRIES = 3                      # 会话格点击重试次数（首次点击可能被激活吞掉）
 
@@ -68,6 +69,9 @@ class WeChat4Target(Target):
     name = "wechat4"
 
     WINDOW_CLASS = "mmui::MainWindow"
+    # 主窗口在 Win32 层的标题（Qt 壳窗口类名形如 Qt51514QWindowIcon，带版本号，
+    # 不能写死；认标题更稳）。用于窗口被隐藏后按句柄唤出。
+    MAIN_TITLES = ("微信", "WeChat")
     SEARCH_BOX = "mmui::XValidatorTextEdit"
     SESSION_TABLE = "mmui::XTableView"
     SESSION_CELL = "mmui::ChatSessionCell"
@@ -107,6 +111,7 @@ class WeChat4Target(Target):
         self.show_hotkey = (show_hotkey or self.DEFAULT_SHOW_HOTKEY).strip()
         self._uia = None
         self._wnd = None
+        self._last_hwnd = 0          # 上次成功定位到的窗口句柄，隐藏后靠它唤醒
         self._current = ""
 
     # ---------- 底层 ----------
@@ -181,6 +186,7 @@ class WeChat4Target(Target):
                 "整个消失）。可运行 tools/probe_wechat_state.py 查看当前窗口状态。"
             )
         self._wnd = wnd
+        self._remember(wnd)
         return wnd
 
     def _find_window(self):
@@ -243,6 +249,80 @@ class WeChat4Target(Target):
         except Exception as exc:
             log.debug("还原微信窗口失败：%s", exc)
 
+    def _remember(self, wnd) -> None:
+        """记下窗口句柄 —— 窗口一旦被隐藏，UIA 就再也给不出它，只能靠这个。"""
+        h = self._hwnd(wnd)
+        if h:
+            self._last_hwnd = h
+
+    def _hwnd_by_class(self) -> int:
+        """找主窗口句柄，**隐藏（收进托盘）的窗口也能找到**。
+
+        ⚠ 不能拿 UIA 的 ClassName 去 FindWindow：UIA 报 ``mmui::MainWindow``，
+        而 Win32 层的真实类名是 ``Qt51514QWindowIcon``、标题「微信」，
+        `FindWindowW("mmui::MainWindow")` 必然返回 0（2026-10-17 实测）。
+
+        顺序：① 上次成功定位时记下的句柄 ② 枚举 Qt 顶层窗口按标题认。
+        """
+        if _user32 is None:
+            return 0
+        if self._last_hwnd:
+            try:
+                if _user32.IsWindow(wintypes.HWND(self._last_hwnd)):
+                    return self._last_hwnd
+            except Exception:
+                pass
+            self._last_hwnd = 0
+
+        found: list[int] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def cb(hwnd, _lparam):
+            try:
+                buf = ctypes.create_unicode_buffer(256)
+                _user32.GetClassNameW(hwnd, buf, 256)
+                cls = buf.value or ""
+                if not (cls.startswith("Qt5") and cls.endswith("QWindowIcon")):
+                    return True
+                n = _user32.GetWindowTextLengthW(hwnd)
+                if not n:
+                    return True
+                title = ctypes.create_unicode_buffer(n + 1)
+                _user32.GetWindowTextW(hwnd, title, n + 1)
+                if (title.value or "") in self.MAIN_TITLES:
+                    found.append(int(hwnd))
+            except Exception:
+                pass
+            return True
+
+        try:
+            _user32.EnumWindows(cb, 0)
+        except Exception as exc:
+            log.debug("枚举微信窗口失败：%s", exc)
+            return 0
+        if not found:
+            return 0
+        self._last_hwnd = found[0]
+        return found[0]
+
+    @staticmethod
+    def _show_hidden(hwnd: int) -> None:
+        if not hwnd or _user32 is None:
+            return
+        try:
+            _user32.ShowWindow(wintypes.HWND(hwnd), SW_SHOW)
+        except Exception as exc:
+            log.debug("显示微信窗口失败：%s", exc)
+
+    def _wait_present(self, timeout: float) -> bool:
+        """等窗口重新出现在 UIA 里（刚 ShowWindow 的那一下还读不到）。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._wnd_present():
+                return True
+            time.sleep(0.25)
+        return self._wnd_present()
+
     def _wait_rendered(self, timeout: float = 4.0) -> bool:
         """等窗口把控件渲染出来。
 
@@ -274,25 +354,32 @@ class WeChat4Target(Target):
         这是所有投递动作的前置条件。返回 (是否可用, 说明)，说明会直接写进
         投递失败的 detail 里，方便用户在日志里看到「到底卡在哪一步」。
         """
-        # 情形 A：窗口收进了托盘 —— 对象整个不存在，只能靠全局热键唤回
+        # 情形 A：UIA 里看不到窗口 —— 收进托盘（隐藏）或已退出
         if not self._wnd_present():
-            log.info("微信主窗口不在（多半被收进了托盘），尝试用热键 %s 唤回",
-                     self.show_hotkey)
-            try:
-                self._load_uia().SendKeys(self.show_hotkey)
-            except Exception as exc:
-                return False, f"唤回微信窗口失败：{exc}"
-            deadline = time.time() + 6.0
-            while time.time() < deadline:
-                if self._wnd_present():
-                    log.info("微信主窗口已唤回")
-                    break
-                time.sleep(0.25)
-            else:
-                return False, (
-                    f"微信主窗口找不到，热键 {self.show_hotkey} 也没能唤回 —— "
-                    "请在微信「设置 → 快捷键」里确认「显示/隐藏主窗口」的快捷键，"
-                    "或手动点开微信主窗口")
+            # A1：按窗口类名拿句柄直接亮出来。隐藏的窗口句柄还在，这一步最可靠。
+            hwnd = self._hwnd_by_class()
+            if hwnd:
+                log.info("微信主窗口不可见（多半收进了托盘），按窗口类名直接唤出")
+                self._show_hidden(hwnd)
+                if self._wait_present(4.0):
+                    log.info("微信主窗口已唤出")
+                else:
+                    log.warning("已 ShowWindow 但 UIA 里仍读不到窗口，改用热键兜底")
+
+            # A2：还是看不到，才退回全局热键（老路，热键被改过就失效）
+            if not self._wnd_present():
+                log.info("尝试用热键 %s 唤回微信窗口", self.show_hotkey)
+                try:
+                    self._load_uia().SendKeys(self.show_hotkey)
+                except Exception as exc:
+                    return False, f"唤回微信窗口失败：{exc}"
+                if not self._wait_present(6.0):
+                    return False, (
+                        f"微信主窗口找不到，热键 {self.show_hotkey} 也没能唤回 —— "
+                        "微信可能已经退出，或「显示/隐藏主窗口」的快捷键被改过。"
+                        "请在微信「设置 → 快捷键」里确认该快捷键，"
+                        "或手动打开微信主窗口")
+                log.info("微信主窗口已唤回")
 
         # 情形 B：窗口在，但被点了最小化
         wnd = self._window()
@@ -893,7 +980,10 @@ class WeChat4Target(Target):
             if lst.Exists(1):
                 return False, (
                     f"有打开的会话但读不到输入框（{self.INPUT_FIELD}）—— "
-                    "微信可能已关闭 UIA 暴露，请运行 tools/probe_wechat_ui.py 复查"
+                    "当前打开的多半是公众号/服务号会话（这类会话本来就没有输入框，"
+                    "2026-10-17 实测「海康威视客户服务」即如此），切到要转发的群即可；"
+                    "若切换后仍读不到，再运行 tools/probe_wechat_ui.py 复查"
+                    "（微信也可能关闭了 UIA 暴露）"
                 )
             state = "当前未打开会话（发送时自动切换，正常）"
         suffix = "（dry-run，不会真发）" if self.dry_run else ""

@@ -258,5 +258,72 @@ class TestOwnNoticeNotForwarded(unittest.TestCase):
         self.assertEqual(len(self.target.sent), 1)
 
 
+class FakeRecoveringTarget(FakeTarget):
+    """模拟真机上的那个状态：停在服务号会话上 → 自检报「读不到输入框」，
+    切到目标群之后就好了。"""
+
+    name = "fake-recovering"
+
+    def __init__(self):
+        super().__init__()
+        self.opened: list[str] = []
+        self.chat_open = False
+        self.open_ok = True
+
+    def health_check(self):
+        if self.chat_open:
+            return True, "微信 4.x 控件树可用（会话 15 个，输入框已就绪）"
+        return False, "有打开的会话但读不到输入框（mmui::ChatInputField）"
+
+    def open_chat(self, target: str) -> bool:
+        self.opened.append(target)
+        if self.open_ok and target == "测试群":
+            self.chat_open = True
+            return True
+        return False
+
+
+class TestPreflightRecovery(unittest.TestCase):
+    """启动自检的自愈：停在公众号/服务号会话上不能直接判死。
+
+    真机（2026-10-17）：微信停在「海康威视客户服务」，那种会话本来就没有
+    输入框，自检报「微信可能已关闭 UIA 暴露」；而程序每次发送前都会先切会话，
+    根本不影响转发 —— 若不复查，用户会在群里明明没消息时被拦下不让启动。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = Config(
+            storage=type("S", (), {"db_path": str(Path(self.tmp.name) / "s.db")})(),
+            wechat=WeChatConfig(dry_run=True, interval=0.0, targets=["测试群"]),
+            routes=[RouteConfig(name="t", companies=["示例科技"], targets=["测试群"],
+                                template="{content}")],
+        )
+        self.cfg._base_dir = Path(self.tmp.name)
+        self.target = FakeRecoveringTarget()
+        self.svc = BridgeService(self.cfg, target=self.target)
+
+    def tearDown(self):
+        self.svc.close()
+        self.tmp.cleanup()
+
+    def test_opens_first_target_then_passes(self):
+        problems = self.svc.preflight()
+        self.assertEqual(problems, [])
+        self.assertEqual(self.target.opened, ["测试群"])
+        self.assertTrue(self.svc.last_target_check[0])
+
+    def test_still_reports_when_switch_does_not_help(self):
+        self.target.open_ok = False
+        problems = self.svc.preflight()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("微信投递端不可用", problems[0])
+        self.assertFalse(self.svc.last_target_check[0])
+
+    def test_first_target_falls_back_to_routes(self):
+        self.cfg.wechat.targets = []
+        self.assertEqual(self.svc.first_target(), "测试群")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

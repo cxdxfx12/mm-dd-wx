@@ -304,7 +304,7 @@ class BridgeService:
             problems.append("没有任何转发目标：请在 routes[].targets 中配置微信好友或群名")
         ok, detail = self.target.health_check()
         if not ok:
-            # 只对「窗口不可用」这类可自愈的问题做一次修复尝试：
+            # 只对「窗口不可用」这类可自愈的问题做修复尝试：
             # 微信被最小化 / 收进托盘时，启动瞬间就该把它唤回来，
             # 而不是丢一句报错让用户自己找原因。
             ensure = getattr(self.target, "ensure_visible", None)
@@ -313,10 +313,35 @@ class BridgeService:
                 if fixed:
                     log.info("微信窗口已自动恢复：%s", why)
                     ok, detail = self.target.health_check()
+            # 仍然是坏的，再试一次「切到第一个目标群」：微信只有打开一个真实
+            # 会话才会创建输入框，停在公众号/服务号会话上会被误判成
+            # 「UIA 暴露被关掉了」（2026-10-17 实测「海康威视客户服务」）。
+            # 反正真正发送前也要切过去，这里先切一次不影响任何东西。
+            if not ok:
+                opener = getattr(self.target, "open_chat", None)
+                first = self.first_target()
+                if callable(opener) and first:
+                    log.info("自检未通过，尝试切到「%s」后复查", first)
+                    try:
+                        if opener(first):
+                            ok, detail = self.target.health_check()
+                    except Exception as exc:
+                        log.debug("切换「%s」失败：%s", first, exc)
         self.last_target_check = (ok, detail)
         if not ok:
             problems.append(f"微信投递端不可用：{detail}")
         return problems
+
+    def first_target(self) -> str:
+        """配置里的第一个转发目标（自检复查、日志提示用）。"""
+        for t in self.cfg.wechat.targets:
+            if t:
+                return t
+        for r in self.cfg.routes:
+            for t in r.targets:
+                if t:
+                    return t
+        return ""
 
     def notify_status(self) -> str:
         """给自检输出用的一行说明。"""
