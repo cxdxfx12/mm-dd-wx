@@ -65,7 +65,8 @@ from urllib.parse import parse_qs, urlparse
 from ..config import Config
 from ..fingerprint import fp_of, is_same_message, norm_sender
 from ..models import MSG_TYPES, Message
-from .android_parse import (FrameDiffer, ParseError, needs_scroll, parse_frame,
+from .android_parse import (FrameDiffer, ParseError, clipped_units,
+                            needs_scroll, parse_frame,
                             units_to_messages)
 from .base import MessageHandler, Source, infer_company
 
@@ -93,6 +94,14 @@ HOLD_MAX = 4
 # 足以覆盖，又短到不会误伤「人工故意在十分钟后再发一条一样的话」。
 # 机器人日报每天格式相同、数字不同，content_key 会保留全部数字，不会撞。
 NEAR_DUP_WINDOW = 600.0
+# 锚点对不上时「请手机翻一屏试着找回」的节流参数。
+#   · PROBE_COOLDOWN：上一次试探到这一次的最短间隔（秒）。手机翻上去再翻回来
+#     约 700ms（Scroller 里 SWIPE_MS + SETTLE_MS），期间上报的都是中间态帧，
+#     冷却期就是为了等它安定下来，别把指令发成连环翻。
+#   · PROBE_MAX：连续这么多次没找回锚点就认输（多半是在翻历史/换了群）。
+#     对上一次就清零，所以偶发的「长消息挤掉锚点」永远有试探机会。
+PROBE_COOLDOWN = 3.0
+PROBE_MAX = 2
 # 看门狗多久检查一次「手机还在不在」（秒）。比心跳间隔（手机端 60s）小得多，
 # 所以失联的发现延迟最多是「心跳间隔 + 这个 tick」。
 OFFLINE_TICK = 10.0
@@ -576,6 +585,17 @@ class _Ctx:
     # 换了渲染形态又被当成新消息」的重复转发：横排表格和一格一行的指纹不同、
     # uid 不同，is_duplicate 挡不住，只能按**内容片段重合度**在时间窗内再挡一次。
     recent_keys: dict = field(default_factory=dict)
+    # ── 锚点丢失时「翻一屏试探」的状态 ──────────────────────────────
+    # 锚点丢失目前是静默重建基线 + 这一屏不发。但真机上它有两个常见原因：
+    #   · 卡片重绘后锚点那条换了形态（已由 _locate 的近似匹配覆盖）；
+    #   · 新消息把锚点整条挤出了屏幕（近似匹配也救不了 —— 屏上根本没有它）。
+    # 后者只要手机往上翻一帧就能重新看到锚点，把中间那段补回来。所以丢失时
+    # 不直接放弃，先让手机翻一屏再报一次；align_md5 记「为哪一帧翻的」，
+    # 同一帧只试探一次，align_at 记上次试探时刻（冷却期内不再发指令 ——
+    # 否则会变成翻上去、翻回来、又翻上去的来回抖）。
+    align_md5: str = ""
+    align_tried: int = 0
+    align_at: float = 0.0
     companies: list[str] = field(default_factory=list)
     on_message: MessageHandler | None = None
     count: dict = field(default_factory=lambda: {"requests": 0, "accepted": 0,
@@ -947,7 +967,8 @@ class _Handler(BaseHTTPRequestHandler):
                 # 手机端上翻补全后重报的那一帧会带 reason=scroll-fill。
                 # 它必须走另一套判定 —— 见 _ingest 里的说明。
                 pending, note, scroll, hold_ms = self._ingest(
-                    text, filling=(screen["reason"] == "scroll-fill"))
+                    text, filling=(screen["reason"] == "scroll-fill"),
+                    frame_md5=screen["md5"])
 
         # 记「手机还活着」。必须在锁外调：touch 走的是另一把锁，
         # 但把它放在这里能让 hold 锁的时间只包含解析。
@@ -986,8 +1007,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     # --- 画面解析（仅 dingtalk.android_parse = true）---
 
-    def _ingest(self, text: str, *, filling: bool = False
-                ) -> tuple[list, str, bool, int]:
+    def _ingest(self, text: str, *, filling: bool = False,
+                frame_md5: str = "") -> tuple[list, str, bool, int]:
         """一帧节点树 → 本帧**新增**的消息单元。
 
         返回 ``(单元列表, 说明, 是否要补全, 扣住毫秒数)``。扣住毫秒数 > 0
@@ -1050,7 +1071,11 @@ class _Handler(BaseHTTPRequestHandler):
         # 就能把真正的补全内容挑出来；而补全内容天然只会是那条长消息的另外几段，
         # 不会把历史灌进群。
         if filling:
-            return (*self._ingest_fill(frame), 0)
+            # 补全帧只**挪锚点**、不做常规判定：它的新内容在锚点上方，喂给
+            # FrameDiffer 等于白翻（实测「新增 0 条」）。
+            pending, note, _ = self._ingest_fill(frame)
+            differ.note_scroll(frame.units)
+            return pending, note, False, 0
 
         # ── H5 卡片渲染中：扣住待稳 ─────────────────────────────────
         # 钉钉机器人消息是 H5 卡片，节点坐标常年是坏的（frame.garbled），
@@ -1066,7 +1091,11 @@ class _Handler(BaseHTTPRequestHandler):
         #     （宁可发一条可能不完整的，也不能永远不发）。
         # 原生消息（坐标正常）不经过这条路，延迟零增加。
         garbled = frame.garbled
-        diff = differ.peek(frame.units) if garbled else differ.feed(frame.units)
+        # 一律先 peek（只判定、不动锚点）。原生帧过去直接 feed，锚点立刻被
+        # 覆盖成本帧 —— 那样「锚点丢失后翻一屏试探」就永远对不上了（旧锚点
+        # 已经被冲掉）。改成 peek 之后再决定：真发新消息 / 重建基线 / 试探，
+        # 只有"确认不要试探"的分支才 commit。
+        diff = differ.peek(frame.units)
 
         if garbled and (diff.baseline or diff.anchor_lost):
             # 基线/锚点先不建：现在记住的是半成品，渲染完就「锚点丢失」了。
@@ -1079,6 +1108,16 @@ class _Handler(BaseHTTPRequestHandler):
                 log.info("安卓画面解析：屏上有 H5 卡片还在渲染，%s（第 %d 眼）",
                          what, seen)
                 return [], f"H5 渲染中，{what}", False, HOLD_MS
+            if not diff.baseline:
+                # H5 帧的锚点丢失同样先试探一次（理由同下面原生帧那处）。
+                # **必须在 commit 之前**：commit 会把锚点覆盖成当前这屏，
+                # 覆盖之后就再也对不上了，试探也就白翻了。
+                if self._should_probe(frame_md5):
+                    self.ctx.align_md5 = frame_md5
+                    log.warning("安卓画面解析：H5 卡片的锚点对不上 —— "
+                                "已请手机翻一屏试着找回（第 %d 次）",
+                                self.ctx.align_tried)
+                    return [], "锚点丢失，翻一屏找", True, 0
             differ.commit(frame.units)
             self.ctx.hold_key, self.ctx.hold_seen, self.ctx.hold_total = "", 0, 0
             if diff.baseline:
@@ -1089,6 +1128,7 @@ class _Handler(BaseHTTPRequestHandler):
             return [], "锚点丢失", False, 0
 
         if diff.baseline:
+            differ.commit(frame.units)          # peek 之后必须自己推进锚点
             log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
                      "此后只转发基线之后的新消息", len(frame.units))
             # 基线帧也要报截断：新装/重启那一刻屏上可能正好卡着一条长消息，
@@ -1099,11 +1139,35 @@ class _Handler(BaseHTTPRequestHandler):
                 log.info("安卓画面解析：当前屏有消息没显示全（%s）", why)
             return [], "已建立基线", False, 0
         if diff.anchor_lost:
+            # 锚点丢失 ≠ 一定是翻历史。真机上最常见的两个原因恰恰是**漏发**：
+            #   · 新消息太长，把上一帧的锚点整条挤出了屏幕；
+            #   · 卡片重绘后锚点换了形态（近似匹配能兜住的都已兜住，剩下的
+            #     是真的不在屏上了）。
+            # 这两种情况下，手机只要**往上翻一屏**，锚点就会重新露出来，夹在
+            # 中间那条被漏掉的消息也跟着出现。所以先不认输，让手机翻一屏再
+            # 报一次（走的还是 scroll-fill 通道，手机端一行代码都不用改）。
+            #
+            # 防抖：同一帧（按 md5）只试探一次。翻完还对不上，说明确实是在
+            # 翻历史或者换了群，那就重建基线、不再纠缠 —— 否则手机会在
+            # 「翻上去、翻回来」之间无限来回。
+            md5 = frame_md5
+            if self._should_probe(md5):
+                # 试探时不 commit —— 锚点必须留着，否则翻回来也对不上
+                self.ctx.align_md5 = md5
+                log.warning("安卓画面解析：上一帧的锚点在本帧里找不到 —— "
+                            "已请手机翻一屏试着找回（第 %d 次）",
+                            self.ctx.align_tried)
+                return [], "锚点丢失，翻一屏找", True, 0
+            differ.commit(frame.units)          # 认输了，基线重建到当前画面
             log.warning("安卓画面解析：上一帧的锚点在本帧里找不到（翻历史／换群／"
                         "一屏全换）—— 本帧不转发，基线已重建到当前画面")
             return [], "锚点丢失", False, 0
 
         new = list(diff.units)
+        # 这一帧正常判出了新内容 = 锚点是好的。清零试探计数，让下次真遇到
+        # 「长消息挤掉锚点」时还有翻一屏的机会（不清零的话，一天里偶尔两次
+        # 误试探就会把额度耗光，之后再丢消息就不再救了）。
+        self.ctx.align_tried = 0
         if garbled and new:
             # 新消息在 H5 卡片里：同一批指纹见到第二眼（内容没再长）才投递。
             key = "\n".join(u.fp for u in new)
@@ -1138,6 +1202,34 @@ class _Handler(BaseHTTPRequestHandler):
             return new, "消息可能不完整", True, 0
         return new, "", False, 0
 
+    def _should_probe(self, frame_md5: str) -> bool:
+        """锚点对不上时，该不该先请手机翻一屏试试？
+
+        三种情况不试探（直接认输、重建基线）：
+          · 同一帧已经试探过（md5 相同）—— 手机原地没动，再翻也是同一屏；
+          · 刚刚才为别的一帧翻过（``PROBE_COOLDOWN`` 秒内）—— 手机翻上去
+            再翻回来本身要 700ms 左右，期间上报的帧全是中间态，此时再发
+            指令会变成「翻、翻、翻」来回抖；
+          · 连续试探次数到顶 —— 说明屏上确实没有上一帧的锚点（翻历史 /
+            换群 / 一屏全换），再翻就是白折腾。
+
+        对上了（``_locate`` 成功或正常发出了消息）会把 ``align_tried`` 清零，
+        所以偶发的「一条长消息挤掉锚点」永远有试探机会。
+        """
+        if not frame_md5 or frame_md5 == self.ctx.align_md5:
+            return False
+        now = time.monotonic()
+        if now - self.ctx.align_at < PROBE_COOLDOWN:
+            return False
+        if self.ctx.align_tried >= PROBE_MAX:
+            log.warning("安卓画面解析：连续 %d 次翻一屏都没找回锚点 —— "
+                        "多半是在翻历史或换了群，不再试探，重建基线",
+                        self.ctx.align_tried)
+            return False
+        self.ctx.align_tried += 1
+        self.ctx.align_at = now
+        return True
+
     def _ingest_fill(self, frame) -> tuple[list, str, bool]:
         """上翻补全帧：把「锚点上方、此前没见过」的内容挑出来。
 
@@ -1162,20 +1254,50 @@ class _Handler(BaseHTTPRequestHandler):
         if differ is None or not differ.baseline_built:
             return [], "补全帧但没有基线，跳过", False
 
-        at = differ._locate(frame.units)
+        at = differ.locate_anchor(frame.units)
         if at < 0:
             # 锚点找不到 = 这一屏跟上一帧对不上（多半是翻过头了）。
             # 不转发、也不动基线，等手机翻回来。
             return [], "补全帧对不上锚点，跳过", False
 
-        above = [u for u in frame.units[:at]]
-        # 去掉锚点里已有的（保守起见再挡一次重复）
+        # 锚点找到了 = 试探成功（或者只是普通补全）。清零试探计数：下次真
+        # 遇到「长消息挤掉锚点」时还有翻一屏的机会。
+        if self.ctx.align_tried:
+            self.ctx.align_tried = 0
+
+        # 两边都要看，因为「上翻一屏」在两个方向上都可能是漏消息的现场：
+        #
+        #   · 锚点**上方**：被切掉的长消息前半截（长消息补全，最常见）；
+        #   · 锚点**下方**：这一帧新露出来的内容。锚点丢失以后常规帧一条都
+        #     没发（全走了锚点丢失分支），所以锚点下面那些很可能也是漏的。
+        #     实测原型：锚点在屏幕最上面，一条很高的新消息把它下面撑满，
+        #     中间那条新消息被挤出可见区 —— 上翻一屏后它正好夹在锚点和
+        #     长消息之间，只看「上方」是空的。
+        #
+        # 但下方只捡到**第一个被切掉的消息为止**：再往下的都是完整显示的
+        # 新消息，它们本来就会在手机翻回列表底部时由常规帧正常投递（按顺序、
+        # 按时延），在这里抢先发一遍会把顺序打乱，也白占了近似去重的窗口。
         known = set(differ._anchor)
-        above = [u for u in above if u.fp not in known]
-        if not above:
+        seen_text = list(differ._anchor_text)
+        cut = {u.fp for u in clipped_units(frame)}
+        picked = list(frame.units[:at])                  # 上方：整段都要
+        for u in frame.units[at + 1:]:                   # 下方：捡到被切掉的为止
+            picked.append(u)
+            if u.fp in cut:
+                break
+        kept = []
+        for u in picked:
+            if u.fp in known:
+                continue
+            ns = norm_sender(u.sender)
+            if any(norm_sender(s) == ns and is_same_message(c, u.content)
+                   for s, c in seen_text):
+                continue          # 换了渲染形态的同一条，指纹不同内容相同
+            kept.append(u)
+        if not kept:
             return [], "补全帧没有新内容", False
-        log.info("安卓画面解析：上翻补全到 %d 条此前没看到的内容", len(above))
-        return above, "补全帧", False
+        log.info("安卓画面解析：上翻补全到 %d 条此前没看到的内容", len(kept))
+        return kept, "补全帧", False
 
     def _emit(self, units: list) -> int:
         """把消息单元交给下游，返回成功条数。

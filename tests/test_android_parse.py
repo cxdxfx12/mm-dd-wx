@@ -737,6 +737,40 @@ class TestFrameDiffer(unittest.TestCase):
         # 精确匹配应该命中「收到」这一条，而不是把「好的」误当锚点
         self.assertEqual([u.content for u in diff.units], ["新的正文内容"])
 
+    # ---- 上翻探测：锚点只能往前挪一点点 --------------------------------
+
+    def test_note_scroll_keeps_anchor_on_the_visible_bottom(self):
+        """手机翻上去之后，锚点要留在「刚翻走的那一屏的最后一条」。
+
+        这一条锁的是**丢消息**：锚点丢失时网关请手机翻一屏，回包那一帧既
+        有漏掉的内容、也有列表底部露出来的新内容。如果照常 commit，锚点
+        会爬到最新那条上，等手机翻回底部，那条新内容就跑到锚点**上方**，
+        补全帧再也捡不到 —— 日志里一切正常，消息却永远丢了。
+        """
+        d = FrameDiffer()
+        d.feed(self.units(("a", "旧1"), ("a", "旧2")))
+        # 手机翻上去：屏幕上变成 旧1 / 旧2 / 长消息（列表底部露出了新内容）
+        d.note_scroll(self.units(("a", "旧1"), ("a", "旧2"), ("a", "新3")))
+        self.assertEqual(d._anchor_text, [("a", "旧1"), ("a", "旧2"), ("a", "新3")])
+
+        # 翻回底部：新3 仍在锚点里 → 不重复发
+        diff = d.feed(self.units(("a", "旧1"), ("a", "旧2"), ("a", "新3"),
+                                 ("a", "新4")))
+        self.assertEqual([u.content for u in diff.units], ["新4"])
+
+    def test_note_scroll_ignores_frames_before_the_anchor(self):
+        """翻过头（本帧里根本没有旧锚点）时锚点不动 —— 宁可多补一次。"""
+        d = FrameDiffer()
+        d.feed(self.units(("a", "旧1"), ("a", "旧2")))
+        d.note_scroll(self.units(("a", "更早1"), ("a", "更早2")))
+        self.assertEqual(d._anchor_text, [("a", "旧1"), ("a", "旧2")])
+
+    def test_note_scroll_without_baseline_is_noop(self):
+        d = FrameDiffer()
+        d.note_scroll(self.units(("a", "1")))
+        self.assertFalse(d.baseline_built)
+        self.assertEqual(d._anchor, [])
+
 
 # ------------------------------------------------------------------ 表格消息
 

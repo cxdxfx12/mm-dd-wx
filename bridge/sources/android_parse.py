@@ -1076,6 +1076,38 @@ class FrameDiffer:
         self._anchor_text = [(u.sender, u.content) for u in tail]
         self.baseline_built = True
 
+    def note_scroll(self, units: list[Unit]) -> None:
+        """手机刚按我们的要求上翻了一屏 —— 锚点只许挪到这一屏的最后一条。
+
+        ── 为什么不能照常 commit ─────────────────────────────────────
+        探测（网关判出 anchor_lost → 请手机翻一屏）回包的那一帧会走
+        :meth:`_ingest_fill`，取的是锚点**上方**的内容 —— 刚才因为锚点被
+        挤出屏幕而漏掉的那条。但那一帧本身其实还带着锚点下方的新内容
+        （列表底部露出来的），如果网关照常 commit，锚点就爬到「本帧最后
+        一条」上去了；手机翻回列表底部之后，那条消息跑到锚点**上方**，
+        补全帧再也捡不到 —— 消息永久丢失，而日志里一切正常。
+
+        所以这里只把锚点往前挪一点点（挪到刚翻走的那一屏的最后一条），
+        前提是新锚点在本帧里**仍然找得到**（说明没翻过头）。判不出来
+        （翻过了头/翻到顶）就保持旧锚点不动 —— 宁可多补一次，不能丢。
+        """
+        if not units or not self.baseline_built:
+            return
+        if self._locate(units) < 0:
+            return                          # 翻过头/换了群：锚点留在旧位置
+        self._anchor = [u.fp for u in units[-self.tail:]]
+        self._anchor_text = [(u.sender, u.content)
+                             for u in units[-self.tail:]]
+
+    def locate_anchor(self, units: list[Unit]) -> int:
+        """公开入口：在 ``units`` 里找锚点，返回下标（找不到 -1）。
+
+        网关的「上翻补全帧」需要知道锚点在本帧的哪个位置，好取它**上方**的
+        内容 —— 那是常规帧方向相反的一侧。以前直接调 ``_locate``，现在给它
+        一个名字，免得哪天重构顺手把私有方法改名又炸一次。
+        """
+        return self._locate(units)
+
     def _locate(self, units: list[Unit]) -> int:
         """在 ``units`` 里找锚点，返回它的下标；找不到返回 -1。
 

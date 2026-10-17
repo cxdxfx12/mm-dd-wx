@@ -838,7 +838,7 @@ class TestScreenParse(GatewayCase):
         body = self.post_frame(self.screen(
             self.row("第一条", 300), self.row("第二条", 500), self.row("第三条", 700)))
         self.assertEqual(body["messages"], 0)
-        self.assertEqual(body["note"], "锚点丢失")
+        self.assertEqual(body["note"], "锚点丢失，翻一屏找")
         self.assertEqual(self.received, [])
 
     def test_broken_xml_returns_200_not_error(self):
@@ -893,7 +893,100 @@ class TestScreenParse(GatewayCase):
         self.assertEqual(body["note"], "已建立基线")
         self.assertNotIn("scroll", body)
 
-    # --- 上翻补全帧 ---
+    # ---- 锚点丢失 → 先请手机翻一屏试探 --------------------------------
+    #
+    # 用户原话：「如果我手动向上翻手机屏他又能转发，是这个原因吗，能修复吗」。
+    # 是的 —— 而且手动翻能好恰恰证明内容还在，只是被新消息挤出屏幕了。
+    # 所以电脑判出 anchor_lost 时不再静默重建基线，而是先请手机翻一屏；
+    # 翻回来锚点对上了，刚才漏的那条就能补出来。
+
+    def test_anchor_lost_asks_phone_to_scroll_before_giving_up(self):
+        """锚点对不上时不能直接重建基线 —— 要先让手机翻一屏。"""
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        body = self.post_frame(self.screen(
+            self.row("历史1", 300), self.row("历史2", 600)))
+        self.assertTrue(body.get("scroll"), "锚点丢失却没说让手机翻一屏")
+        self.assertEqual(body["note"], "锚点丢失，翻一屏找")
+        self.assertEqual(self.received, [])
+
+    def test_probe_hit_recovers_the_swallowed_message(self):
+        """翻一屏后锚点找回 → 被长消息挤掉的中间那条要补发出来。
+
+        真机的形状：锚点（旧消息A）还在最上面，新来一条很高的消息把它下面
+        撑满，中间那条「新消息B」被挤出屏幕 —— 节点树里根本没有它，所以
+        常规帧怎么等都等不到。手机往上翻一屏后 B 重新露出来，这时候补全帧
+        必须在 **A 与长消息之间** 把它捡回来。
+        """
+        self.post_frame(self.screen(self.row("旧消息A", 300)))
+        # 一条很高的新消息进来，把「新消息B」和锚点一起挤出可见区
+        b1 = self.post_frame(self.screen(
+            self.row("新消息B", 500, "签收跟单专员"),
+            self.long_row("履约跟单专员", 700, 3200)))
+        self.assertIn(b1["note"], ("锚点丢失，翻一屏找", ""))
+        self.assertNotIn("新消息B", [m.content for m in self.received])
+
+        # 手机翻一屏：旧消息A 重新露出，B 也在，长消息退到下面
+        b2 = self.post_fill(self.screen(
+            self.row("旧消息A", 300),
+            self.row("新消息B", 500, "签收跟单专员"),
+            self.long_row("履约跟单专员", 1400, 3200)))
+        contents = [m.content for m in self.received]
+        self.assertIn("新消息B", contents, "被长消息挤掉的那条没补回来")
+        # 长消息只算一条：补全帧里它既露头又被切着，不能出现两次
+        self.assertEqual(contents.count("很长的正文……"), 1)
+        self.assertEqual(self.received[0].content, "新消息B")
+
+        # 手机翻回列表底部：同一批内容不能因为「刚才补过」再发一遍
+        b3 = self.post_frame(self.screen(
+            self.row("新消息B", 500, "签收跟单专员"),
+            self.long_row("履约跟单专员", 1400, 3200)))
+        self.assertEqual(b3["messages"], 0, "翻回底部后重复发了")
+        self.assertEqual(len(self.received), 2)
+
+        # 之后照常的新消息还要能发（锚点没被弄坏）
+        b4 = self.post_frame(self.screen(
+            self.long_row("履约跟单专员", 300, 1900), self.row("新消息C", 2000)))
+        self.assertEqual(b4["messages"], 1)
+        self.assertEqual(self.received[-1].content, "新消息C")
+
+    def test_second_miss_gives_up_and_rebuilds_baseline(self):
+        """翻一屏还对不上（真在翻历史）→ 认输重建，别让手机来回翻。
+
+        不认输的后果是手机在「翻上去、翻回来」之间无限循环，一条都不转发，
+        表现和「锚点永久卡死」一模一样。
+        """
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        b1 = self.post_frame(self.screen(self.row("历史1", 300),
+                                         self.row("历史2", 600)))
+        self.assertTrue(b1.get("scroll"))
+        # 手机翻过了头，还是对不上；冷却期内不再发指令，直接重建基线
+        b2 = self.post_fill(self.screen(self.row("更早的历史1", 300)))
+        self.assertIn("对不上锚点", b2["note"])
+        b3 = self.post_frame(self.screen(self.row("更早的历史1", 300),
+                                         self.row("更早的历史2", 600)))
+        self.assertNotIn("scroll", b3)
+        self.assertEqual(b3["note"], "锚点丢失")
+        self.assertEqual(self.received, [])
+        # 基线已重建：此后新消息恢复转发
+        b4 = self.post_frame(self.screen(self.row("更早的历史1", 300),
+                                         self.row("其实很新的消息", 900)))
+        self.assertEqual(b4["messages"], 1)
+        self.assertEqual(self.received[-1].content, "其实很新的消息")
+
+    def test_probe_is_not_repeated_for_the_same_frame(self):
+        """同一屏连报两次只翻一次 —— 手机原地没动，再翻是白折腾。"""
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        same = self.screen(self.row("历史1", 300), self.row("历史2", 600))
+        self.assertTrue(self.post_frame(same).get("scroll"))
+        self.assertNotIn("scroll", self.post_frame(same))
+
+    def test_probe_does_not_fire_on_baseline_frame(self):
+        """建基线时不许翻：刚记下的基线会被自己翻脏。"""
+        body = self.post_frame(self.screen(self.row("第一条", 400)))
+        self.assertEqual(body["note"], "已建立基线")
+        self.assertNotIn("scroll", body)
+
+    # ---- 上翻补全帧 ----
     #
     # 补全帧和常规帧**方向相反**：常规帧的新消息在锚点下方，补全帧要的是
     # 锚点上方那半截长消息。直接喂给 FrameDiffer 会「新增 0 条」，白翻一屏。
