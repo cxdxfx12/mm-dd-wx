@@ -1095,6 +1095,7 @@ class _Handler(BaseHTTPRequestHandler):
         # 覆盖成本帧 —— 那样「锚点丢失后翻一屏试探」就永远对不上了（旧锚点
         # 已经被冲掉）。改成 peek 之后再决定：真发新消息 / 重建基线 / 试探，
         # 只有"确认不要试探"的分支才 commit。
+        differ.set_view(frame.view)         # 判「锚点上方那条是不是新卡片」要用
         diff = differ.peek(frame.units)
 
         if garbled and (diff.baseline or diff.anchor_lost):
@@ -1168,6 +1169,31 @@ class _Handler(BaseHTTPRequestHandler):
         # 「长消息挤掉锚点」时还有翻一屏的机会（不清零的话，一天里偶尔两次
         # 误试探就会把额度耗光，之后再丢消息就不再救了）。
         self.ctx.align_tried = 0
+
+        if diff.scrambled:
+            # 锚点上方夹进了新内容（新卡片从屏幕顶挤进来，见 android_parse
+            # 的 _above_anchor_is_new）。这时「锚点」已经不可靠：不管把锚点
+            # 推到帧尾还是推到旧锚点，下一帧都会重新判出同一条，同一条发
+            # 好几遍（实测 4 帧抛 4 次）。直接重建基线到当前这一屏。
+            log.info("安卓画面解析：锚点上方来了新内容（卡片从屏幕顶挤进来），"
+                     "锚点重建到当前这一屏")
+            if garbled and new:
+                # H5 卡片可能还在长，按「扣住待稳」那套等一帧再发。
+                key = "\n".join(u.fp for u in new)
+                seen = self.ctx.hold_seen + 1 if self.ctx.hold_key == key else 1
+                self.ctx.hold_key, self.ctx.hold_seen = key, seen
+                self.ctx.hold_total += 1
+                if seen < 2 and self.ctx.hold_total < HOLD_MAX:
+                    log.info("安卓画面解析：新消息在 H5 卡片里，扣住等渲染稳定"
+                             "（第 %d 眼，%d 条）", seen, len(new))
+                    return [], "H5 渲染中，扣住待稳", False, HOLD_MS
+            differ.commit(frame.units)
+            self.ctx.hold_key, self.ctx.hold_seen, self.ctx.hold_total = "", 0, 0
+            why = needs_scroll(frame)
+            if why and new:
+                return new, "消息可能不完整", True, 0
+            return new, "", False, 0
+
         if garbled and new:
             # 新消息在 H5 卡片里：同一批指纹见到第二眼（内容没再长）才投递。
             key = "\n".join(u.fp for u in new)

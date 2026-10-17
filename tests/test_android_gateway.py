@@ -986,6 +986,52 @@ class TestScreenParse(GatewayCase):
         self.assertEqual(body["note"], "已建立基线")
         self.assertNotIn("scroll", body)
 
+    # ---- 新卡片长在锚点**上方** ----------------------------------------
+    #
+    # 真机事故（2026-10-17 19:12）：用户报「标签履约周累计达成（1012-1015）
+    # 又没采集到」。后来抓到的那一帧（data/screen-20261017_191838.xml）显示
+    # 卡片就在屏幕上、解析也完全正常，但它渲染在锚点（那条采集波动告警）
+    # **上方** —— 只看锚点之后的 `units[idx+1:]` 永远是空的，于是卡片既不算
+    # 新消息、也不入库，日志里一条错都不报。
+    #
+    # 下面两条锁的是「上方的新内容要发」和「上方的历史绝不能发」。
+
+    def test_card_above_anchor_is_forwarded(self):
+        """卡片从屏幕顶挤进来（排在锚点上方）也必须发出去。
+
+        位置关系照抄真机那一帧（view 顶 265、卡片 y0 也 265、卡片下沿 1251
+        紧贴告警上沿 1251）：卡片**顶到列表上沿**、底边紧贴锚点顶边，中间
+        没夹别的消息 —— 这才是「卡片插进来」的形状。位置差一点点就判不出来，
+        这不是容错问题：宽松一点就会把翻历史的整屏旧消息灌进微信群。
+        """
+        alert = "采集波动：无法确认新旧消息"
+        self.post_frame(self.screen(self.row(alert, 900, "服务诊断专员")))
+        body = self.post_frame(self.screen(
+            self.row("标签履约周累计达成 1012-1015", 200, "履约跟单专员"),
+            self.row(alert, 385, "服务诊断专员")))
+        self.assertEqual(body["messages"], 1, "锚点上方的卡片没被转发")
+        self.assertEqual([m.sender_name for m in self.received], ["履约跟单专员"])
+        self.assertIn("标签履约周累计达成", self.received[0].content)
+
+        # 手机原地不动又报了几帧：同一条不能重复发
+        for _ in range(3):
+            again = self.post_frame(self.screen(
+                self.row("标签履约周累计达成 1012-1015", 200, "履约跟单专员"),
+                self.row(alert, 385, "服务诊断专员")))
+            self.assertEqual(again["messages"], 0)
+        self.assertEqual(len(self.received), 1)
+
+    def test_history_above_anchor_is_not_forwarded(self):
+        """往上翻历史时上面全是旧消息 —— 一条都不能当新消息发。"""
+        self.post_frame(self.screen(
+            self.row("第五条的正文，说的是今晚的交接安排与注意事项。", 400)))
+        body = self.post_frame(self.screen(
+            self.row("很久以前的旧消息，内容是八月的积压情况一共 99 票。", 265),
+            self.row("更早的一条，说的是七月的派送异常与处理结果。", 460),
+            self.row("第五条的正文，说的是今晚的交接安排与注意事项。", 655)))
+        self.assertEqual(body["messages"], 0, "翻历史时把旧消息发出去了")
+        self.assertEqual(self.received, [])
+
     # ---- 上翻补全帧 ----
     #
     # 补全帧和常规帧**方向相反**：常规帧的新消息在锚点下方，补全帧要的是

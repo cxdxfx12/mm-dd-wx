@@ -1000,10 +1000,41 @@ class Diff:
     units: list[Unit] = field(default_factory=list)
     baseline: bool = False        # 这一帧被当作基线（一条都不发）
     anchor_lost: bool = False     # 上一帧的锚点在本帧里找不到
+    # units 里来自锚点**上方**的那部分条数（新卡片从屏幕顶挤进来的形状）。
+    # 网关靠它决定「这一帧之后不要把锚点推到最新一条」—— 否则手机翻回
+    # 底部时那张卡片会再被判成一次新消息。
+    above: int = 0
 
     @property
     def count(self) -> int:
         return len(self.units)
+
+    def anchor_only(self, units: list[Unit]) -> list[Unit]:
+        """本帧里「锚点及其之前」的那一段 —— 推进锚点时只该看这一段。
+
+        ``above > 0`` 时锚点上方混进了新内容（新卡片从屏幕顶挤进来）。
+        这时锚点**不能**推到帧尾：推到帧尾会让后面每一次上报都重新判出那条
+        卡片（实测同一张「标签履约周累计」在 4 帧里被抛出 4 次）。
+        """
+        if self.above and len(units) > self.above:
+            return units[:self.above + 1]
+        return units
+
+    @property
+    def scrambled(self) -> bool:
+        """本帧的锚点上方夹着新内容 —— 这说明「锚点」这个概念已经不可靠了。
+
+        取 ``above > 0`` 的帧，按 ``anchor_only`` 推进锚点会掉进死循环：
+        新判出的那条（上方的卡片）一变成新锚点，`_locate` 找到的就是**旧锚
+        点那条**（排在新锚点下面），于是「锚点之后」永远是空的，那条卡片
+        每一帧都被当成新消息抛一次、锚点却原地踏步（实测 4 帧抛 4 次）。
+
+        所以这种帧走**重建基线**：锚点重建到「当前这一屏的最后若干条」，
+        之后的新内容照常判。代价是这一屏里锚点之后的极少数内容可能要等
+        下一次上报才发 —— 反正常规采集本来就是「屏幕变了才上报」，下一帧
+        紧接着就来。
+        """
+        return self.above > 0
 
 
 class FrameDiffer:
@@ -1019,8 +1050,16 @@ class FrameDiffer:
         # 锚点的**正文**（与 _anchor 一一对应）。精确指纹对不上时用它做近似
         # 匹配 —— 见 _locate 里「锚点为什么需要近似」的说明。
         self._anchor_text: list[tuple[str, str]] = []
+        # 消息列表可视区上沿（px）。由网关每帧告知 —— 判「锚点上方那条是不是
+        # 从屏幕顶上挤出来的新卡片」要用它，见 ``_above_anchor_is_new``。
+        self._view_top: int | None = None
         self.baseline_built = False
         self.frames = 0
+
+    def set_view(self, view: tuple[int, int, int, int]) -> None:
+        """记录本帧消息列表的可视区 ``(l, t, r, b)``。拿不到就传全 0。"""
+        _, top, _, bottom = view
+        self._view_top = top if bottom - top > 0 else None
 
     # --- 对外 ---
 
@@ -1037,7 +1076,63 @@ class FrameDiffer:
         if idx < 0:
             # 锚点没了（换群、清缓存、一屏全换）。这一帧不发。
             return Diff(anchor_lost=True)
-        return Diff(units=units[idx + 1:])
+
+        # 锚点之后是常规的「新消息」；锚点**之前**偶尔也有真新内容 ——
+        # 见 ``_above_anchor_is_new``：卡片长在锚点上方时，只看后面会
+        # **永久丢掉**那条消息（实测 2026-10-17 19:12「标签履约周累计
+        # 达成」就这么没的，日志里一条错都不报）。
+        above = units[:idx] if self._above_anchor_is_new(units, idx) else []
+        return Diff(units=list(above) + units[idx + 1:], above=len(above))
+
+    def _above_anchor_is_new(self, units: list[Unit], idx: int) -> bool:
+        """锚点上方那些单元，能不能当真新消息发出去？
+
+        ── 为什么锚点上方也会有新内容 ──────────────────────────────
+        锚点的假设是「它之前的内容都是旧的、已经处理过」。真机上这个假设
+        会被打破，最典型的是**卡片长在锚点上方**：
+
+          19:08 开机建基线时屏上只有一条运维通知（锚点 = 它）；
+          19:12 机器人卡片渲染完，插到了那条通知**上面**；
+          此后每一帧都是「卡片 / 告警」，锚点一直是告警，
+          锚点之后**永远为空** —— 卡片被判成「不是新消息」，
+          一条都不会转发，而且日志里一句错都不报。
+
+        实测 2026-10-17 19:12~19:14 的「标签履约周累计达成（1012-1015）」
+        就是这样丢的：库里没有，微信也没收到。
+
+        ── 判据为什么这么保守 ──────────────────────────────────────
+        宽松判据（「锚点上方有没见过的内容就发」）会把**用户往上翻历史**
+        时的整屏旧消息灌进微信群 —— 那是绝对不能发生的事。所以只认一种
+        形状：锚点上方**只有一条**，而且它必须挤在屏幕最上沿。
+
+          · 翻历史：上方会有好几条，且整体高度填满屏幕 → 不是新内容；
+          · 卡片插入：上方就一条，底边紧贴锚点顶边，顶边贴着列表上沿。
+
+        ``tol`` 给 40px 余量：真机的气泡间距、圆角和滚动惯性都会有几十
+        像素的浮动。宁可偶尔漏一条（还有补全帧那条路兜着），也不能灌历史。
+        """
+        if idx != 1 or len(units) < 2:
+            return False
+        top = units[0]
+        anchor = units[1]
+        # **已经在锚点里的不算新**。重建基线后锚点会包含整屏最后若干条，
+        # 这时候「卡片在上、告警在下」的形状会一直满足下面的位置判据 ——
+        # 不排除的话，同一条卡片每一帧都被当成新消息抛一次（实测 4 帧抛
+        # 4 次，锚点却原地不动）。
+        if top.fp in self._anchor:
+            return False
+        view_top = self._view_top
+        if view_top is None:
+            return False
+        # bounds 的 y0/y1 在坏坐标的 H5 卡片里**顺序不可靠**（y0 可能是底边），
+        # 一律先归一化成 (上沿, 下沿) 再比。
+        top_hi = min(top.y0, top.y1)
+        top_lo = max(top.y0, top.y1)
+        anchor_hi = min(anchor.y0, anchor.y1)
+        anchor_lo = max(anchor.y0, anchor.y1)
+        # ① 上沿紧贴列表顶；② 它的下沿紧贴锚点的上沿（中间没夹别的消息）
+        return (top_hi <= view_top + 40
+                and abs(anchor_hi - top_lo) <= 40)
 
     def feed(self, units: list[Unit]) -> Diff:
         """判定并记住（锚点推进到本帧）。常规帧走这条路。"""

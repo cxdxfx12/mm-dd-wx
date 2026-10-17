@@ -19,8 +19,8 @@ if str(BASE) not in sys.path:
 
 from bridge.fingerprint import fp_of, norm_sender              # noqa: E402
 from bridge.sources.android_parse import (                     # noqa: E402
-    FrameDiffer, ParseError, Unit, clipped_units, needs_scroll, parse_frame,
-    units_to_messages,
+    Diff, FrameDiffer, ParseError, Unit, clipped_units, needs_scroll,
+    parse_frame, units_to_messages,
 )
 
 PKG = "com.alibaba.android.rimet"
@@ -770,6 +770,121 @@ class TestFrameDiffer(unittest.TestCase):
         d.note_scroll(self.units(("a", "1")))
         self.assertFalse(d.baseline_built)
         self.assertEqual(d._anchor, [])
+
+    # ---- 新内容长在锚点**上方** ----------------------------------------
+    #
+    # 真机事故（2026-10-17 19:12）：用户报「标签履约周累计达成（1012-1015）
+    # 又没采集到」，而库里确实一条都没有，日志也**一条错都不报**。抓下来的
+    # 那一帧（data/screen-20261017_191838.xml）说明原因：卡片在屏幕上、解析
+    # 完全正常（814 字、发送者对），但它渲染在锚点（那条采集波动告警）**上方**。
+    # 只看 ``units[idx+1:]`` 的话后面永远是空的 —— 卡片既不算新、也不入库，
+    # 就这么无声无息地丢了。
+    #
+    # 修法见 ``_above_anchor_is_new``：判据是「上沿紧贴列表顶」+「下沿紧贴
+    # 锚点上沿」，且必须是**已经在锚点里的**才排除（否则同一条卡片每帧抛一次）。
+
+    VIEW = (0, 265, 1176, 2018)         # 真机消息列表可视区
+
+    def laid_out(self, *items: tuple[str, str, int, int]) -> list[Unit]:
+        """(sender, content, y0, y1) → Unit，用来摆出真实的位置关系。"""
+        return [Unit(sender=s, content=c, y0=y0, y1=y1) for s, c, y0, y1 in items]
+
+    def card_above_alert(self) -> list[Unit]:
+        """真机那一帧的形状：卡片在上（顶到列表顶），告警在下（= 锚点）。"""
+        return self.laid_out(
+            ("履约跟单专员", self.CARD_A, 265, 1251),
+            ("服务诊断专员", "【系统】采集波动：无法确认新旧消息，本帧已跳过。", 1251, 1951),
+        )
+
+    def test_card_above_anchor_is_emitted(self):
+        """卡片从屏幕顶挤进来（在锚点上方）也必须发出去 —— 这就是漏的那条。"""
+        d = FrameDiffer()
+        d.set_view(self.VIEW)
+        d.feed(self.laid_out(
+            ("服务诊断专员", "【系统】采集波动：无法确认新旧消息，本帧已跳过。", 900, 1600)))
+        diff = d.feed(self.card_above_alert())
+        self.assertFalse(diff.anchor_lost)
+        self.assertEqual([u.sender for u in diff.units], ["履约跟单专员"],
+                         "锚点上方的卡片没被当成新消息")
+
+    def test_card_above_anchor_is_emitted_only_once(self):
+        """同一条卡片连来三帧，只能发一次（真机曾 4 帧抛 4 次）。"""
+        d = FrameDiffer()
+        d.set_view(self.VIEW)
+        d.feed(self.laid_out(
+            ("服务诊断专员", "【系统】采集波动：无法确认新旧消息，本帧已跳过。", 900, 1600)))
+        self.assertEqual(d.feed(self.card_above_alert()).count, 1)
+        self.assertEqual(d.feed(self.card_above_alert()).count, 0)
+        self.assertEqual(d.feed(self.card_above_alert()).count, 0)
+
+    def test_alert_after_card_is_not_replayed(self):
+        """卡片在上、告警在下：告警已经在锚点里，不能每帧重发一遍。"""
+        d = FrameDiffer()
+        d.set_view(self.VIEW)
+        d.feed(self.card_above_alert())              # 第一帧 = 基线，都不发
+        diff = d.feed(self.card_above_alert())
+        self.assertEqual(diff.count, 0)
+
+    def test_history_above_anchor_is_never_emitted(self):
+        """用户往上翻历史：整屏都是没转发过的旧消息，一条都不能当新消息。"""
+        d = FrameDiffer()
+        d.set_view(self.VIEW)
+        d.feed(self.laid_out(
+            ("a", "今天最后一条消息，说的是晚上的交接安排，请各位留意。", 265, 700)))
+        diff = d.feed(self.laid_out(
+            ("a", "很久以前的旧消息，内容是八月的积压情况一共 99 票。", 265, 700),
+            ("a", "更早的一条，说的是七月的派送异常与处理结果。", 700, 1200),
+            ("a", "今天最后一条消息，说的是晚上的交接安排，请各位留意。", 1200, 1700)))
+        self.assertEqual(diff.count, 0, "翻历史时把旧消息当新消息发出来了")
+
+    def test_card_above_without_view_info_is_ignored(self):
+        """拿不到可视区就不敢判 —— 宁可按老行为漏一次，也不注入历史。"""
+        d = FrameDiffer()
+        d.feed(self.laid_out(
+            ("服务诊断专员", "【系统】采集波动：无法确认新旧消息，本帧已跳过。", 900, 1600)))
+        diff = d.feed(self.card_above_alert())       # 没调 set_view
+        self.assertEqual(diff.count, 0)
+
+    def test_scrambled_flag_marks_frames_with_above_content(self):
+        """``scrambled`` 是给网关看的：这种帧的锚点已经不可靠，要重建基线。"""
+        d = FrameDiffer()
+        d.set_view(self.VIEW)
+        d.feed(self.laid_out(
+            ("服务诊断专员", "【系统】采集波动：无法确认新旧消息，本帧已跳过。", 900, 1600)))
+        diff = d.feed(self.card_above_alert())
+        self.assertTrue(diff.scrambled)
+        self.assertEqual(diff.above, 1)
+        # above 是 units 的**前缀**：units = 上方的卡片 + 锚点之后的部分
+        self.assertEqual(diff.count, diff.above, "above 应计入 units")
+
+    def test_anchor_only_drops_the_above_section(self):
+        """推进锚点时只该看「锚点及其之前」，否则新卡片会被当成锚点吞掉。"""
+        d = FrameDiffer()
+        d.set_view(self.VIEW)
+        d.feed(self.laid_out(
+            ("服务诊断专员", "【系统】采集波动：无法确认新旧消息，本帧已跳过。", 900, 1600)))
+        frame = self.card_above_alert()
+        diff = d.peek(frame)
+        kept = diff.anchor_only(frame)
+        self.assertEqual([u.sender for u in kept], ["履约跟单专员", "服务诊断专员"])
+
+        # 没有上方内容时原样返回（不复制、不切片）
+        plain = self.laid_out(
+            ("履约跟单专员", self.CARD_A, 265, 1251),
+            ("服务诊断专员", "【系统】采集波动：无法确认新旧消息，本帧已跳过。", 1251, 1951))
+        self.assertIs(Diff().anchor_only(plain), plain)
+
+    def test_peek_does_not_move_anchor(self):
+        """peek 只判不提交 —— 网关要靠这一点在锚点丢失时保留旧锚点。"""
+        d = FrameDiffer()
+        d.set_view(self.VIEW)
+        d.feed(self.laid_out(
+            ("服务诊断专员", "【系统】采集波动：无法确认新旧消息，本帧已跳过。", 900, 1600)))
+        before = list(d._anchor)
+        d.peek(self.card_above_alert())
+        self.assertEqual(d._anchor, before)
+        d.commit(self.card_above_alert())
+        self.assertNotEqual(d._anchor, before)
 
 
 # ------------------------------------------------------------------ 表格消息
