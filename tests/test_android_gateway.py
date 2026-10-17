@@ -26,8 +26,8 @@ from bridge.config import Config, DingTalkConfig, RouteConfig, StorageConfig, We
 from bridge.fingerprint import fp_of, norm_sender, unit_fp
 from bridge.service import BridgeService
 from bridge.sources.android_gateway import (
-    MAX_BATCH, MAX_SCREEN_BODY, OFFLINE_REMIND_EVERY, AndroidGatewaySource,
-    _Ctx, _online_now, _watchdog_step, build_messages, lan_ips,
+    HEARTBEAT_GRACE, MAX_BATCH, MAX_SCREEN_BODY, OFFLINE_REMIND_EVERY,
+    AndroidGatewaySource, _Ctx, _online_now, _watchdog_step, build_messages, lan_ips,
 )
 from bridge.sources.base import Source
 from bridge.sources.factory import build_source
@@ -1043,7 +1043,12 @@ class TestWatchdog(unittest.TestCase):
         c.touch()                                   # 有业务上报，无心跳
         base = c.last_seen
 
-        msg = _watchdog_step(c, base, base + 1, 300.0)
+        # 宽限期内不下结论：真机上第一帧画面几乎总比第一个心跳先到，
+        # 立刻断言「旧版 APK」会把排查带去「装错包」（每次重启都误报一次）
+        self.assertIsNone(_watchdog_step(c, base, base + 1, 300.0))
+        self.assertEqual(c.state, "waiting")
+
+        msg = _watchdog_step(c, base, base + HEARTBEAT_GRACE + 1, 300.0)
         self.assertEqual(msg[0], logging.INFO)
         self.assertIn("0.2.0", msg[1])
         self.assertEqual(c.state, "online")

@@ -88,6 +88,11 @@ OFFLINE_TICK = 10.0
 # 每 10 秒刷一条 WARNING 会把日志文件灌满，真问题反而被盖掉。
 OFFLINE_REMIND_EVERY = 1800.0
 
+# 刚启动时给心跳留的宽限期（秒）。手机端心跳 60 秒一次，而第一帧画面几乎
+# 总是比第一个心跳先到 —— 不设宽限期的话，每次重启主程序都会立刻判出一条
+# 「多半是旧版 APK」，把人往「装错包」的方向带。取 2 倍心跳间隔，稳妥。
+HEARTBEAT_GRACE = 120.0
+
 TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                 "%m-%d %H:%M", "%H:%M")
 
@@ -157,7 +162,11 @@ def _watchdog_step(ctx: "_Ctx", started: float, now: float,
 
             # ---- 情况二：有上报但从没心跳（旧版 APK，没有心跳就没法判失联）----
             elif not heard:
-                if state != "online":
+                # 宽限期：手机端心跳 60 秒一次，而**第一帧画面往往比第一个心跳先到**
+                # （重启主程序、或手机刚上报完一帧后的头一分钟就是这样）。这时候
+                # 立刻下「旧版 APK」的结论是错的，真机重启时每次都这么报一次，
+                # 排查的人会以为装错了包，白折腾。
+                if state != "online" and now - started >= HEARTBEAT_GRACE:
                     new_state = "online"
                     msg = (logging.INFO,
                            "已收到手机（%s）的上报，但它没有发心跳 —— 多半是旧版 APK。"
