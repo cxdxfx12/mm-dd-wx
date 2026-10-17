@@ -684,8 +684,14 @@ class TestFrameDiffer(unittest.TestCase):
 
 # ------------------------------------------------------------------ 表格消息
 
+def dt_text(label: str, left: int, top: int, right: int, bottom: int) -> str:
+    """卡片正文里的一段普通文字（left 恒为 212，right 被裁到屏宽）。"""
+    return (f'<node index="70" text="{label}" class="android.widget.TextView" '
+            f'package="{PKG}" bounds="[{left},{top}][{right},{bottom}]"></node>')
+
+
 def dt_table(rows: list[list[str]], *, top: int, left: int = 212,
-             cell: int = 452) -> str:
+             cell: int = 452, cols: list[int] | None = None) -> str:
     """气泡里的横滑表格（真机 2026-10-17 16:31 那一帧的形状）。
 
     真机的两个反直觉之处，这里都照实复现：
@@ -696,13 +702,16 @@ def dt_table(rows: list[list[str]], *, top: int, left: int = 212,
     2. 表头与数据行的 y 区间不整齐（659~770 / 810~869），同一行的格子
        垂直区间重叠但中心不相等。
     3. 格子前面夹着 8px 宽的装饰 View（无文本）。
+
+    ``cols`` 给的是**绝对 x 列表**：真机的列宽并不相等（三列那张是
+    250 / 548 / 714，不是等距），等距模型只适合横向铺开的宽表。
     """
     idx = 80
     parts = []
     for r, cells in enumerate(rows):
         y = top + 151 * r
         for c, text in enumerate(cells):
-            x = left + 38 + c * cell
+            x = cols[c] if cols else left + 38 + c * cell
             if c:     # 列分隔装饰
                 parts.append(
                     f'<node index="{idx}" text="" class="android.view.View" '
@@ -827,6 +836,36 @@ class TestCardTable(unittest.TestCase):
         xml = dt_frame(item).replace(":id/list_view", ":id/some_future_id")
         f = parse_frame(xml)
         self.assertNotEqual(f.container, "HorizontalScrollView")
+
+    # --- 2026-10-17 16:42 第二次事故：三列表 + 头顶挤成一行 ---
+
+    SMALL = [["小件员名称", "票数", "单号"],
+             ["周吉祥", "1票", "777454064365026"]]
+    SMALL_COLS = [250, 548, 714]        # 真机 08:13 那张三列表的实际列坐标
+
+    def test_header_not_stolen_by_the_title_row(self):
+        """三列表只有两行时，气泡顶部那一排（头像/昵称/角标/首段）列数更多，
+        不能被当成表头 —— 一旦被当成表头，真正的表头就被截掉，整张表判成
+        「不是表格」，连带正文压成一大坨纯文本。"""
+        item = dt_item("今天 08:13",
+                       dt_card_message("拦截跟单专员",
+                                       dt_table(self.SMALL, top=640,
+                                                cols=self.SMALL_COLS), 320))
+        body = parse_frame(dt_frame(item)).units[0].content
+        self.assertIn("小件员名称: 周吉祥 ｜ 票数: 1票 ｜ 单号: 777454064365026", body)
+
+    def test_body_around_the_table_is_kept(self):
+        """表格只替换自己的格子，表格前后的正文必须原样留在原位。"""
+        cells = (dt_text("表格上面的一句话", 212, 600, 964, 660)
+                 + dt_table(self.SMALL, top=700, cols=self.SMALL_COLS)
+                 + dt_text("表格下面的一句话", 212, 1000, 964, 1060))
+        item = dt_item("今天 08:13",
+                       dt_card_message("拦截跟单专员", cells, 320))
+        body = parse_frame(dt_frame(item)).units[0].content
+        lines = body.split("\n")
+        self.assertEqual(lines[0], "表格上面的一句话")
+        self.assertIn("小件员名称: 周吉祥", lines[1])
+        self.assertEqual(lines[-1], "表格下面的一句话")
 
 
 # ------------------------------------------------------------------ 单元 → 消息

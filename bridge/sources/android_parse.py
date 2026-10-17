@@ -404,12 +404,28 @@ def find_message_list(root: Node) -> Node | None:
     return _drill_into(best, cands) or (best if units_of(best) else None)
 
 
+def _is_semantic_list(node: Node) -> bool:
+    """这个节点是不是「消息列表」那一层（靠钉钉的语义 id 认）。
+
+    ⚠ 消息列表的 id 是不混淆的语义名，而气泡里的横滑表格是**匿名**的。
+    所以只要认出了语义列表，它里面的任何东西都不该再被当成容器候选。
+    """
+    return node.rid.rsplit("/", 1)[-1] in MESSAGE_LIST_IDS
+
+
 def _drill_into(best: Node, cands: list[Node]) -> Node | None:
     """外层只是壳时往里钻一层（``ScrollView > RecyclerView`` 是常见写法）。
 
     ⚠ 别钻进「气泡里的横滑表格」：它嵌在消息列表里、文本量也够，但它不是列表。
     真机事故就是从这个方向钻进去的（表格 60 个叶子 vs 列表 74 个，过了「一半」）。
+
+    ⚠ 已经认准语义列表（``list_view``）时，**一律不钻**。三列小表格（如
+    「小件员名称 / 票数 / 单号」）根本不横向溢出，靠溢出去识别它必然失效，
+    而它只有 1 个单元，钻进去就等于把整屏消息换成一张表的一行 —— 锚点当场
+    失效、整屏停转（2026-10-17 16:42 就是这样）。
     """
+    if _is_semantic_list(best):
+        return best
     for _ in range(4):
         outer_leaves = len(_leaves(best))
         inner = [c for c in cands
@@ -703,15 +719,42 @@ def _table_rows(nodes: list[Node]) -> list[list[str]]:
     # 行内只按 left 排序 —— 真机上格子的 right 全被裁剪成屏幕宽度（都报 964），
     # 左边界才是可信的列位置（实测 250 / 702 / 1154 …，每列递增 452）。
     grid = [sorted(r, key=lambda b: b[0]) for r in rows]
-    grid = [r for r in grid if len(r) >= 3]
-    if len(grid) < 2:
-        return []
 
-    # 表头 = 列数最多的那一行；只保留列数与它一致的行（挡掉正文行）。
-    cols = max(len(r) for r in grid)
-    head_at = next(i for i, r in enumerate(grid) if len(r) == cols)
-    grid = [r for r in grid[head_at:] if len(r) == cols]
-    return grid if len(grid) >= 2 else []
+    # ⚠ 不能拿「列数最多的那一行」当表头 —— 气泡顶部那几个节点（头像、
+    # 昵称、"机器人"角标、正文首段）y 都在同一水平线上，会被聚成一行 4 列的
+    # "伪表头"，把真正的表头挤到后面去。真机 16:31 那张三列表就是这么被
+    # 判成「不是表格」的（整条消息连带表格压成一大坨纯文本）。
+    #
+    # 可靠判据是**列起点**：表格的行里跑的是同一组 x（每一列左边界固定），
+    # 而正文/标题那一行是「靠左对齐的几句话」，x 各不相同。所以：
+    # 找出现次数最多的列起点组合，只有它的 x 集合与某行**完全一致**时，
+    # 那一行才算表格行。
+    def _sig(row: list[tuple]) -> tuple[int, ...]:
+        return tuple(b[0] for b in row)
+
+    tally: dict[tuple[int, ...], int] = {}
+    for row in grid:
+        if len(row) >= 3:
+            tally[_sig(row)] = tally.get(_sig(row), 0) + 1
+    if not tally:
+        return []
+    # 出现最多的签名 = 表格主体的列布局；一样多时取列数多的那个。
+    main = max(tally, key=lambda s: (tally[s], len(s)))
+    if tally[main] < 2:
+        # 只有一行是这个列布局 —— 孤零零的一行三列，多半是正文里恰好
+        # 排了三个词，不是表格。宁可漏也不要把正文拆成「列名: 值」。
+        return []
+    body = [row for row in grid if _sig(row) == main]
+
+    # 表头：紧挨在表格主体**上方**、列数同样是 len(main) 的那一行。
+    # （真机上表头和数据行的 x 完全对齐，只是文字不同。）
+    first_at = grid.index(body[0])
+    head = None
+    for row in reversed(grid[:first_at]):
+        if len(row) == len(main):
+            head = row
+            break
+    return ([head] + body) if head else body
 
 
 def _render_table(grid: list[list[tuple]]) -> str:
@@ -731,6 +774,27 @@ def _render_table(grid: list[list[tuple]]) -> str:
         else:
             lines.append(" ｜ ".join(cells))
     return "\n".join(lines)
+
+
+def _inline_table(body_nodes: list[Node]) -> tuple[str, list[Node], int]:
+    """气泡正文 → ``(表格文本, 表格之外的正文节点, 表格首行的 y)``。
+
+    不是表格就返回 ``("", [], 0)``。把「坐标还原」和「哪些节点算表格」放在
+    一起，是因为 ``split_row`` 需要后者：一张卡片里往往是「几段正文 + 一张表
+    + 几段正文」，只把整条消息换成表格会把正文全吞掉（真机 08:13 那张拦截单
+    卡片就是：表格前后各有 4 段话）。
+    """
+    grid = _table_rows(body_nodes)
+    if not grid:
+        return "", [], 0
+    cell_keys = {(b[0], b[1], b[4]) for row in grid for b in row}
+    rest: list[Node] = []
+    for n in body_nodes:
+        left, top, right, bottom = n.bounds
+        if (left, min(top, bottom), n.label.strip()) in cell_keys:
+            continue                    # 这个节点是表格格，已经从 grid 还原过了
+        rest.append(n)
+    return _render_table(grid), rest, min(b[1] for b in grid[0])
 
 
 def split_row(row: Node) -> Unit:
@@ -769,11 +833,18 @@ def split_row(row: Node) -> Unit:
 
     # 卡片消息里的表格：它被读成「列优先」的一竖排（10 个列名、然后 10 个值……），
     # 直接发出去就是一堆对不上号的名字和数字。这里按坐标还原成一行一条记录。
-    grid = _table_rows(body_nodes)
-    if grid:
-        return Unit(sender=sender, content=_render_table(grid),
-                    kind="text", y0=y0, y1=y1)
-
+    #
+    # ⚠ 表格只替换它自己那几个格子，**正文必须原样留着**：真机的卡片基本是
+    # 「几段话 + 一张表 + 几段话」，早期版本直接 return 表格，结果整条消息
+    # 只剩一行数据，提示语、附件说明全没了（08:13 那张拦截单卡片）。
+    table, rest, cut = _inline_table(body_nodes)
+    if table:
+        # 表格插回它原来的纵向位置：y 比表格首行小的正文在上面，其余在下面。
+        y_of = lambda n: min(n.bounds[1], n.bounds[3])
+        upper = [n.label for n in rest if y_of(n) < cut]
+        lower = [n.label for n in rest if y_of(n) >= cut]
+        text = "\n".join(upper + [table] + lower).strip()
+        return Unit(sender=sender, content=text, kind="text", y0=y0, y1=y1)
 
     if all(PLACEHOLDER_RE.match(x) for x in body):
         return Unit(sender=sender, content=body[0],
