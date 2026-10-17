@@ -145,6 +145,33 @@
             android:textSize="13sp"
             android:text="@string/label_snapshot" />
 
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:text="@string/section_keepalive" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:textSize="12sp"
+            android:text="@string/hint_keepalive" />
+
+        <Button
+            android:id="@+id/btn_battery"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/btn_battery" />
+
+        <Button
+            android:id="@+id/btn_startup"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/btn_startup" />
+
         <Button
             android:id="@+id/btn_save"
             android:layout_width="match_parent"

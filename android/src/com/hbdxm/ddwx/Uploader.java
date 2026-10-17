@@ -101,6 +101,54 @@ final class Uploader {
         }
     }
 
+    /**
+     * POST /ping —— 心跳。
+     *
+     * <p>它看起来是多余的（抓取本来就在跑），但电脑侧<b>只能</b>靠它判断手机还在不在：
+     * 抓取只在画面变化时上报，群里半天没人说话时一个包都不发，电脑侧看到的现象
+     * 和「App 被系统杀了」完全一样。没有心跳就只能等用户自己发现「群里怎么没消息了」。
+     *
+     * <p>body 刻意是空对象而不是空串：网关对 /ping 只做「读掉请求体」，
+     * 但空串会让某些代理/防火墙当成畸形请求而丢掉。
+     */
+    static Result heartbeat(String host, int port, String token) {
+        HttpURLConnection conn = null;
+        try {
+            byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
+            conn = open("http://" + host + ":" + port + "/ping", "POST");
+            conn.setFixedLengthStreamingMode(body.length);
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            conn.setRequestProperty("X-Bridge-Token", token);
+            conn.setRequestProperty("X-Ddwx-Device",
+                    Build.MODEL == null ? "" : Build.MODEL);
+
+            OutputStream os = conn.getOutputStream();
+            try {
+                os.write(body);
+                os.flush();
+            } finally {
+                closeQuietly(os);
+            }
+
+            int code = conn.getResponseCode();
+            String resp = readBody(code >= 400 ? conn.getErrorStream() : conn.getInputStream());
+            if (code >= 200 && code < 300) {
+                return new Result(true, code, "心跳正常 " + trim(resp, 80));
+            }
+            if (code == 401) {
+                return new Result(false, code,
+                        "心跳被拒（401）：App 里的 token 与电脑端不一致");
+            }
+            return new Result(false, code, "HTTP " + code + " " + trim(resp, MAX_BODY));
+        } catch (Exception e) {
+            return new Result(false, 0, describe(e));
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
     /** GET /ping?token=... —— 设置页的「测试连通性」。 */
     static Result ping(String host, int port, String token) {
         HttpURLConnection conn = null;

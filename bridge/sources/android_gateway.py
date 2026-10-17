@@ -81,9 +81,125 @@ SCREEN_LOG_EVERY = 30
 # 连续这么多帧都认不出「聊天页」→ 升到 WARNING（会触发钉钉告警）。
 # 认不出意味着一条都不转发，属于「程序在跑但静默失效」，必须让人知道。
 UNKNOWN_PAGE_ALERT_AFTER = 3
+# 看门狗多久检查一次「手机还在不在」（秒）。比心跳间隔（手机端 60s）小得多，
+# 所以失联的发现延迟最多是「心跳间隔 + 这个 tick」。
+OFFLINE_TICK = 10.0
+# 失联期间重复提醒的间隔（秒）。告警本身有冷却，但日志也需要一个节奏 ——
+# 每 10 秒刷一条 WARNING 会把日志文件灌满，真问题反而被盖掉。
+OFFLINE_REMIND_EVERY = 1800.0
 
 TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                 "%m-%d %H:%M", "%H:%M")
+
+
+# --------------------------------------------------------------- 失联看门狗
+
+def _fmt_span(seconds: float) -> str:
+    s = int(max(0.0, seconds))
+    if s < 60:
+        return f"{s} 秒"
+    if s < 3600:
+        return f"{s // 60} 分钟"
+    return f"{s // 3600} 小时 {s % 3600 // 60} 分钟"
+
+
+def _watchdog_step(ctx: "_Ctx", started: float, now: float,
+                   offline_after: float) -> tuple[int, str, tuple] | None:
+    """判一次「手机还在不在」，顺带把状态迁移写回 ``ctx``。
+
+    返回 ``(日志级别, 模板, 参数)``，不该说话时返回 ``None``。
+
+    抽成纯函数（只依赖传入的 ``now``、不自己取时钟）是为了**可测**：
+    走线程 + sleep 的测试既慢又会在负载高时随机红，而这里的每一条分支
+    （从没收到过 / 掉线 / 恢复 / 旧版没有心跳）都是必须逐条锁住的现场结论。
+    """
+    msg: tuple[int, str, tuple] | None = None
+    with ctx.seen_lock:
+            last, heard = ctx.last_seen, ctx.heard_heartbeat
+            state, device = ctx.state, ctx.last_device
+            wall, last_alert = ctx.last_seen_wall, ctx.last_alert_at
+            gap = (now - last) if last > 0.0 else (now - started)
+            new_state = state
+
+            # ---- 情况一：启动之后一次都没收到过 ----
+            if last <= 0.0:
+                if state != "missing" and gap >= offline_after:
+                    new_state = "missing"
+                    ctx.last_alert_at = now
+                    msg = (logging.WARNING,
+                           "安卓网关已就绪 %s，但一次都没有收到手机的上报。"
+                           "手机端请自查：App 在运行吗？无障碍服务还开着吗？"
+                           "填的 IP/端口/token 与电脑端一致吗（token 不对会一直是"
+                           " 401）？手机和电脑在同一 Wi-Fi 吗？",
+                           (_fmt_span(gap),))
+                elif state == "missing" and now - last_alert >= OFFLINE_REMIND_EVERY:
+                    ctx.last_alert_at = now
+                    msg = (logging.WARNING,
+                           "手机端仍然没有任何上报（已经 %s）。",
+                           (_fmt_span(gap),))
+
+            # ---- 情况二：有上报但从没心跳（旧版 APK，没有心跳就没法判失联）----
+            elif not heard:
+                if state != "online":
+                    new_state = "online"
+                    msg = (logging.INFO,
+                           "已收到手机（%s）的上报，但它没有发心跳 —— 多半是旧版 APK。"
+                           "旧版只在画面变化时上报，无法区分「App 被系统杀了」和"
+                           "「群里没人说话」，所以失联检测对旧版不启用（否则必然"
+                           "误报）。要准确检测请把手机端升级到 0.2.0。",
+                           (device or "未知机型",))
+
+            # ---- 情况三：正常在线 ----
+            elif gap <= offline_after:
+                if state == "offline":
+                    away = now - (ctx.offline_last_seen or last)
+                    ctx.offline_last_seen = 0.0
+                    msg = (logging.WARNING,
+                           "手机端恢复上报（断开了约 %s）。", (_fmt_span(away),))
+                elif state == "missing":
+                    msg = (logging.WARNING,
+                           "手机端终于连上了（网关启动后空等了 %s）。",
+                           (_fmt_span(now - started),))
+                new_state = "online"
+
+            # ---- 情况四：失联 ----
+            elif state != "offline" or now - last_alert >= OFFLINE_REMIND_EVERY:
+                new_state = "offline"
+                ctx.last_alert_at = now
+                ctx.offline_last_seen = last
+                msg = (logging.WARNING,
+                       "手机端失联：已经 %s 没有心跳（最后一次 %s，机型 %s）。"
+                       "常见原因：系统把 App 清理了 / 锁屏断网 / 手机换了 Wi-Fi。"
+                       "处理：打开手机上的采集端 App，看「最后动作」那一行是不是"
+                       "「上报失败」；若 App 已被关掉，重新打开并确认无障碍服务"
+                       "仍然开启。",
+                       (_fmt_span(gap), wall or "未知", device or "未知机型"))
+
+            ctx.state = new_state
+    return msg
+
+
+def _watchdog(ctx: "_Ctx", offline_after: float,
+              stop: threading.Event) -> None:
+    """盯着「手机还在不在」，状态**只在变化时**说话。
+
+    为什么必须有这东西：手机端 App 被系统清掉、锁屏断网之后，电脑侧什么异常
+    都收不到 —— 没有连接、没有请求、没有报错。表现出来的样子是「程序安安静静
+    在跑」，而实际上一条消息都不会再转发。这种静默失效只能靠主动探测发现。
+
+    判据用**心跳**（手机端每 60 秒 POST /ping），不用「多久没收到画面」：
+    群里半天没人说话时画面本来就不变、手机也不上报，按画面判会天天误报，
+    而误报几次之后人就再也不看告警了 —— 那比不告警更糟。
+
+    决策在锁内、日志在锁外。看着绕，但必须这样：告警处理器是**同步发 HTTP**
+    到钉钉的（要几秒），持锁写日志会把手机下一次上报一起卡住，
+    现场表现成「一告警就断线」，反而更像手机出问题。
+    """
+    started = time.monotonic()
+    while not stop.wait(OFFLINE_TICK):
+        msg = _watchdog_step(ctx, started, time.monotonic(), offline_after)
+        if msg is not None:
+            log.log(msg[0], msg[1], *msg[2])
 
 
 # --------------------------------------------------------------- 报文解析
@@ -251,12 +367,48 @@ class _Ctx:
     # 锚点，用来判「哪几条是新的」，所以必须跟 ctx 一起走、由同一把锁保护。
     parse: bool = False
     differ: FrameDiffer | None = None
+    # 失联判定阈值（秒），0 = 不检测。只用于 /ping 的回包与看门狗。
+    offline_after: float = 300.0
     # 上一次「不是聊天页，本帧跳过」的说明。用户点开 @ 面板会连着报好几帧，
     # 内容一样就没必要重复写日志（日志是滚动文件，刷满了会盖掉真问题）。
     last_skip_note: str = ""
     # 连续多少帧认不出聊天页。只数「认不出来」，明确的 @ 面板/群信息不计。
     skip_streak: int = 0
+    # ---- 在线状态（失联告警用）----
+    # 最后一次收到手机上报的时刻（time.monotonic）。0 = 至今一次都没收到。
+    last_seen: float = 0.0
+    last_seen_wall: str = ""              # 同一时刻的人话版本，写进告警文案
+    last_device: str = ""                 # 手机型号，告警时好认出是哪台
+    # 是否收到过**心跳**。判定失联必须有它：手机端只在画面变化时上报，
+    # 群里半天没人说话时它本来就不发东西 —— 按「多久没收到上报」判会天天误报。
+    heard_heartbeat: bool = False
+    # waiting（启动后还没收到）/ online / offline / missing（一直没收到）
+    state: str = "waiting"
+    last_alert_at: float = 0.0            # 上次告警时刻，用来控制重复提醒的节奏
+    # 掉线那一刻「最后一次心跳」的时间。恢复时要用它算「断了多久」——
+    # 不能用恢复后的 gap，那时 last_seen 刚被心跳刷新，算出来永远是 0 秒，
+    # 日志会变成「断开了约 0 秒」，正好把最想看的信息抹掉。
+    offline_last_seen: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # 在线状态用**单独的锁**。绝不能复用上面那把：`_post_screen` 是拿着 lock
+    # 再去调 touch 的，同一把不可重入的 Lock 会当场死锁 —— 表现是「收到画面后
+    # 网关整个卡住，手机上报超时」，而日志里什么都没有。
+    seen_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def touch(self, device: str = "", heartbeat: bool = False) -> None:
+        """记一次「手机还活着」。心跳与业务上报都算。
+
+        这里**只更新时间戳、不改状态**：状态机和它的日志全交给看门狗一处做，
+        否则「恢复」的日志会出现在请求线程里、与看门狗的判定互相打架，
+        现场就成了「一会儿说恢复、一会儿说失联」。
+        """
+        with self.seen_lock:
+            self.last_seen = time.monotonic()
+            self.last_seen_wall = time.strftime("%H:%M:%S")
+            if device:
+                self.last_device = device
+            if heartbeat:
+                self.heard_heartbeat = True
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -338,8 +490,20 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/screen":
             self._get_screen()
             return
+        if path == "/ping":
+            # 只有带 hb=1 才算「手机还在」：浏览器/curl 里随手打开一次只是自测，
+            # 若也刷新在线状态，人工排查反而会把真正的失联掩盖掉。
+            q = parse_qs(urlparse(self.path).query)
+            if (q.get("hb") or [""])[0] in ("1", "true", "yes"):
+                self.ctx.touch(device=(q.get("device") or [""])[0],
+                               heartbeat=True)
         self._reply(200, {"ok": True, "source": "android",
                           "chat_name": self.ctx.chat_name,
+                          "online": bool(self.ctx.last_seen),
+                          "last_seen": self.ctx.last_seen_wall,
+                          "device": self.ctx.last_device,
+                          "heartbeat": self.ctx.heard_heartbeat,
+                          "offline_after": self.ctx.offline_after,
                           "screen": _screen_meta(self.ctx.screen),
                           "stats": dict(self.ctx.count)})
 
@@ -370,11 +534,30 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:                                # noqa: N802
         path = self._path()
-        if path not in ("/", "/messages", "/screen"):
+        if path not in ("/", "/messages", "/screen", "/ping"):
             self._reply(404, {"ok": False, "error": "未知路径"})
             return
         if not self._auth_ok():
             self._reject_auth()
+            return
+
+        if path == "/ping":
+            # 手机端的**心跳**。它存在的唯一理由，是让电脑侧能区分
+            # 「手机好好的，只是群里没人说话」和「手机端已经死了」——
+            # 前者的表现是「没有新消息」，后者也是，光看消息永远分不出来。
+            # 手机端会带一个 {} 作请求体；curl 手测可能什么都不带。
+            # 不读掉又直接回包的话，客户端还在写 → RST → 它只看到「连接被重置」。
+            try:
+                hb_len = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                hb_len = 0
+            self._drain(hb_len)
+            device = (self.headers.get("X-Ddwx-Device") or "").strip()
+            self.ctx.touch(device=device, heartbeat=True)
+            self._reply(200, {"ok": True, "source": "android",
+                              "chat_name": self.ctx.chat_name,
+                              "last_seen": self.ctx.last_seen_wall,
+                              "offline_after": self.ctx.offline_after})
             return
 
         limit = MAX_SCREEN_BODY if path == "/screen" else MAX_BODY
@@ -419,6 +602,10 @@ class _Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError) as exc:
             self._reply(400, {"ok": False, "error": str(exc)})
             return
+
+        # 能在 /messages 里报消息，本身就说明手机还活着（老版 APK 没有心跳，
+        # 靠这一条也能让「启动后一次都没收到」的告警不再误报）。
+        self.ctx.touch(device=(self.headers.get("X-Ddwx-Device") or "").strip())
 
         for msg in msgs:
             try:
@@ -485,6 +672,10 @@ class _Handler(BaseHTTPRequestHandler):
             note = ""
             if self.ctx.parse and self.ctx.on_message is not None:
                 pending, note = self._ingest(text)
+
+        # 记「手机还活着」。必须在锁外调：touch 走的是另一把锁，
+        # 但把它放在这里能让 hold 锁的时间只包含解析。
+        self.ctx.touch(device=screen["device"])
 
         if count == 1:
             log.info("收到第一帧手机画面：%d 字节，%d 条文本（来自 %s）",
@@ -624,6 +815,12 @@ class AndroidGatewaySource(Source):
             self.port = DEFAULT_PORT
         self.token = str(getattr(dt, "gateway_token", "") or "").strip()
         self.parse = bool(getattr(dt, "android_parse", False))
+        try:
+            self.offline_after = float(getattr(dt, "android_offline_after", 300.0))
+        except (TypeError, ValueError):
+            self.offline_after = 300.0
+        if self.offline_after < 0:
+            self.offline_after = 0.0          # 负数按「关闭」处理，别让它变成「秒级误报」
         self.chat_name = (dt.chat_names or [""])[0] if dt.chat_names else ""
         self.companies = list(dt.companies or [])
 
@@ -632,6 +829,8 @@ class AndroidGatewaySource(Source):
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._ready = threading.Event()
+        self._watchdog_stop = threading.Event()
+        self.online = False                    # 只用于退出时留个快照
 
     # --- 生命周期 ---
 
@@ -660,7 +859,7 @@ class AndroidGatewaySource(Source):
 
         ctx = _Ctx(token=self.token, chat_name=self.chat_name,
                    companies=self.companies, on_message=on_message,
-                   parse=self.parse,
+                   parse=self.parse, offline_after=self.offline_after,
                    differ=FrameDiffer() if self.parse else None)
         self._stop.clear()
         try:
@@ -694,15 +893,34 @@ class AndroidGatewaySource(Source):
                         "要开启解析：config.yaml 的 dingtalk.android_parse 设为 true"
                         "（先用 tools/android_capture.py 看过一帧真实画面的解析结果）")
 
+        # ---- 失联看门狗 ----
+        self._watchdog_stop = threading.Event()
+        if self.offline_after > 0:
+            self._watchdog_stop.clear()
+            threading.Thread(target=_watchdog,
+                             args=(ctx, self.offline_after, self._watchdog_stop),
+                             name="android-watchdog", daemon=True).start()
+            log.info("  失联检测已开启：手机超过 %s 没有心跳就告警"
+                     "（要准确检测，手机端需 0.2.0 及以上；旧版只会报「一次都没收到」）",
+                     _fmt_span(self.offline_after))
+        else:
+            log.info("  失联检测已关闭（dingtalk.android_offline_after = 0）："
+                     "手机端挂了不会有任何提示，只能靠群里没消息自己察觉")
+
         try:
             server.serve_forever(poll_interval=0.5)
         finally:
+            self._watchdog_stop.set()
             server.server_close()
             self._server = None
             self.count = dict(ctx.count)
+            self.online = bool(ctx.last_seen)
 
     def stop(self) -> None:
         self._stop.set()
+        wd = getattr(self, "_watchdog_stop", None)
+        if wd is not None:
+            wd.set()
         srv = self._server
         if srv is not None:
             # shutdown() 必须与 serve_forever 不在同一个线程里调用，

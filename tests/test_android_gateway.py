@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import tempfile
 import threading
@@ -24,7 +25,8 @@ from bridge.config import Config, DingTalkConfig, RouteConfig, StorageConfig, We
 from bridge.fingerprint import fp_of, norm_sender, unit_fp
 from bridge.service import BridgeService
 from bridge.sources.android_gateway import (
-    MAX_BATCH, MAX_SCREEN_BODY, AndroidGatewaySource, build_messages, lan_ips,
+    MAX_BATCH, MAX_SCREEN_BODY, OFFLINE_REMIND_EVERY, AndroidGatewaySource,
+    _Ctx, _watchdog_step, build_messages, lan_ips,
 )
 from bridge.sources.base import Source
 from bridge.sources.factory import build_source
@@ -62,6 +64,7 @@ def make_cfg(port: int, token: str = TOKEN, **kw) -> Config:
         chat_names=kw.pop("chat_names", ["数字质控"]),
         companies=kw.pop("companies", []),
         android_parse=kw.pop("android_parse", False),
+        android_offline_after=kw.pop("android_offline_after", 300.0),
     )
     return Config(dingtalk=dt, **kw)
 
@@ -846,6 +849,198 @@ class TestScreenParse(GatewayCase):
         """默认（android_parse 未开）时 /screen 一条都不产生 —— 只收不转。"""
         cfg = make_cfg(free_port(), TOKEN)
         self.assertFalse(cfg.dingtalk.android_parse)
+
+
+# --------------------------------------------------------------- 心跳与失联
+#
+# 这一层解决的是「程序在跑、但一条都不转，而且没人发现」——手机端 App 被系统
+# 清理、锁屏断网之后，电脑侧收不到任何异常。判据只能是心跳。
+
+MIN_FRAME = ('<?xml version="1.0" encoding="UTF-8"?><hierarchy rotation="0">'
+             '<node class="android.widget.FrameLayout" '
+             'package="com.alibaba.android.rimet" bounds="[0,0][1080,2340]">'
+             '<node class="android.widget.ListView" '
+             'package="com.alibaba.android.rimet" scrollable="true" '
+             'bounds="[0,200][1080,2100]"/></node></hierarchy>')
+
+
+class TestHeartbeatEndpoint(GatewayCase):
+    """心搏端点的行为锁死：谁能刷新「在线」，谁不能。"""
+
+    def post_ping(self, token: str | None = TOKEN, device: str = "PAL-AL00"):
+        req = urllib.request.Request(self.url("/ping"), data=b"{}",
+                                     method="POST")
+        if token is not None:
+            req.add_header("X-Bridge-Token", token)
+        if device:
+            req.add_header("X-Ddwx-Device", device)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode("utf-8"))
+
+    def post_frame(self):
+        req = urllib.request.Request(self.url("/screen"),
+                                     data=MIN_FRAME.encode("utf-8"),
+                                     method="POST")
+        req.add_header("X-Bridge-Token", TOKEN)
+        req.add_header("Content-Type", "text/plain; charset=utf-8")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status
+
+    def test_post_ping_marks_online(self):
+        code, body = self.post_ping()
+        self.assertEqual(code, 200)
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["last_seen"])          # 形如 "13:31:58"
+
+        _, state = self.get()
+        self.assertTrue(state["online"])
+        self.assertTrue(state["heartbeat"])
+        self.assertEqual(state["device"], "PAL-AL00")
+
+    def test_post_ping_requires_token(self):
+        """心跳也要鉴权 —— 否则局域网上任何人都能把「失联告警」压掉。"""
+        code, _ = self.post_ping(token=None)
+        self.assertEqual(code, 401)
+        _, state = self.get()
+        self.assertFalse(state["online"])
+        self.assertFalse(state["heartbeat"])
+
+    def test_get_ping_without_hb_does_not_count(self):
+        """浏览器/curl 随手打开 /ping 只是自测，不能把人当成「手机在线」。"""
+        code, state = self.get("/ping")
+        self.assertEqual(code, 200)
+        self.assertFalse(state["online"])
+
+        # 带 hb=1 才算心跳。注意 token 要自己拼进 query —— 帮助方法只会在
+        # 整条 path 后面追加 `?token=`，path 里已经有一个 `?` 时会拼出两个。
+        _, state = self.get(f"/ping?hb=1&device=PAL-AL00&token={quote(TOKEN)}",
+                            token=None)
+        self.assertTrue(state["online"])
+        self.assertTrue(state["heartbeat"])
+
+    def test_screen_counts_as_alive_but_not_heartbeat(self):
+        """上报画面能证明「活着」，但**不能冒充心跳**。
+
+        写反了会怎样：旧版 APK 没有心跳，只要收到过画面就算「有心跳」，
+        于是「群里没人说话」被当成「手机失联」，一天报几十次。
+        """
+        self.assertEqual(self.post_frame(), 200)
+        _, state = self.get()
+        self.assertTrue(state["online"])
+        self.assertFalse(state["heartbeat"])
+
+
+class TestWatchdog(unittest.TestCase):
+    """失联状态机。测纯函数而不用线程 + sleep：后者慢，而且负载高时会随机红。"""
+
+    def new_ctx(self) -> _Ctx:
+        return _Ctx(token="t", chat_name="数字质控")
+
+    def test_never_seen_alerts_after_threshold(self):
+        c = self.new_ctx()
+        self.assertIsNone(_watchdog_step(c, 0.0, 100.0, 300.0))
+        msg = _watchdog_step(c, 0.0, 400.0, 300.0)
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg[0], logging.WARNING)
+        self.assertIn("一次都没有收到", msg[1])
+        self.assertIn("6 分钟", msg[2])
+        self.assertEqual(c.state, "missing")
+
+    def test_never_seen_reminder_is_rate_limited(self):
+        c = self.new_ctx()
+        _watchdog_step(c, 0.0, 400.0, 300.0)
+        self.assertIsNone(_watchdog_step(c, 0.0, 460.0, 300.0))
+        again = _watchdog_step(c, 0.0, 400.0 + OFFLINE_REMIND_EVERY + 1, 300.0)
+        self.assertIsNotNone(again)
+        self.assertIn("仍然没有任何上报", again[1])
+
+    def test_online_then_offline_then_recover(self):
+        c = self.new_ctx()
+        c.touch(device="PAL-AL00", heartbeat=True)
+        base = c.last_seen
+
+        self.assertIsNone(_watchdog_step(c, base, base + 10, 300.0))
+        self.assertEqual(c.state, "online")
+
+        msg = _watchdog_step(c, base, base + 400, 300.0)
+        self.assertEqual(msg[0], logging.WARNING)
+        self.assertIn("失联", msg[1])
+        self.assertIn("PAL-AL00", msg[2])
+        self.assertEqual(c.state, "offline")
+
+        # 冷却期内不重复刷日志（WARNING 会触发钉钉告警）
+        self.assertIsNone(_watchdog_step(c, base, base + 500, 300.0))
+
+        c.touch(heartbeat=True)
+        back = c.last_seen
+        msg = _watchdog_step(c, back, back + 5, 300.0)
+        self.assertEqual(msg[0], logging.WARNING)
+        self.assertIn("恢复", msg[1])
+        # 断开时长要按「上一次心跳」算，不能按刚刷新的 last_seen ——
+        # 后者永远是 0 秒，正好把最想看的信息抹掉。
+        self.assertEqual(msg[2][0], "5 秒")
+        self.assertEqual(c.state, "online")
+
+    def test_no_heartbeat_never_reports_offline(self):
+        """旧版 APK（没有心跳）永不判失联。
+
+        它只在画面变化时上报，「群里没人说话」和「App 死了」在电脑侧看来
+        完全一样。硬判就会天天误报，而误报几次之后就没人再看告警了 ——
+        那比不告警更糟。所以只提示一次「升级 APK」。
+        """
+        c = self.new_ctx()
+        c.touch()                                   # 有业务上报，无心跳
+        base = c.last_seen
+
+        msg = _watchdog_step(c, base, base + 1, 300.0)
+        self.assertEqual(msg[0], logging.INFO)
+        self.assertIn("0.2.0", msg[1])
+        self.assertEqual(c.state, "online")
+
+        # 一天都没动静，仍然沉默
+        self.assertIsNone(_watchdog_step(c, base, base + 86400, 300.0))
+        self.assertEqual(c.state, "online")
+
+    def test_missing_then_connects(self):
+        c = self.new_ctx()
+        _watchdog_step(c, 0.0, 400.0, 300.0)        # → missing
+        c.touch(heartbeat=True)
+        base = c.last_seen
+        msg = _watchdog_step(c, base, base + 5, 300.0)
+        self.assertEqual(msg[0], logging.WARNING)
+        self.assertIn("终于连上", msg[1])
+        self.assertEqual(c.state, "online")
+
+    def test_touch_does_not_flip_state(self):
+        """状态迁移只能发生在看门狗里，否则日志会「一会儿说恢复一会儿说失联」。"""
+        c = self.new_ctx()
+        c.touch(heartbeat=True)
+        self.assertEqual(c.state, "waiting")
+
+
+class TestOfflineConfig(unittest.TestCase):
+
+    def test_default_threshold(self):
+        cfg = make_cfg(free_port(), TOKEN)
+        self.assertEqual(cfg.dingtalk.android_offline_after, 300.0)
+
+    def test_source_reads_threshold(self):
+        s = AndroidGatewaySource(
+            make_cfg(free_port(), TOKEN, android_offline_after=90))
+        self.assertEqual(s.offline_after, 90.0)
+
+    def test_negative_means_disabled(self):
+        s = AndroidGatewaySource(
+            make_cfg(free_port(), TOKEN, android_offline_after=-5))
+        self.assertEqual(s.offline_after, 0.0)
+
+    def test_bad_value_falls_back(self):
+        s = AndroidGatewaySource(
+            make_cfg(free_port(), TOKEN, android_offline_after="abc"))
+        self.assertEqual(s.offline_after, 300.0)
 
 
 if __name__ == "__main__":

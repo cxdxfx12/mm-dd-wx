@@ -137,6 +137,8 @@ def run_case(root: tk.Tk, title: str, config_text: str, problems: list[str],
         problems.append(f"{title}：dingtalk.time_window 没写进去")
     if back.dingtalk.anchor_guard is None:
         problems.append(f"{title}：dingtalk.anchor_guard 没写进去")
+    if back.dingtalk.android_offline_after is None:
+        problems.append(f"{title}：dingtalk.android_offline_after 没写进去")
     if mode and back.dingtalk.mode != mode:
         problems.append(f"{title}：数据来源没写进去（读回 {back.dingtalk.mode!r}）")
     if token and back.dingtalk.gateway_token != token:

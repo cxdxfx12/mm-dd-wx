@@ -40,8 +40,8 @@ APP_ID = "com.hbdxm.ddwx"
 BUILD_TOOLS = "33.0.2"
 PLATFORM = "android-33"
 
-VERSION_CODE = "1"
-VERSION_NAME = "0.1.0"
+VERSION_CODE = "2"
+VERSION_NAME = "0.2.0"
 
 # 自签名用的口令。这是**演示/自用**签名，不是发布凭据 —— 仓库里放口令是可接受的，
 # 因为它唯一的作用是让 Android 愿意装这个包，不保护任何机密。
@@ -154,6 +154,11 @@ def link_res(r: Runner, bt: Path, android_jar: Path, res_zip: Path, build: Path)
            "-o", str(apk),
            "-I", str(android_jar),
            "--manifest", str(PROJECT / "AndroidManifest.xml"),
+           # 版本号以这里为准。清单里也写了一份（方便单看清单时能读懂），
+           # 但真正进包的是这两个参数 —— 两处漂移过一次：文件名已经是 0.2.0，
+           # 装到手机上却显示 0.1.0，覆盖安装时很容易误判成「装的是旧包」。
+           "--version-code", VERSION_CODE,
+           "--version-name", VERSION_NAME,
            str(res_zip),
            "--java", str(gen),
            "-0", "arsc"], quiet=True)

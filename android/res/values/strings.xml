@@ -12,6 +12,11 @@
     <string name="btn_snapshot">存一份快照到 Download/mmddwx</string>
     <string name="btn_save">保存设置</string>
 
+    <string name="section_keepalive">保活（别让系统把采集掐掉）</string>
+    <string name="hint_keepalive">华为/小米这类系统在内存紧张时会连同无障碍服务一起回收，被回收后它不会自己回来 —— 表现就是「群里再没有新消息」，而这往往很久之后才被发现。下面两项做完能显著降低被清理的概率，但无法保证 100%（系统级清理是厂商策略，应用没有权限强行恢复）。</string>
+    <string name="btn_battery">① 允许后台常驻（忽略电池优化）</string>
+    <string name="btn_startup">② 应用启动管理里设为「手动管理」</string>
+
     <string name="section_server">电脑端网关</string>
     <string name="hint_server">这些值必须与电脑上 config.yaml 的 dingtalk 段一致：gateway_port 与 gateway_token。IP 是电脑的局域网地址。</string>
 

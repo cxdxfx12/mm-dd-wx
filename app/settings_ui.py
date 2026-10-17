@@ -380,6 +380,8 @@ class SettingsDialog:
         self.st["gw_port"] = tk.StringVar(value=str(d.get("gateway_port") or 8765))
         self.st["gw_token"] = tk.StringVar(value=str(d.get("gateway_token") or ""))
         self.st["gw_parse"] = tk.BooleanVar(value=bool(d.get("android_parse")))
+        self.st["gw_offline"] = tk.StringVar(
+            value=str(d.get("android_offline_after", 300)))
 
         srcbox = _card(page, "数据来源：消息从哪儿读")
         srcbox.pack(fill="x", padx=12, pady=(12, 8))
@@ -416,6 +418,16 @@ class SettingsDialog:
                                                            pady=(6, 0))
         _tip(srcbox, "手机模式下**必须**勾选，否则网关只收不转、一条消息都不会发出去。"
                      "（默认不勾是安全考虑：先确认解析结果对不对。）"
+             ).pack(fill="x", padx=30)
+
+        # 失联告警：手机被系统清理、锁屏断网之后，电脑侧收不到任何异常，
+        # 表现就是「程序安安静静在跑、一条都不转」。这一项是唯一的发现手段。
+        self._spin(grid2, 3, "失联告警（秒）", self.st["gw_offline"], 0, 3600,
+                   "手机超过这么久没心跳就发钉钉告警（0 = 不检测）。"
+                   "手机端 0.2.0 起每 60 秒发一次心跳，填 300（5 分钟）即可；"
+                   "旧版 APK 没有心跳，此项对它不生效。")
+        _tip(srcbox, "关掉失联告警的后果：手机端挂了以后不会有任何提示，"
+                     "只能靠「群里怎么没消息了」自己察觉 —— 而那通常很久之后才会被注意到。"
              ).pack(fill="x", padx=30, pady=(0, 12))
 
         box = _card(page, "投递")
@@ -933,6 +945,13 @@ class SettingsDialog:
                 "监听端口不对", "端口要填 1–65535 之间的整数，例如 8765。",
                 parent=self.win)
             return
+        try:
+            gw_offline = int(float(self.st["gw_offline"].get() or 300))
+        except ValueError:
+            gw_offline = 300
+        # 0 = 关闭（合法的「我知道风险，不检测」）；负数按关闭处理，
+        # 而不是变成一个极小值——那会让告警每 10 秒刷一次。
+        gw_offline = max(0, min(3600, gw_offline))
         if src_mode == "android":
             # 这两个是「选了手机却一条都收不到」的头号原因，保存时就拦住，
             # 别让用户回去对着日志猜。
@@ -1049,6 +1068,7 @@ class SettingsDialog:
         S("dingtalk", "gateway_port", gw_port, after="gateway_host")
         S("dingtalk", "gateway_token", gw_token, after="gateway_port")
         S("dingtalk", "android_parse", gw_parse, after="gateway_token")
+        S("dingtalk", "android_offline_after", gw_offline, after="android_parse")
         S("wechat", "dry_run", bool(self.st["dry_run"].get()), after="interval")
         S("wechat", "interval", interval, after="dry_run")
         S("wechat", "show_hotkey", hotkey, after="wxauto_path")

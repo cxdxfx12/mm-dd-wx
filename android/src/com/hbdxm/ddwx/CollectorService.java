@@ -46,6 +46,12 @@ public class CollectorService extends AccessibilityService {
     /** 无障碍事件的最小间隔。 */
     private static final long EVENT_THROTTLE_MS = 400L;
 
+    /**
+     * 心跳间隔。必须显著小于电脑侧的失联阈值（默认 300 秒），
+     * 否则网络稍微一抖就被判失联；60 秒既够密，又不至于让待机耗电变差。
+     */
+    private static final long HEARTBEAT_MS = 60000L;
+
     private static volatile CollectorService instance;
 
     // ---- 给设置页读的运行时状态。都是 volatile，探测/展示用不追求事务性。 ----
@@ -60,9 +66,19 @@ public class CollectorService extends AccessibilityService {
     public static volatile int lastTexts = 0;
     public static volatile int lastBytes = 0;
     public static volatile String lastMd5 = "";
+    /** 心跳结果，设置页直接显示 —— 「电脑说手机失联」时第一眼要看的就是它。 */
+    public static volatile boolean heartbeatOk = false;
+    public static volatile String lastHeartbeat = "尚未发送";
+    public static volatile long heartbeats = 0L;
 
     private ScheduledExecutorService scheduler;
     private ScheduledFuture<?> timer;
+    /**
+     * 心跳用**独立的**单线程调度器。与抓取共用一个池的话，一次上报超时（12 秒）
+     * 会把心跳一起排到后面，电脑侧就可能因为「抓取卡住」而误判手机失联。
+     */
+    private ScheduledExecutorService hbScheduler;
+    private ScheduledFuture<?> hbTimer;
     /**
      * 执行抓取的线程池。与 {@link #scheduler} 分开是有原因的：定时器也往同一个池里投任务的话，
      * 一次慢抓取（比如网络超时 12 秒）会把后续 tick 全排在它后面，定时就失去意义了。
@@ -95,6 +111,10 @@ public class CollectorService extends AccessibilityService {
             setServiceInfo(info);
         }
         Log.i(TAG, "采集服务已连接");
+        // 顺带把前台保活服务拉起来：无障碍服务被系统解绑时，它是唯一还在的
+        // 「喊话口」（常驻通知会把状态改成警示）。放在这里而不是只放在设置页，
+        // 是因为用户很少主动打开设置页 —— 手机重启后更是根本不会打开。
+        KeepAliveService.start(this);
         startTimer();
         captureAndSend("service-connected");
     }
@@ -167,9 +187,11 @@ public class CollectorService extends AccessibilityService {
             }
         }, ms, ms, TimeUnit.MILLISECONDS);
         Log.i(TAG, "定时抓取已启动，间隔 " + ms + "ms");
+        heartbeatStart();
     }
 
     private void stopTimer() {
+        heartbeatStop();
         if (timer != null) {
             timer.cancel(false);
             timer = null;
@@ -181,6 +203,59 @@ public class CollectorService extends AccessibilityService {
         if (pool != null) {
             pool.shutdownNow();
             pool = null;
+        }
+    }
+
+    // ------------------------------------------------------------------ 心跳
+
+    /**
+     * 定时告诉电脑「我还活着」。
+     *
+     * <p>不做这件事的话，电脑侧无法区分「群里没人说话」和「手机端已经死了」——
+     * 两者在它看来都是「没有新消息」。而后者意味着一条都不再转发，属于必须
+     * 主动告警的故障。
+     */
+    private void heartbeatStart() {
+        heartbeatStop();
+        hbScheduler = Executors.newSingleThreadScheduledExecutor();
+        hbTimer = hbScheduler.scheduleWithFixedDelay(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    heartbeatOnce();
+                } catch (Throwable t) {
+                    heartbeatOk = false;
+                    lastHeartbeat = "心跳内部错误：" + t;
+                }
+            }
+        }, 0L, HEARTBEAT_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private void heartbeatStop() {
+        if (hbTimer != null) {
+            hbTimer.cancel(false);
+            hbTimer = null;
+        }
+        if (hbScheduler != null) {
+            hbScheduler.shutdownNow();
+            hbScheduler = null;
+        }
+    }
+
+    private void heartbeatOnce() {
+        String token = Prefs.token(this);
+        if (TextUtils.isEmpty(token)) {
+            heartbeatOk = false;
+            lastHeartbeat = "没填 token，心跳发不出去";
+            return;
+        }
+        Uploader.Result r = Uploader.heartbeat(Prefs.host(this), Prefs.port(this), token);
+        heartbeatOk = r.ok;
+        heartbeats++;
+        lastHeartbeat = stamp() + " · " + (r.ok ? "正常" : r.detail);
+        if (!r.ok) {
+            // 心跳失败不弹通知：一次网络抖动很常见，连续失联由电脑侧告警兜底。
+            Log.w(TAG, "心跳失败：" + r.detail);
         }
     }
 

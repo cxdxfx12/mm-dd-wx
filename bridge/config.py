@@ -32,6 +32,10 @@ class DingTalkConfig:
     # 默认 False —— 此时网关只负责「收」，程序不转发任何东西。开启前务必先用
     # tools/android_capture.py 看过一帧真实画面的解析结果（见 android/README.md）。
     android_parse: bool = False
+    # android 模式：手机多久没上报就判为「失联」并告警（秒，0 = 不检测）。
+    # 判据是**心跳**（手机端每 60 秒 POST /ping），不是「多久没收到画面」——
+    # 群里半天没人说话时画面本来就不变、手机也不上报，按画面判会天天误报。
+    android_offline_after: float = 300.0
     ui_poll_interval: float = 5.0           # ui / ocr 模式的轮询间隔（秒）
     title_check: bool = True                # OCR 模式：每帧校验窗口标题，防转发错群
     title_ratio: float = 0.55               # 标题模糊匹配阈值（OCR 对标题有误识，需容错）

@@ -23,11 +23,18 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.hbdxm.ddwx"
-    android:versionCode="1"
-    android:versionName="0.1.0">
+    android:versionCode="2"
+    android:versionName="0.2.0">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 前台保活服务（常驻通知）。没有它，华为/小米会在内存紧张时把整个应用
+         连同无障碍服务一起回收，而回收之后不会自己回来。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 13+ 显示常驻通知要用户授权（不授也能跑，只是看不到状态） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 设置页的「允许后台常驻」按钮用它申请电池优化白名单 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
@@ -58,6 +65,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          前台保活服务。exported=false：只给自己启动，外部应用没有必要也没有理由
+          拉起它。targetSdk 33 不需要 android:foregroundServiceType（34 起才强制）。
+        -->
+        <service
+            android:name=".KeepAliveService"
+            android:exported="false"
+            android:label="@string/service_name" />
 
         <!--
           无障碍服务。三点必须注意，少一条就装不上或者绑不起来：
