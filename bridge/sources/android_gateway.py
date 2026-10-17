@@ -63,7 +63,7 @@ from urllib.parse import parse_qs, urlparse
 from ..config import Config
 from ..fingerprint import fp_of
 from ..models import MSG_TYPES, Message
-from .android_parse import (FrameDiffer, ParseError, parse_frame,
+from .android_parse import (FrameDiffer, ParseError, needs_scroll, parse_frame,
                             units_to_messages)
 from .base import MessageHandler, Source, infer_company
 
@@ -778,12 +778,26 @@ class _Handler(BaseHTTPRequestHandler):
         if diff.baseline:
             log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
                      "此后只转发基线之后的新消息", len(frame.units))
+            # 基线同样要报截断：新装/重启那一刻，屏上可能正好卡着一条长消息，
+            # 不补的话要等下一次滚动才看得见。
+            why = needs_scroll(frame)
+            if why:
+                log.info("安卓画面解析：当前屏有消息没显示全（%s）", why)
             return [], "已建立基线"
         if diff.anchor_lost:
             log.warning("安卓画面解析：上一帧的锚点在本帧里找不到（翻历史／换群／"
                         "一屏全换）—— 本帧不转发，基线已重建到当前画面")
             return [], "锚点丢失"
-        return list(diff.units), ""
+
+        # 一屏装不下的长消息：树里只有屏幕上那截，滚出去的部分根本不存在。
+        # 现在照常转发（用户要的是「几分钟内到」），但同时记一条 WARNING ——
+        # 微信那边收到的可能是半截话，得让人知道。
+        why = needs_scroll(frame)
+        new = list(diff.units)
+        if why and new:
+            log.warning("安卓画面解析：%s —— 这一屏新转的消息可能不完整", why)
+            return new, "消息可能不完整"
+        return new, ""
 
     def _emit(self, units: list) -> int:
         """把消息单元交给下游，返回成功条数。"""

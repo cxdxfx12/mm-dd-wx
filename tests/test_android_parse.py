@@ -19,7 +19,8 @@ if str(BASE) not in sys.path:
 
 from bridge.fingerprint import fp_of, norm_sender              # noqa: E402
 from bridge.sources.android_parse import (                     # noqa: E402
-    FrameDiffer, ParseError, Unit, parse_frame, units_to_messages,
+    FrameDiffer, ParseError, Unit, clipped_units, needs_scroll, parse_frame,
+    units_to_messages,
 )
 
 PKG = "com.alibaba.android.rimet"
@@ -866,6 +867,49 @@ class TestCardTable(unittest.TestCase):
         self.assertEqual(lines[0], "表格上面的一句话")
         self.assertIn("小件员名称: 周吉祥", lines[1])
         self.assertEqual(lines[-1], "表格下面的一句话")
+
+
+# ------------------------------------------------------------------ 截断检测
+
+class TestClipped(unittest.TestCase):
+    """一屏装不下的长消息要能被认出来 —— 否则发出去的就是半截话。
+
+    ``getRootInActiveWindow()`` 只给可见节点，超出屏幕的部分在树里**不存在**。
+    这不是解析 bug，是采集方式的物理上限；能做的只是「认出它不完整」，
+    再让手机端往上翻页补全。
+    """
+
+    def _frame(self, n_lines: int):
+        lines = [f"第 {i} 段正文，说的是同一件事的不同细节" for i in range(1, n_lines + 1)]
+        return parse_frame(dt_frame(dt_item(
+            "今天 16:31", dt_message("履约跟单专员", lines, 300))))
+
+    def test_long_message_is_detected(self):
+        """40 行的消息会顶出列表下沿（可视区 265~2018），必须报出来。"""
+        f = self._frame(40)
+        cut = clipped_units(f)
+        self.assertEqual(len(cut), 1)
+        self.assertIn("被屏幕边界切掉", needs_scroll(f))
+
+    def test_short_message_is_not_flagged(self):
+        """14 行还在屏内（底边 1260 < 2018），绝不能误报 —— 误报会让手机白白滑动。"""
+        f = self._frame(14)
+        self.assertEqual(clipped_units(f), [])
+        self.assertEqual(needs_scroll(f), "")
+
+    def test_unknown_view_never_flags(self):
+        """拿不到列表可视范围时一律不猜（宁可不补，也不要每帧都滚）。"""
+        f = self._frame(40)
+        f.view = (0, 0, 0, 0)
+        self.assertEqual(clipped_units(f), [])
+        self.assertEqual(needs_scroll(f), "")
+
+    def test_every_real_frame_is_clean(self):
+        """现场存下来的每一帧都不该被判定为截断。"""
+        for path in sorted((BASE / "data").glob("screen-*.xml")):
+            raw = path.read_text(encoding="utf-8", errors="replace")
+            f = parse_frame(raw)
+            self.assertEqual(clipped_units(f), [], f"{path.name} 误报截断")
 
 
 # ------------------------------------------------------------------ 单元 → 消息

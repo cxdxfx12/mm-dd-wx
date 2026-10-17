@@ -23,7 +23,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1613,41 +1613,89 @@ class App(tk.Tk):
     # ---------------- 记录 / 导出 ----------------
 
     def show_records(self):
-        if self._busy or self.runner.alive():
-            messagebox.showinfo("提示", "有任务正在运行，请先停止。", parent=self)
-            return
+        # ⚠ 不能拦「正在运行」：想看消息记录的时刻，基本就是程序在跑的时刻。
+        # 只读打开数据库，运行中读也安全。
         win = tk.Toplevel(self)
-        win.title("消息记录（最近 200 条）")
-        win.geometry("900x520")
+        win.title("消息记录")
+        win.geometry("1000x560")
         win.transient(self)
-        cols = ("time", "chat", "sender", "content")
+
+        # 顶部筛选条 —— 「没发出去的」是这里最有用的一栏：漏发、投递失败、
+        # 被规则拦下的都从它捞回来。
+        bar = ttk.Frame(win)
+        bar.pack(side="top", fill="x", padx=10, pady=(10, 0))
+        ttk.Label(bar, text="显示：").pack(side="left")
+        scope = tk.StringVar(value="全部")
+        for text in ("全部", "最近 30 分钟", "最近 24 小时", "没有发出的"):
+            ttk.Radiobutton(bar, text=text, value=text, variable=scope,
+                            command=lambda: load()).pack(side="left", padx=(0, 8))
+        count = ttk.Label(bar, text="")
+        count.pack(side="right")
+
+        cols = ("time", "state", "chat", "sender", "content")
         tree = ttk.Treeview(win, columns=cols, show="headings")
         for cid, text, width, anchor in (
-                ("time", "时间", 140, "w"), ("chat", "会话", 180, "w"),
-                ("sender", "发送者", 120, "w"), ("content", "内容", 420, "w")):
+                ("time", "时间", 130, "w"), ("state", "投递", 70, "center"),
+                ("chat", "会话", 150, "w"), ("sender", "发送者", 110, "w"),
+                ("content", "内容", 470, "w")):
             tree.heading(cid, text=text)
             tree.column(cid, width=width, anchor=anchor)
         sb = ttk.Scrollbar(win, command=tree.yview)
         tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y", pady=10, padx=(0, 10))
         tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
-        sb.pack(side="left", fill="y", pady=10)
+        tree.tag_configure("bad", foreground="#c0392b")
+        tree.tag_configure("ok", foreground="#27ae60")
 
-        def work():
-            rows = []
-            try:
-                conn = sqlite3.connect(f"file:{self._db_path()}?mode=ro", uri=True,
-                                       timeout=2)
-                for r in conn.execute(
-                        "SELECT msg_time, chat_name, sender_name, content "
-                        "FROM messages ORDER BY msg_time DESC LIMIT 200"):
-                    rows.append(("" if v is None else str(v)) for v in r)
-                conn.close()
-            except Exception as exc:
-                rows = [[str(datetime.now()), "", "", f"读取失败：{exc}"]]
-            self.after(0, lambda: [tree.insert("", "end", values=list(r))
-                                   for r in rows])
+        def load():
+            sel = scope.get()
+            where, params = "", []
+            if sel == "最近 30 分钟":
+                where = "WHERE m.msg_time >= ?"
+                params = [(datetime.now() - timedelta(minutes=30))
+                          .strftime("%Y-%m-%d %H:%M:%S")]
+            elif sel == "最近 24 小时":
+                where = "WHERE m.msg_time >= ?"
+                params = [(datetime.now() - timedelta(hours=24))
+                          .strftime("%Y-%m-%d %H:%M:%S")]
+            elif sel == "没有发出的":
+                # 「没有成功投递」= 一次都没发成。被规则拦下的、发失败的、
+                # 以及压根没走到投递的，全在这一栏里。
+                # ⚠ 状态值是 ``ok`` / ``fail``（见 service.log_delivery 的调用处），
+                # 不是 ``successful`` —— 写错的话这一栏会把已发的也列出来。
+                where = ("WHERE NOT EXISTS (SELECT 1 FROM deliveries d "
+                         "WHERE d.uid = m.uid AND d.status = 'ok')")
 
-        threading.Thread(target=work, daemon=True).start()
+            def work():
+                rows = []
+                try:
+                    conn = sqlite3.connect(f"file:{self._db_path()}?mode=ro",
+                                           uri=True, timeout=2)
+                    sql = (
+                        "SELECT m.msg_time, m.chat_name, m.sender_name, m.content, "
+                        "  (SELECT d.status FROM deliveries d WHERE d.uid = m.uid "
+                        "   ORDER BY d.id DESC LIMIT 1) AS st "
+                        f"FROM messages m {where} ORDER BY m.msg_time DESC LIMIT 300")
+                    for r in conn.execute(sql, params):
+                        rows.append(["" if v is None else str(v) for v in r])
+                    conn.close()
+                except Exception as exc:
+                    rows = [[str(datetime.now()), "", "", f"读取失败：{exc}", ""]]
+                self.after(0, lambda: render(rows))
+
+            def render(rows):
+                tree.delete(*tree.get_children())
+                for t, chat, sender, content, st in rows:
+                    st_txt = {"ok": "已发", "fail": "失败"}.get(st or "", "未发")
+                    tag = "ok" if st == "ok" else "bad"
+                    tree.insert("", "end", tag=tag,
+                                values=(t, st_txt, chat, sender,
+                                        content.replace("\n", " ")[:120]))
+                count.config(text=f"共 {len(rows)} 条")
+
+            threading.Thread(target=work, daemon=True).start()
+
+        load()
 
     def export_csv(self):
         if self._busy or self.runner.alive():

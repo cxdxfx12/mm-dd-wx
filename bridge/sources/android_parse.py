@@ -250,6 +250,7 @@ class Frame:
     texts: int = 0                                       # 全树的带文本节点数
     page: str = "chat"                                   # chat | other | unknown
     page_reason: str = ""
+    view: tuple[int, int, int, int] = (0, 0, 0, 0)       # 消息列表的可视范围
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -881,6 +882,7 @@ def parse_frame(text: str) -> Frame:
 
     frame.container = container.short_class
     frame.rows = len(container.children)
+    frame.view = container.bounds
 
     units: list[Unit] = []
     for unit in _container_units(container):
@@ -902,6 +904,53 @@ def parse_frame(text: str) -> Frame:
     units.sort(key=lambda u: u.y0)
     frame.units = units
     return frame
+
+
+# ------------------------------------------------------------------ 截断检测
+
+def clipped_units(frame: Frame, *, tol: int = 24) -> list[Unit]:
+    """哪几条消息在屏幕上**被切掉了**（只有一部分进得来）。
+
+    为什么需要它：``getRootInActiveWindow()`` 只给可见节点，一条超过一屏的
+    长消息在树里只有屏幕上那截，滚出去的部分**根本不存在**。把它当完整消息
+    发出去，微信群那边收到的就是半截话 —— 而且它每帧都「看起来一样」，
+    下游还以为发全了。
+
+    判据（都用行级 bounds，真机上是准的）：
+      · 消息底边越过列表可视区下沿 —— 下面还有内容没露出来；
+      · 消息顶边高于列表可视区上沿 —— 上面还有内容被挡住了。
+    首尾两条天然会贴着边界（一屏正好切在消息中间），所以 ``tol`` 给一点余量：
+    只有**明显**越界才算，避免每条消息都触发滚动。
+
+    返回空列表 = 这一屏的消息都是完整的，不需要滚动补全。
+    """
+    if not frame.units:
+        return []
+    _, top, _, bottom = frame.view
+    if bottom - top <= 0:               # 拿不到可视范围时不猜，当作没截断
+        return []
+    out = []
+    for u in frame.units:
+        y0, y1 = min(u.y0, u.y1), max(u.y0, u.y1)
+        if y1 > bottom + tol or y0 < top - tol:
+            out.append(u)
+    return out
+
+
+def needs_scroll(frame: Frame, *, tol: int = 24) -> str:
+    """要不要为这一屏做「往上翻页补全」。返回原因（空串 = 不用补）。
+
+    只认两种明确信号，**不做常态化滚动**：群聊一直在来消息，如果每帧都滚，
+    手机就永远停在「滑动中」，反而更容易错过内容。
+      · 有消息被屏幕边界切掉（长消息）；
+      · 一屏里消息太少且最上面那条也不完整（可能刚好卡在两条消息之间）。
+    """
+    clipped = clipped_units(frame, tol=tol)
+    if not clipped:
+        return ""
+    head = clipped[0]
+    return (f"有 {len(clipped)} 条消息被屏幕边界切掉"
+            f"（如 {head.sender or '无昵称'} 的那条，长 {len(head.content)} 字）")
 
 
 # ------------------------------------------------------------------ 帧序列 → 新消息
