@@ -101,12 +101,33 @@ TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
 
 # ------------------------------------------------------------------ 手机端下载
 
+def _apk_version(p: "Path") -> tuple:
+    """从文件名里取版本号，取不到就排最后。
+
+    ``ddwx-collector-0.2.0.apk`` → ``(0, 2, 0)``。
+    文件名不合格式（或纯数字段不是数字）时返回空元组，排序时垫底 ——
+    宁可让用户拿到「格式规范的那个」，也不要随便挑一个。
+    """
+    rows: list[int] = []
+    for part in p.stem.split("-")[-1].split("."):
+        if not part.isdigit():
+            return ()
+        rows.append(int(part))
+    return tuple(rows)
+
+
 def _find_apk() -> "Path | None":
     """找最新编出来的 APK。
 
-    取 mtime 最新的那个 —— 重新编过之后不用再手动拷来拷去。
-    ``_APK_DIRS`` 为空时（比如单元测试里直接调）退回到自动探测，
-    不要因为「还没调 set_apk_dirs」就返回 None。
+    **按版本号挑，不按 mtime。** 早先只取 mtime 最新的，真机上踩过：
+    安装版把 APK 解压到 ``app/``，同一次解压出来的 0.1.0 与 0.2.0
+    mtime 精确到秒**完全一样**，``max()`` 遇到相等时保留先遇到的，
+    于是页面一直发 0.1.0 —— 那个版本缺手势权限、没有 /ping 心跳，
+    用户装上后长消息补全失效，而页面上写着「下载并安装 0.1.0」，
+    看起来完全正常，极难排查。
+
+    mtime 只在版本号相同时（或都解析不出）才作为次级判据，
+    这样「重新编过同一个版本号」仍能拿到新的那个。
     """
     dirs = _APK_DIRS or _apk_search_dirs()
     cands: list[Path] = []
@@ -118,7 +139,7 @@ def _find_apk() -> "Path | None":
             continue
     if not cands:
         return None
-    return max(cands, key=lambda p: p.stat().st_mtime)
+    return max(cands, key=lambda p: (_apk_version(p), p.stat().st_mtime))
 
 
 _APK_DIRS: "list[Path]" = []

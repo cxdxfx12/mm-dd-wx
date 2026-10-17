@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import socket
 import tempfile
 import threading
@@ -27,7 +29,8 @@ from bridge.fingerprint import fp_of, norm_sender, unit_fp
 from bridge.service import BridgeService
 from bridge.sources.android_gateway import (
     HEARTBEAT_GRACE, MAX_BATCH, MAX_SCREEN_BODY, OFFLINE_REMIND_EVERY,
-    AndroidGatewaySource, _Ctx, _online_now, _watchdog_step, build_messages, lan_ips,
+    AndroidGatewaySource, _Ctx, _find_apk, _online_now, _watchdog_step,
+    build_messages, lan_ips, set_apk_dirs,
 )
 from bridge.sources.base import Source
 from bridge.sources.factory import build_source
@@ -944,6 +947,61 @@ class TestScreenParse(GatewayCase):
 
 
 # --------------------------------------------------------------- 手机装 App
+
+class TestFindApk(unittest.TestCase):
+    """挑哪个 APK 发出去 —— 按版本号，不按 mtime。
+
+    真机事故：安装版把 APK 解压到 ``app/``，同一次解压出来的 0.1.0 和
+    0.2.0 的 mtime **精确到秒完全一样**。早先只按 mtime 取 ``max()``，
+    相等时保留先遇到的那个，于是页面一直发 0.1.0（缺手势权限、没有心跳），
+    而页面上写着「下载并安装 ddwx-collector-0.1.0.apk」，看着完全正常。
+    """
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="apk-"))
+        set_apk_dirs([self.dir])
+
+    def tearDown(self):
+        set_apk_dirs([])
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def put(self, name: str, *, mtime: float | None = None,
+            size: int = 10) -> Path:
+        p = self.dir / name
+        p.write_bytes(b"PK" + b"\0" * size)
+        if mtime is not None:
+            os.utime(p, (mtime, mtime))
+        return p
+
+    def test_same_mtime_picks_the_higher_version(self):
+        """0.1.0 在列表里排前面且 mtime 相同 —— 仍必须挑 0.2.0。"""
+        self.put("ddwx-collector-0.1.0.apk", mtime=1_700_000_000)
+        self.put("ddwx-collector-0.2.0.apk", mtime=1_700_000_000)
+        self.assertEqual(_find_apk().name, "ddwx-collector-0.2.0.apk")
+
+    def test_older_version_with_newer_mtime_still_loses(self):
+        """版本号高的赢，哪怕旧版本的文件时间更新。"""
+        self.put("ddwx-collector-0.1.0.apk", mtime=2_000_000_000)
+        self.put("ddwx-collector-0.2.0.apk", mtime=1_700_000_000)
+        self.assertEqual(_find_apk().name, "ddwx-collector-0.2.0.apk")
+
+    def test_same_version_newer_mtime_wins(self):
+        """版本号相同时（重编同名包）才轮到 mtime 决定。"""
+        self.put("ddwx-collector-0.2.0.apk", mtime=1_700_000_000)
+        self.put("ddwx-collector-0.2.0.apk", mtime=1_700_000_000)
+        # 换一种文件名不合规的，确认合规的那个不被它挤掉
+        self.put("collector-dev.apk", mtime=2_000_000_000)
+        self.assertEqual(_find_apk().name, "ddwx-collector-0.2.0.apk")
+
+    def test_ten_beats_nine(self):
+        """按数字比，不能按字符串比 —— '0.10.0' 要赢 '0.9.0'。"""
+        self.put("ddwx-collector-0.9.0.apk", mtime=1_700_000_000)
+        self.put("ddwx-collector-0.10.0.apk", mtime=1_700_000_000)
+        self.assertEqual(_find_apk().name, "ddwx-collector-0.10.0.apk")
+
+    def test_no_apk_returns_none(self):
+        self.assertIsNone(_find_apk())
+
 
 class TestAppDownload(GatewayCase):
     """``/app``（下载页）与 ``/app.apk``（安装包）。
