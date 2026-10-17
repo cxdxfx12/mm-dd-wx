@@ -51,9 +51,14 @@ TARGET_PKG = "com.alibaba.android.rimet"
 
 # 时间分隔条。钉钉安卓把它做成消息列表的**独立子节点**，直接「一个子节点
 # 一条消息」会把「09:12」当消息转发出去 —— 阶段 1 必须按类型过滤掉。
+# 真机上的格式是「今天 08:13」（实测），只有「今天」后面不带时间时才是孤零零的
+# 三个字，所以这里刻意不写成 `今天.*` —— 那会把「今天还有1票…」这种正文也吃掉。
 TIME_ONLY_RE = re.compile(
-    r"^(\d{1,2}:\d{2}(:\d{2})?|昨天.*|前天.*|星期[一二三四五六日]|"
-    r"\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2})$"
+    r"^((今天|昨天|前天|大前天)\s*\d{1,2}:\d{2}|"
+    r"(今天|昨天|前天|大前天)|"
+    r"\d{1,2}:\d{2}(:\d{2})?|"
+    r"星期[一二三四五六日天]|"
+    r"\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2})\s*$"
 )
 
 # 非文本消息的占位描述（图片/文件这类只有 content-desc，没有正文）。
@@ -67,6 +72,21 @@ PLACEHOLDER_RE = re.compile(
 SENDER_MAX_LEN = 24
 # 昵称与正文之间的垂直容差（像素）：布局里两行常有 0~4px 重叠，取 8 够用。
 SENDER_GAP_TOL = 8
+
+# 气泡里挂着的「操作按钮」不是消息内容。真机上它们是 ``android.view.View`` 的
+# content-desc（长按气泡就出现「复制」），跟着正文发出去就是一句莫名其妙的噪音。
+NOISE_LABELS = frozenset({
+    "复制", "复制链接", "转发", "转发给", "撤回", "回复", "引用", "多选", "删除",
+    "编辑", "收藏", "翻译", "提醒", "更多", "举报", "保存图片", "查看大图",
+    "全屏", "下载", "识别图中二维码",
+})
+
+# 逐层往下的最大深度：防病态布局（自嵌套包装）把递归拖爆。
+MAX_SPLIT_DEPTH = 6
+
+# 昵称后面会跟一个单独的「机器人」标签（机器人账号发消息时）。库里存的昵称
+# 不该带它 —— 指纹那边也会把尾部的「机器人」去掉，这里提前对齐，展示才一致。
+ROBOT_TAG_RE = re.compile(r"\s+机器人$")
 
 
 class ParseError(ValueError):
@@ -204,6 +224,31 @@ def _leaves(node: Node) -> list[Node]:
     return out
 
 
+def _clean_leaves(node: Node) -> list[Node]:
+    """去掉「不是消息内容」的叶子：气泡上的操作按钮、右侧隐藏时间戳。
+
+    真机上这两类会把正文弄脏：
+      · 气泡里挂着一个 ``android.view.View``，content-desc=``复制``；
+      · 每条消息右侧有个**零宽**的 ``chatting_item_hidden_time``（``08:13``），
+        当正文发出去就是一句莫名其妙的时间。
+    """
+    out: list[Node] = []
+    for n in _leaves(node):
+        lab = n.label
+        if not lab or lab in NOISE_LABELS:
+            continue
+        left, _, right, _ = n.bounds
+        if right - left <= 0 and TIME_ONLY_RE.match(lab):
+            continue
+        out.append(n)
+    return out
+
+
+def _area(node: Node) -> int:
+    left, top, right, bottom = node.bounds
+    return max(0, right - left) * max(0, bottom - top)
+
+
 def _candidates(root: Node) -> list[Node]:
     return [n for n in walk(root)
             if n.scrollable or any(k in n.cls for k in SCROLL_CLASSES)]
@@ -214,26 +259,50 @@ def _is_inside(outer: Node, target: Node) -> bool:
 
 
 def find_message_list(root: Node) -> Node | None:
-    """挑出最像「消息列表」的容器：最里层、且带文本的子节点最多。
+    """挑出「消息列表」容器。
 
-    外层 ScrollView 套内层 RecyclerView 很常见，所以先取最里层；同一层有多个
-    候选时，取带文本子节点最多的那个（会话列表页的 RecyclerView 也在树里时，
-    靠这一条把聊天区挑出来）。
+    真机实测（Mate Xs 2 / 钉钉 7.x，见 ``android/README.md``）：聊天区是
+    ``ListView``，但它**不是**树里唯一的可滚动容器 —— 底部功能条
+    （``RecyclerView#native_menu_bar``）、气泡里的横滑表格
+    （``HorizontalScrollView``）也都是。所以不能只看「谁更靠里」。
+
+    两步：
+      1. 先只在**没有被别的候选包住**的候选里挑，取「能切出的消息条数最多、
+         面积最大」的那个（会话列表页/底部功能条都在树里时，这一条把它们挡掉）；
+      2. 再往里钻一层：外层 ScrollView 套内层 RecyclerView 是常见写法，若内层
+         装了外层一半以上的文本，说明外层只是个壳 → 换成内层。
+         阈值取「一半」是因为气泡里的横滑表格也满足「更靠里」，但它只有几条
+         文本，占不到整屏的一半。
     """
     cands = _candidates(root)
     if not cands:
         return None
-    inner = [c for c in cands if not any(_is_inside(c, o) for o in cands if o is not c)]
-    best: Node | None = None
-    best_score = 0
-    for c in (inner or cands):
-        # 只算「真消息」的条数：时间分隔条每个列表都有，拿它凑数会让外面那层
-        # 空壳容器胜出。
-        score = sum(1 for ch in c.children if split_row(ch).kind in
-                    ("text", "image", "file", "voice", "link", "unknown"))
-        if score > best_score:
-            best, best_score = c, score
-    return best if best_score else None
+
+    # 先按面积筛一道：消息列表基本占满屏幕，而底部功能条、气泡里的横滑表格
+    # 都只是窄窄一截。真机实测这一条最有效 —— 功能条同样是 RecyclerView，
+    # 它下面有 4 个带文本的子节点，按「条数」比它反而赢过只有 2 组消息的列表。
+    root_area = _area(root) or 1
+    big = [c for c in cands if _area(c) * 100 >= root_area * 12]
+    cands = big or cands
+
+    def units_of(n: Node) -> list[Unit]:
+        return _container_units(n)
+
+    top = [c for c in cands if not any(_is_inside(o, c) for o in cands if o is not c)]
+    best = max(top or cands, key=lambda c: (len(units_of(c)), _area(c)))
+
+    for _ in range(4):
+        outer_leaves = len(_leaves(best))
+        inner = [c for c in cands
+                 if _is_inside(best, c)
+                 and not any(_is_inside(c, o) for o in cands
+                             if o is not c and _is_inside(best, o))]
+        inner = [c for c in inner
+                 if units_of(c) and len(_leaves(c)) * 2 >= max(1, outer_leaves)]
+        if not inner:
+            break
+        best = max(inner, key=lambda c: (len(_leaves(c)), _area(c)))
+    return best if units_of(best) else None
 
 
 def _labeled_children(node: Node) -> list[Node]:
@@ -295,13 +364,132 @@ def _looks_like_sender(first: Node, second: Node) -> bool:
     return len(name) < len(second.label) or bool(PLACEHOLDER_RE.match(second.label))
 
 
+def _is_time_strip(node: Node) -> bool:
+    """是时间分隔条吗（``今天 08:13`` / ``星期一`` / ``10-16``）。
+
+    真机上「时间分隔条」是列表子节点里的一个独立包装层（``layout_chatting_split``），
+    而每条消息右侧还有一个**零宽**的 ``chatting_item_hidden_time``（同样的时间
+    文本，宽度 0，给读屏用的）。只看文本会把后者也当成分隔条 —— 于是整条消息
+    被误判成「一组」，正文被拆散。零宽的那条在这里被挡掉。
+    """
+    leaves = _leaves(node)
+    if not leaves:
+        return False
+    if not all(TIME_ONLY_RE.match(x.label) for x in leaves):
+        return False
+    left, top, right, bottom = node.bounds
+    return right - left > 0 and bottom - top != 0
+
+
+def _looks_like_msgrow(node: Node) -> bool:
+    """这一层像不像「一条消息」（昵称/头像 + 一个装了多行文本的气泡）。"""
+    kids = _labeled_children(node)
+    if len(kids) < 2:
+        return False
+    return any(len(_labeled_children(k)) >= 2 and _clean_leaves(k) for k in kids)
+
+
+def _one(node: Node) -> list[Unit]:
+    unit = split_row(node)
+    return [] if unit.kind == "empty" else [unit]
+
+
+def _item_units(item: Node, depth: int = 0) -> list[Unit]:
+    """列表的一个子节点 → 0..N 个 Unit。
+
+    **真机上 ListView 的子节点不是「一条消息」**，而是「时间分隔条 + 若干条
+    消息」的一组（实测结构：``LinearLayout`` › ``layout_chatting_split`` +
+    若干 ``RelativeLayout``）。把它当一条的后果不是报错，而是整屏消息被拼成
+    一条、时间条混进正文里 —— 所以这里要能往下走两层。
+    """
+    kids = _labeled_children(item)
+    if not kids:
+        return _one(item)
+
+    times = [k for k in kids if _is_time_strip(k)]
+    if times and depth < MAX_SPLIT_DEPTH:
+        out: list[Unit] = []
+        for k in times:
+            _, y0, _, y1 = k.bounds
+            out.append(Unit(kind="time", content=_leaves(k)[0].label,
+                            y0=y0, y1=y1))
+        for k in kids:
+            if any(k is t for t in times):
+                continue
+            out.extend(_item_units(k, depth + 1) if _labeled_children(k)
+                       else _one(k))
+        return out
+
+    # 一个包装层里塞了多条消息（RecyclerView 套 RecyclerView 这类）
+    if depth < MAX_SPLIT_DEPTH and sum(1 for k in kids
+                                       if _looks_like_msgrow(k)) >= 2:
+        out = []
+        for k in kids:
+            out.extend(_item_units(k, depth + 1) if _labeled_children(k)
+                       else _one(k))
+        return out
+    return _one(item)
+
+
+def _container_units(container: Node) -> list[Unit]:
+    out: list[Unit] = []
+    for row in container.children:
+        out.extend(_item_units(row))
+    return out
+
+
+def _strip_robot_tag(name: str) -> str:
+    return ROBOT_TAG_RE.sub("", name or "").strip()
+
+
+def _bubble_and_sender(node: Node) -> tuple[Node | None, str]:
+    """在一条消息行里分出「气泡（正文）」与「昵称」。
+
+    真机结构：``RelativeLayout`` › ``[头像FrameLayout(content-desc=昵称)``,
+    ``CheckBox``, ``ViewGroup[昵称, 机器人]``, ``气泡FrameLayout``, ``零宽时间]``。
+    昵称取气泡**之前**第一个像名字的块，正文取气泡里的全部文本 —— 这样头像的
+    content-desc 与「机器人」标签都不会混进正文。
+    """
+    kids = _labeled_children(node)
+    # 气泡 = **面积最大**的那个容器。不能只按「文本行数」比：只有一行的消息
+    # （正文两三个字）与「昵称 + 机器人标签」那个小块的文本数一样多，按行数
+    # 会挑到昵称块，正文就成了「昵称 / 机器人」。
+    bubble: Node | None = None
+    best: tuple[int, int] = (-1, -1)
+    for k in kids:
+        if not _labeled_children(k):
+            continue
+        key = (_area(k), len(_clean_leaves(k)))
+        if key > best:
+            bubble, best = k, key
+    if bubble is None:
+        return None, ""
+
+    sender = ""
+    for k in kids:
+        if k is bubble:
+            break
+        if _labeled_children(k):
+            leaves = _clean_leaves(k)
+            cand = leaves[0].label if leaves else ""
+        else:
+            cand = k.label
+        cand = _strip_robot_tag(cand)
+        if (cand and len(cand) <= SENDER_MAX_LEN
+                and not PLACEHOLDER_RE.match(cand) and cand not in NOISE_LABELS
+                and not TIME_ONLY_RE.match(cand)):
+            sender = cand
+            break
+    return bubble, sender
+
+
 def split_row(row: Node) -> Unit:
-    """一个列表子节点 → 一个 :class:`Unit`（时间分隔条也会返回，kind="time"）。
+    """一个「消息行」→ 一个 :class:`Unit`（时间分隔条也会返回，kind="time"）。
 
     先切昵称、再判类型：只有切掉昵称之后才能正确认出「昵称 + [图片]」这种
     非文本消息 —— 否则整行会被当成 text，把 ``[图片]`` 当正文发出去。
     """
-    parts = _leaves(row)
+    parts = _clean_leaves(row)
     # bounds 是 (left, top, right, bottom)，别按 (x0, y0, x1, y1) 解 ——
     # 解错的后果不是报错，而是「旧→新」排序全乱，现场表现成转发顺序错乱。
     _, y0, _, y1 = row.bounds
@@ -314,11 +502,18 @@ def split_row(row: Node) -> Unit:
 
     sender = ""
     body = labels
-    struct = _split_by_structure(_unwrap(row))
-    if struct is not None:
-        sender, body = struct[0], [p.label for p in struct[1]]
-    elif len(parts) >= 2 and _looks_like_sender(parts[0], parts[1]):
-        sender, body = labels[0], labels[1:]
+    node = _unwrap(row)
+    bubble, name = _bubble_and_sender(node)
+    if bubble is not None:
+        inner = [p.label for p in _clean_leaves(bubble)]
+        if inner:
+            sender, body = name, inner
+    else:
+        struct = _split_by_structure(node)
+        if struct is not None:
+            sender, body = struct[0], [p.label for p in struct[1]]
+        elif len(parts) >= 2 and _looks_like_sender(parts[0], parts[1]):
+            sender, body = labels[0], labels[1:]
 
     if all(PLACEHOLDER_RE.match(x) for x in body):
         return Unit(sender=sender, content=body[0],
@@ -350,16 +545,15 @@ def parse_frame(text: str) -> Frame:
     frame.rows = len(container.children)
 
     units: list[Unit] = []
-    for row in container.children:
-        unit = split_row(row)
+    for unit in _container_units(container):
         if unit.kind == "time":
             frame.separators.append(unit.content)
-        elif unit.kind == "empty":
-            continue
         else:
             units.append(unit)
 
     # 列表子节点的文档顺序一般就是上→下，但嵌套布局偶尔不保证；按 y 再排一次。
+    # （行级 bounds 在真机上是准的；只有深层子节点的 bounds 会失真，见
+    # `_is_time_strip` 的说明。）
     units.sort(key=lambda u: u.y0)
     frame.units = units
     return frame

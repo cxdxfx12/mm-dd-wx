@@ -239,11 +239,32 @@ dingtalk:
 | 电脑侧 `/screen` 接收端点 | ✅ `bridge/sources/android_gateway.py` |
 | 排障工具 | ✅ `tools/android_screen.py`（连现成网关）、`tools/android_capture.py`（自起网关，联调用） |
 | 电脑侧解析器（XML → 消息） | ✅ `bridge/sources/android_parse.py`（解析 + 基线/锚点差分） |
-| 后台解析开关 | ✅ `dingtalk.android_parse`，默认关；开启即开始转发 |
-| **消息边界确认（真机）** | ⏳ **下一步**：手机上报一帧真实画面，看 `--analyze` 与解析预览 |
+| **消息边界确认（真机）** | ✅ 2026-10-17 真机一帧：容器 `ListView`、2 组消息 → 2 条、昵称与正文分开、时间条过滤 |
+| 后台解析开关 | ✅ `dingtalk.android_parse`（本机已置 `true`）；样板文件仍默认 `false` |
 | 设置中心里的网关页签 | ⏳ 目前只能改 config.yaml |
-| 保活与异常恢复 | ⏳ 待真机跑通后做 |
+| 保活与异常恢复 | ⏳ 待定（手机端被系统杀掉后不会自启） |
+
+### 真机实测出来的四个坑（解析器已按它们改）
+
+一帧真实画面（Mate Xs 2 / 钉钉 7.x，群聊页贴底）暴露的假设错误，全部有回归锁
+（`tests/test_android_parse.py::TestRealDeviceLayout`）：
+
+1. **列表的一个子节点不是一条消息**。`ListView#list_view` 的子节点是
+   「时间分隔条（`layout_chatting_split`，`今天 08:13`）+ 若干条 `RelativeLayout`」
+   的一组。按「一个子节点一条」切，整屏会被拼成一条、时间条混进正文。
+2. **底部功能条也是 RecyclerView**（`#native_menu_bar`，员工档案/任务进度/使用帮助/
+   Group Check in 四个带文本子节点）。只按「能切出几条」挑容器，它会赢过只有两组
+   消息的列表 —— 所以先按面积筛掉窄条，再比条数。
+3. **深层子节点的 `bounds` 会失真**：行级 bounds 准确，但行内会出现
+   `[212,265][964,-929]` 这种「top 恒等于列表顶部、bottom 为负」的乱码。
+   切分只依赖**结构**（叶子/容器/面积），不依赖这些坐标。
+4. **两个隐形噪音**：气泡里挂着一个 `android.view.View`、content-desc 为 `复制`
+   （长按气泡的动作条，常驻在树里）；每条消息右侧还有一个**零宽**的
+   `chatting_item_hidden_time`（`08:13`，给读屏用的）。两者都会被当正文发出去。
 
 > **注意**：`android_parse` 默认是 `false`，此时 `mode: android` 下网关**只负责收**。
 > 手机报的是画面，不开解析就不会有任何转发 —— 这是刻意的安全默认值。
 > 别把「网关在收」当成「业务在转」。
+>
+> 另外手机端**整树 md5 不变就不上报**：网关若是后起的，要等画面变一下
+> （来新消息、轻轻滑一下）才会收到第一帧。

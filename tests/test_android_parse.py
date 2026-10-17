@@ -72,6 +72,96 @@ def frame(*rows: str, pkg: str = PKG) -> str:
     )
 
 
+# ------------------------------------------------------ 真机结构（Mate Xs 2 实测）
+# 下面这套造树工具复刻的是**真机截图**里的结构，与上面的合成树刻意不同：
+#   ListView › 组(时间条 + 若干条消息) › RelativeLayout 消息行
+#                                   › [头像, CheckBox, 昵称块, 气泡, 零宽时间]
+# 这一层假设随钉钉升级变，所以必须有回归锁 —— 变的当天就要能立刻看出来。
+
+def dt_message(sender: str, lines: list[str], top: int, *,
+               hidden_time: str = "", broken_bounds: bool = False) -> str:
+    """一条消息行。``broken_bounds`` 复刻真机上深层子节点 bounds 失真的情况。
+
+    实测规律：行的 bounds 是准的，但行内子节点会出现「top 恒等于列表顶部、
+    bottom 是负数」的乱码（例如 ``[212,265][964,-929]``）。解析不能依赖它们。
+    """
+    h = 120 + 60 * len(lines)
+
+    def bbox(left: int, y: int, right: int, bottom: int) -> str:
+        if broken_bounds:
+            return f'[212,265][964,{y - 1000}]'
+        return f'[{left},{y}][{right},{bottom}]'
+
+    bubble = "".join(
+        f'<node index="9" text="{t}" class="android.widget.TextView" package="{PKG}" '
+        f'bounds="{bbox(212, top + 90 + 60 * i, 964, top + 150 + 60 * i)}"></node>'
+        for i, t in enumerate(lines))
+    hidden = (
+        f'<node index="10" text="{hidden_time}" class="android.widget.TextView" '
+        f'package="{PKG}" bounds="[1176,{top + 40}][1176,{top + 80}]"></node>'
+        if hidden_time else "")
+    return (
+        f'<node index="1" text="" class="android.widget.RelativeLayout" package="{PKG}" '
+        f'bounds="[0,{top}][1176,{top + h}]">'
+        f'<node index="2" text="" class="android.widget.FrameLayout" package="{PKG}" '
+        f'bounds="[9,{top}][153,{top + 144}]">'
+        f'<node index="3" text="" class="android.widget.ImageView" package="{PKG}" '
+        f'content-desc="{sender}" bounds="[24,{top}][137,{top + 113}]"></node></node>'
+        f'<node index="4" text="" class="android.view.ViewGroup" package="{PKG}" '
+        f'bounds="[178,{top + 20}][1006,{top + 64}]">'
+        f'<node index="5" text="{sender}" class="android.widget.TextView" package="{PKG}" '
+        f'bounds="[178,{top + 20}][406,{top + 64}]"></node>'
+        f'<node index="6" text="机器人" class="android.widget.TextView" package="{PKG}" '
+        f'bounds="[419,{top + 20}][536,{top + 64}]"></node></node>'
+        f'<node index="7" text="" class="android.widget.FrameLayout" package="{PKG}" '
+        f'bounds="[174,{top + 80}][1002,{top + h - 10}]">{bubble}'
+        f'<node index="8" text="" class="android.view.View" package="{PKG}" '
+        f'content-desc="复制" bounds="[541,{top + h - 40}][635,{top + h - 5}]"></node>'
+        f'</node>{hidden}</node>')
+
+
+def dt_item(strip: str, *msgs: str, top: int = 265, height: int = 878) -> str:
+    """ListView 的一个子节点 = 一组：时间分隔条 + 若干条消息。
+
+    ``layout_chatting_split`` 那一层的 bounds 在真机上是坏的（``[0,265][1176,-1189]``），
+    这里刻意也做成坏的 —— 时间条是靠「文本全是时间 + 有宽度」认出来的，不看坐标。
+    """
+    return (
+        f'<node index="20" text="" class="android.widget.LinearLayout" package="{PKG}" '
+        f'clickable="true" bounds="[0,{top}][1176,{top + height}]">'
+        f'<node index="21" text="" resource-id="{PKG}:id/layout_chatting_split" '
+        f'class="android.widget.LinearLayout" package="{PKG}" '
+        f'bounds="[0,{top}][1176,{top - height - 200}]">'
+        f'<node index="22" text="{strip}" class="android.widget.TextView" package="{PKG}" '
+        f'bounds="[473,{top}][702,{top - height - 203}]"></node></node>'
+        f'{"".join(msgs)}</node>')
+
+
+def dt_frame(*items: str, menu: bool = True) -> str:
+    """整屏：一个列表 + 底部功能条（功能条故意做成很难缠的对手）。"""
+    menu_xml = ""
+    if menu:
+        menu_xml = (
+            f'<node index="60" text="" resource-id="{PKG}:id/native_menu_bar" '
+            f'class="androidx.recyclerview.widget.RecyclerView" package="{PKG}" '
+            f'scrollable="true" bounds="[13,2018][1163,2130]">' + "".join(
+                f'<node index="61" text="" class="android.widget.RelativeLayout" '
+                f'package="{PKG}" bounds="[13,{2018 + i * 28}][163,{2046 + i * 28}]">'
+                f'<node index="62" text="{t}" class="android.widget.TextView" '
+                f'package="{PKG}" bounds="[13,{2018 + i * 28}][163,{2046 + i * 28}]">'
+                f'</node></node>'
+                for i, t in enumerate(["员工档案", "任务进度", "使用帮助", "Group Check in"]))
+            + '</node>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy rotation="0">'
+        f'<node index="0" text="" class="android.widget.FrameLayout" package="{PKG}" '
+        f'bounds="[0,0][1176,2480]">'
+        f'<node index="50" text="" resource-id="{PKG}:id/list_view" '
+        f'class="android.widget.ListView" package="{PKG}" scrollable="true" '
+        f'bounds="[0,265][1176,2018]">{"".join(items)}</node>'
+        f'{menu_xml}</node></hierarchy>')
+
+
 # ------------------------------------------------------------------ 解析
 
 class TestParseFrame(unittest.TestCase):
@@ -188,6 +278,86 @@ class TestParseFrame(unittest.TestCase):
         f = parse_frame(frame())          # 列表容器存在但没有任何子节点
         self.assertEqual(f.units, [])
         self.assertTrue(f.warnings)
+
+
+class TestRealDeviceLayout(unittest.TestCase):
+    """真机结构（Mate Xs 2 / 钉钉 7.x，2026-10-17 抓的一帧）。
+
+    这一组锁的是「按合成树写出来的假设」与真机之间的差距。真机上一屏长这样：
+
+        ListView(list_view)
+          └ LinearLayout            ← **一组**，不是一条消息
+              ├ layout_chatting_split  › 「今天 08:13」
+              ├ RelativeLayout      ← 一条消息
+              │   ├ 头像 FrameLayout(content-desc=昵称)
+              │   ├ CheckBox
+              │   ├ ViewGroup › [昵称, 机器人]
+              │   ├ 气泡 FrameLayout › 若干 TextView + 「复制」按钮
+              │   └ 零宽 TextView「08:13」
+              └ RelativeLayout      ← 同组的第二条
+    """
+
+    def test_one_item_can_hold_several_messages(self):
+        """一组里两条消息要拆成两条，不能拼成一条。"""
+        xml = dt_frame(dt_item("今天 08:13",
+                               dt_message("拦截跟单专员", ["第一条正文"], 320),
+                               dt_message("签收跟单专员", ["第二条正文"], 700)))
+        f = parse_frame(xml)
+        self.assertEqual(f.container, "ListView")
+        self.assertEqual([u.content for u in f.units], ["第一条正文", "第二条正文"])
+        self.assertEqual(f.separators, ["今天 08:13"])
+
+    def test_bottom_menu_bar_is_not_the_message_list(self):
+        """底部功能条也是一个 RecyclerView，且有 4 个带文本的子节点 —— 不能赢。"""
+        xml = dt_frame(dt_item("今天 08:13",
+                               dt_message("拦截跟单专员", ["正文"], 320)))
+        f = parse_frame(xml)
+        self.assertEqual(f.container, "ListView")
+        self.assertNotIn("员工档案", [u.content for u in f.units])
+
+    def test_sender_comes_from_avatar_and_robot_tag_stays_out(self):
+        f = parse_frame(dt_frame(dt_item("今天 08:13",
+                                         dt_message("签收跟单专员", ["正文"], 320))))
+        unit = f.units[0]
+        self.assertEqual(unit.sender, "签收跟单专员")
+        self.assertEqual(unit.content, "正文")
+
+    def test_copy_button_and_hidden_time_stay_out_of_body(self):
+        """气泡上的「复制」按钮、右侧零宽时间戳都不是消息内容。"""
+        f = parse_frame(dt_frame(dt_item(
+            "今天 08:13",
+            dt_message("签收跟单专员", ["正文第一行", "正文第二行"], 320,
+                       hidden_time="08:13"))))
+        self.assertEqual(len(f.units), 1)
+        unit = f.units[0]
+        self.assertEqual(unit.content, "正文第一行\n正文第二行")
+        self.assertNotIn("复制", unit.content)
+        self.assertEqual(f.separators, ["今天 08:13"])
+
+    def test_single_line_message_body_is_not_the_nickname_block(self):
+        """只有一行的消息：昵称块的文本数与正文一样多，不能挑错容器。"""
+        f = parse_frame(dt_frame(dt_item("今天 08:13",
+                                         dt_message("拦截跟单专员", ["374票"], 320))))
+        self.assertEqual(f.units[0].content, "374票")
+
+    def test_deep_garbage_bounds_do_not_break_splitting(self):
+        """行内子节点 bounds 乱掉（top 恒为列表顶部、bottom 是负数）时仍能切对。"""
+        xml = dt_frame(dt_item("今天 08:13",
+                               dt_message("拦截跟单专员", ["第一行", "第二行"], 320,
+                                          broken_bounds=True),
+                               dt_message("签收跟单专员", ["第三行"], 900,
+                                          broken_bounds=True)))
+        f = parse_frame(xml)
+        self.assertEqual([u.content for u in f.units], ["第一行\n第二行", "第三行"])
+        self.assertEqual([u.sender for u in f.units], ["拦截跟单专员", "签收跟单专员"])
+
+    def test_hidden_zero_width_time_is_not_a_separator(self):
+        """零宽时间戳（chatting_item_hidden_time）不能被当成分隔条。"""
+        f = parse_frame(dt_frame(dt_item(
+            "今天 08:13", dt_message("签收跟单专员", ["正文"], 320,
+                                     hidden_time="08:13"))))
+        self.assertEqual(f.separators, ["今天 08:13"])
+        self.assertEqual(len(f.units), 1)
 
 
 class TestFingerprintDrift(unittest.TestCase):

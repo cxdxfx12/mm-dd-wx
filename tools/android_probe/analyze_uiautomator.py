@@ -37,11 +37,15 @@ SCROLL_CLASSES = ("RecyclerView", "ListView", "GridView", "ScrollView")
 
 TARGET_PKG = "com.alibaba.android.rimet"
 
-# 时间分隔符：钉钉安卓把「09:12 / 昨天 / 星期一 / 10-16」这类分隔条
+# 时间分隔符：钉钉安卓把「09:12 / 今天 08:13 / 昨天 / 星期一 / 10-16」这类分隔条
 # 也做成消息列表的独立子节点。所以「一个子节点 = 一条消息」不能直接用。
+# ⚠ 与 bridge/sources/android_parse.py 的同名正则保持一致（真机格式是「今天 08:13」）。
 TIME_ONLY_RE = re.compile(
-    r"^(\d{1,2}:\d{2}(:\d{2})?|昨天.*|前天.*|星期[一二三四五六日]|"
-    r"\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2})$"
+    r"^((今天|昨天|前天|大前天)\s*\d{1,2}:\d{2}|"
+    r"(今天|昨天|前天|大前天)|"
+    r"\d{1,2}:\d{2}(:\d{2})?|"
+    r"星期[一二三四五六日天]|"
+    r"\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2})\s*$"
 )
 
 # 非文本消息的占位描述（图片/文件这类消息只有 content-desc，没有正文）。
@@ -132,6 +136,36 @@ def classify_child(node: Node) -> str:
     return "消息"
 
 
+def pick_message_list(root: Node, containers: list[Node]) -> Node | None:
+    """挑出消息列表 —— **直接复用正式解析器的那套规则**。
+
+    为什么不再自己写一份：真机上「哪个才是消息列表」远没有看起来那么显然
+    （底部功能条也是 RecyclerView；气泡里的横滑表格也是可滚动容器；而列表
+    本身因为装着那个表格反而不算「最里层」）。自己写一份的结果是：这个报告
+    说 A 是消息列表、解析预览说 B，人会以为解析器错了，去改一个没错的地方。
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    try:
+        from bridge.sources.android_parse import Node as ParseNode
+        from bridge.sources.android_parse import find_message_list
+    except ImportError:                                   # pragma: no cover
+        return None
+
+    back: dict[int, Node] = {}
+
+    def conv(n: Node) -> "ParseNode":
+        p = ParseNode(cls=n.cls, text=n.text, desc=n.desc, rid=n.rid,
+                      pkg=n.pkg, bounds=n.bounds, scrollable=n.scrollable)
+        back[id(p)] = n
+        p.children = [conv(c) for c in n.children]
+        return p
+
+    choice = find_message_list(conv(root))
+    return back.get(id(choice)) if choice is not None else None
+
+
 def load(path: Path) -> Node:
     root = ET.parse(path).getroot()
     for child in root:
@@ -156,23 +190,18 @@ def report(root: Node, top: int) -> int:
     # ---- 消息容器：决定「能不能按一条消息分组」 ----
     containers = [n for n in nodes
                   if any(k in n.cls for k in SCROLL_CLASSES) or n.scrollable]
-    # 只留最里层那个 —— 外层 ScrollView 套内层 RecyclerView 很常见，
-    # 真正的消息列表是最里面那个。
-    inner = [c for c in containers
-             if not any(_is_ancestor_of(c, o) for o in containers if o is not c)]
     print(f"可滚动容器（消息列表候选）：{len(containers)} 个")
-
-    best: Node | None = None
-    best_rows = 0
-    for c in (inner or containers):
-        rows = [ch for ch in c.children if subtree_text(ch)]
+    for c in containers:
         x1, y1, x2, y2 = c.bounds
+        rows = [ch for ch in c.children if subtree_text(ch)]
         print(f"  · {c.short_class}"
               f"{'#' + c.short_id if c.short_id else ''}"
               f"  子节点 {len(c.children)} 个（其中有文本的 {len(rows)} 个）"
               f"  区域 {x2 - x1}×{y2 - y1} @({x1},{y1})")
-        if len(rows) > best_rows:
-            best, best_rows = c, len(rows)
+
+    # 用解析器的规则挑，保证「结构判定」与「解析预览」说的是同一个容器
+    best = pick_message_list(root, containers)
+    best_rows = len([ch for ch in best.children if subtree_text(ch)]) if best else 0
 
     if best is not None and best_rows >= 2:
         print()
@@ -235,12 +264,12 @@ def verdict_of(labeled: list[Node], best: Node | None, rows: int) -> tuple[list[
         out.append(f"  最长的一条：{max(labeled, key=lambda n: len(n.label)).label[:80]}")
 
     if best is not None and rows >= 2:
-        out.append(f"✓ 找到可分组容器（{best.short_class}，{rows} 个带文本的子节点）"
-                   f"—— 每条消息的边界是清楚的，")
-        out.append("  不需要 PC 端那套按坐标聚类 + 像素颜色判别，实现会简单得多。")
+        out.append(f"✓ 找到消息列表容器（{best.short_class}，{rows} 个带文本的子节点）"
+                   f"—— 消息边界是清楚的。")
         out.append("")
-        out.append("→ 结论：**可行**。下一步做阶段 1（读取 + 指纹去重），"
-                   "再按 tools/android_probe/README.md 接网关。")
+        out.append("→ 结论：**可行**。解析器已按这个形状实现"
+                   "（bridge/sources/android_parse.py）；")
+        out.append("  这一节与下面「解析预览」说的应当是同一个容器，对不上说明解析器该改了。")
         return out, True
 
     out.append("△ 有文本，但没找到「一条消息一个子节点」的容器。")

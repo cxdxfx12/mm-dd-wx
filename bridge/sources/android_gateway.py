@@ -277,6 +277,19 @@ class _Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass                          # 手机提前断开，不值得记一条错误
 
+    def _drain(self, length: int, cap: int = 8 * 1024 * 1024) -> None:
+        """拒绝之前先把请求体读掉（最多读完 ``cap`` 字节）。
+
+        不读完就回 413，客户端还在往里写，socket 会被 RST —— 客户端看到的不是
+        「请求体过大」而是一句「连接被重置」，人就不知道到底哪儿错了。
+        """
+        remaining = min(max(0, length), cap)
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                return
+            remaining -= len(chunk)
+
     def _path(self) -> str:
         p = urlparse(self.path).path
         return p.rstrip("/") or "/"
@@ -365,6 +378,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(400, {"ok": False, "error": "请求体为空"})
             return
         if length > limit:
+            self._drain(length)
             self._reply(413, {"ok": False,
                               "error": f"请求体过大（{length} > {limit} 字节）"})
             return

@@ -191,6 +191,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--keep", action="store_true",
                     help="收到后继续盯着（观察上报是否持续）")
     ap.add_argument("--out", default="", help="存到哪里，默认 data/screen-<时间>.xml")
+    ap.add_argument("--file", default="",
+                    help="不连手机：直接拿一个已存下的 XML 跑结构判定与解析预览"
+                         "（复盘用；改了解析器想验证效果时最方便）")
     ap.add_argument("--top", type=int, default=25, help="判定时打印前多少个文本节点")
     ap.add_argument("--no-analyze", action="store_true", help="只存不做结构判定")
     ap.add_argument("--no-preview", action="store_true",
@@ -200,6 +203,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # ------------------------------------------------------- 0. 复盘已存的帧
+    if args.file:
+        path = Path(args.file)
+        if not path.is_file():
+            print(f"找不到这个文件：{path}")
+            return 1
+        print(LINE)
+        print(f"离线复盘：{path}（不连手机、不开网关、不发任何东西）")
+        print(LINE)
+        analyze(path, args.top)
+        print(LINE)
+        print("解析预览（用正式解析器跑这一帧）")
+        print(LINE)
+        preview_parse(path, args.top)
+        return 0
 
     # ------------------------------------------------------- 1. 读配置
     cfg_path = Path(args.config)
