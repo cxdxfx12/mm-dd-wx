@@ -55,7 +55,7 @@ import socket
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -69,6 +69,7 @@ from .android_parse import (FrameDiffer, ParseError, Unit, clipped_units,
                             needs_scroll, parse_frame,
                             units_to_messages)
 from .base import MessageHandler, Source, infer_company
+from .pending import PendingBuffer
 
 log = logging.getLogger("bridge.source.android")
 
@@ -84,11 +85,6 @@ SCREEN_LOG_EVERY = 30
 # 连续这么多帧都认不出「聊天页」→ 升到 WARNING（会触发钉钉告警）。
 # 认不出意味着一条都不转发，属于「程序在跑但静默失效」，必须让人知道。
 UNKNOWN_PAGE_ALERT_AFTER = 3
-# H5 卡片「扣住待稳」：新内容第一次见扣住不放，请手机 HOLD_MS 毫秒后重报；
-# 同样的内容见到第 HOLD_MAX 眼就放行（渲染实在稳不下来的兜底 —— 宁可发
-# 一条可能不完整的，也不能永远不发）。原生消息不经过这条路，延迟零增加。
-HOLD_MS = 800
-HOLD_MAX = 4
 # 「同一条卡片换了渲染形态」的近似去重窗口（秒）。
 # 实测两种形态的间隔：几分钟内来回切（上翻重绘、卡片重新渲染）。取 10 分钟
 # 足以覆盖，又短到不会误伤「人工故意在十分钟后再发一条一样的话」。
@@ -451,6 +447,113 @@ def _watchdog_step(ctx: "_Ctx", started: float, now: float,
     return msg
 
 
+# --------------------------------------------------------------- 先攒后发
+
+# 排空缓冲的节拍。要明显小于 ``pending.QUIET``（默认 3 秒），否则消息会
+# 比「静默 3 秒」晚到一大截 —— 0.5 秒的抖动可以接受，2 秒就明显滞后了。
+FLUSH_TICK = 0.5
+
+
+def _flush_loop(ctx: "_Ctx", stop: threading.Event) -> None:
+    """定期把缓冲里静默够久的消息投出去。
+
+    单独一个线程而不是在 HTTP 请求里顺手做：``on_message`` 会**同步**等微信
+    把消息发出去（OCR 通道要点会话、贴文本、等气泡出现，可能几秒）。放在
+    HTTP 线程里会让手机的下一次上报被堵住 —— 而「攒」这件事本身就依赖手机
+    持续上报，堵住上报等于攒不到内容。
+
+    出错只记日志、不退出循环：一次投递失败（微信没开、会话没找到）不该让
+    后面所有消息都卡住。失败的那几条已经从缓冲里拿出来了，按现状丢弃 ——
+    它们仍在**手机屏上**，下次采集还会再来一遍。
+    """
+    while not stop.wait(FLUSH_TICK):
+        try:
+            buf = ctx.pending
+            if buf is None:
+                continue
+            ready = buf.drain()
+            if not ready:
+                continue
+            msgs = [m for m in (_rebuild_message(e) for e in ready)
+                    if m is not None]
+            if ctx.on_message is None or not msgs:
+                continue
+            _deliver_ready(ctx, msgs)
+        except Exception:
+            log.exception("排空消息缓冲失败（不影响后续）")
+
+
+def _rebuild_message(entry) -> "Message | None":
+    """把一个缓冲条目还原成**最终要发的** Message。
+
+    ⚠ 不能直接用 ``entry.extra["message"]`` —— 那是**第一次**收到这条消息时
+    构造的 Message，正文是当时那个半成品。缓冲会把后面更全的版本合并进
+    ``entry.content``，但 Message 是不会自己跟着变的对象。2026-10-18 实测：
+    卡片分三段长出来，缓冲里存的已是最全的 29 字，群里收到的却是第一段的
+    6 字（``test_growing_h5_card_only_the_fullest_version_is_sent`` 抓到的）。
+
+    所以这里拿**第一版的 Message 当模板**（uid / raw_id / msg_time / company
+    都保持首次见到时的值 —— 去重要靠它），只把 ``content`` 和
+    ``sender_name`` 换成缓冲里最全的那版。
+
+    ``raw_id`` 保持不动的理由：同一条消息分几批渲染出来，如果每批都换一个
+    uid，下游 `is_duplicate` 就挡不住，手机上重报一帧就多发一条。
+    """
+    base = entry.extra.get("message")
+    if base is None:
+        return None
+    try:
+        return replace(base, content=entry.content or base.content,
+                       sender_name=entry.sender or base.sender_name,
+                       chat_name=entry.chat_name or base.chat_name)
+    except Exception:                       # noqa: BLE001  —— 兜底，别丢消息
+        log.exception("重建缓冲消息失败，按首次见到的版本投递：%s",
+                      (base.content or "")[:40])
+        return base
+
+
+def _deliver_ready(ctx: "_Ctx", msgs: list) -> int:
+    """同 ``_GatewayHandler._deliver`` 的投递部分，供 flusher 线程复用。
+
+    刻意不把 `_deliver` 提成模块级函数：它依赖 `self.ctx.recent_keys` /
+    `self.ctx.count` 这套状态，挪出去要改一圈调用点。这里只复刻**投递 +
+    近似去重**这一段，逻辑必须与那边保持一致（判据都来自
+    `fingerprint.is_same_message`，不会各写一份）。
+    """
+    now = time.monotonic()
+    emitted = 0
+    for msg in msgs:
+        sender = norm_sender(msg.sender_name)
+        with ctx.lock:
+            for k, (_, _, at) in list(ctx.recent_keys.items()):
+                if now - at > NEAR_DUP_WINDOW:
+                    del ctx.recent_keys[k]
+            dup_age = next(
+                (now - at for s, old, at in ctx.recent_keys.values()
+                 if s == sender and is_same_message(old, msg.content)),
+                None)
+        if dup_age is not None:
+            log.info("同一卡片换了渲染形态（%.0f 秒前已发过同一条），跳过：%s",
+                     dup_age, msg.content[:40].replace("\n", " "))
+            with ctx.lock:
+                ctx.count["rejected"] += 1
+            continue
+        try:
+            ctx.on_message(msg)
+            emitted += 1
+            with ctx.lock:
+                ctx.recent_keys[msg.uid] = (sender, msg.content,
+                                            time.monotonic())
+        except Exception:
+            log.exception("下游处理消息失败：%s", msg.uid)
+    with ctx.lock:
+        ctx.count["accepted"] += emitted
+    if emitted:
+        head = next((m.content[:40].replace("\n", " ") for m in msgs), "")
+        log.info("安卓画面新增 %d 条消息：%s", emitted, head)
+    return emitted
+
+
 def _watchdog(ctx: "_Ctx", offline_after: float,
               stop: threading.Event) -> None:
     """盯着「手机还在不在」，状态**只在变化时**说话。
@@ -632,14 +735,6 @@ class _Ctx:
     # 不能写死 8765：用户在设置里改过端口时，页面照着旧值显示，
     # 手机上填了就是连不上，而且他没法从 App 里看出错在哪。
     port: int = DEFAULT_PORT
-    # H5 卡片「扣住待稳」的状态（见 _ingest 的 garbled 分支）。
-    # hold_key 是被扣住那批新单元的指纹串，hold_seen 记这是第几眼看到它 ——
-    # 同样的内容见到第二眼才投递；超过 HOLD_MAX 眼还稳不下来就放行，
-    # 宁可发一条可能不完整的，也不能永远不发。
-    hold_key: str = ""
-    hold_seen: int = 0
-    # 不管 key 换没换都累计 —— 防「内容一直在长」导致永远扣住。
-    hold_total: int = 0
     # 最近投递过的消息 → (归一化发送者, 正文, 投递时刻)。用来拦「同一条卡片
     # 换了渲染形态又被当成新消息」的重复转发：横排表格和一格一行的指纹不同、
     # uid 不同，is_duplicate 挡不住，只能按**内容片段重合度**在时间窗内再挡一次。
@@ -655,19 +750,13 @@ class _Ctx:
     align_md5: str = ""
     align_tried: int = 0
     align_at: float = 0.0
-    # ── H5 卡片「扣住待稳」时**被扣住的那批单元** ─────────────────────
-    # 为什么必须单独记下来：扣住时故意不 commit（锚点留在旧位置），可是
-    # 「同一屏重报」那一帧里，peek 拿锚点去比 —— 锚点本来就是这一屏，
-    # 于是判出「新增 0 条」。扣住的那批就这么**静默蒸发**：既没投递，也
-    # 没告警，日志只留一行「扣住等渲染稳定」。
-    #
-    # 2026-10-18 实测事故（用户报「拦截跟单日报 / 按需派送履约风险提醒
-    # 没转发」）：日志里「扣住（第 1 眼）」出现十几次，几乎从没等到第 2 眼。
-    # 手机确实按 hold 重报了，但重报的帧被这里判成「没有新消息」。
-    #
-    # 所以扣住时把单元本身存进 hold_units，重报帧先跟它对一遍：
-    # 指纹没变 = 渲染稳定了 → 投递；变了 = 还在长 → 更新后再扣一轮。
-    hold_units: list = field(default_factory=list)
+    # ── 「先攒后发」缓冲 ───────────────────────────────────────────
+    # 钉钉机器人的 H5 卡片是分批渲染的，这一帧看到的往往只是半成品。
+    # 早期用「扣住等重报帧指纹一致」，但 H5 卡片每重绘一次整批指纹都变，
+    # 于是永远等不到第二眼（2026-10-18 全天：扣住 14 次、成功 1 次）。
+    # 现在改成按 (发送者, 时间窗) 归并、保留最长版本、静默后投递。
+    # 详见 bridge/sources/pending.py 的模块注释。
+    pending: object | None = None
     # ── 长消息「攒齐再发」的状态（见 _hold_long / _ingest）─────────────
     # 一条超过一屏的消息，第一次出现时树里只有屏幕上那截。旧做法是「先发半截，
     # 再请手机翻一屏补全」—— 补全回来的前半截因为指纹不同（片段 ≠ 全文），
@@ -1047,11 +1136,10 @@ class _Handler(BaseHTTPRequestHandler):
             pending: list = []
             note = ""
             scroll = False
-            hold_ms = 0
             if self.ctx.parse and self.ctx.on_message is not None:
                 # 手机端上翻补全后重报的那一帧会带 reason=scroll-fill。
                 # 它必须走另一套判定 —— 见 _ingest 里的说明。
-                pending, note, scroll, hold_ms = self._ingest(
+                pending, note, scroll = self._ingest(
                     text, filling=(screen["reason"] == "scroll-fill"),
                     frame_md5=screen["md5"])
 
@@ -1076,29 +1164,30 @@ class _Handler(BaseHTTPRequestHandler):
         body = {"ok": True, "bytes": length, "count": count,
                 "md5": screen["md5"]}
         if self.ctx.parse:
-            # 手机端日志里直接能看到「这一帧有没有产生转发」，省得两头对时间
+            # 手机端日志里直接能看到「这一帧有没有产生转发」，省得两头对时间。
+            # ⚠ 这里的数字是**收进缓冲**的条数，不一定是「已投递」的条数 ——
+            # 消息要静默几秒才发（见 pending.py）。所以另给一个 buffered 说明
+            # 还在攒着几条，免得拿日志断言「转发成功」时被误导。
             body["messages"] = emitted
+            if self.ctx.pending is not None:
+                body["buffered"] = len(self.ctx.pending)
             if note:
                 body["note"] = note
             # 这是给手机端的**指令**：屏上有消息被切掉了，请往上翻一屏再报。
             # 手机端见 android/.../CollectorService.maybeFillTruncated。
             if scroll:
                 body["scroll"] = True
-            # 同样是给手机端的指令：H5 卡片还在渲染，等 hold_ms 毫秒重报一帧。
-            # 手机端见 android/.../CollectorService.maybeHoldConfirm。
-            if hold_ms:
-                body["hold"] = hold_ms
         self._reply(200, body)
 
     # --- 画面解析（仅 dingtalk.android_parse = true）---
 
     def _ingest(self, text: str, *, filling: bool = False,
-                frame_md5: str = "") -> tuple[list, str, bool, int]:
+                frame_md5: str = "") -> tuple[list, str, bool]:
         """一帧节点树 → 本帧**新增**的消息单元。
 
-        返回 ``(单元列表, 说明, 是否要补全, 扣住毫秒数)``。扣住毫秒数 > 0
-        表示这一帧的新消息**没有投递**，请手机过这么多毫秒重报一帧 ——
-        见下面 garbled 分支的说明。
+        返回 ``(单元列表, 说明, 是否要补全)``。这三个值都不代表「已经发出去
+        了」—— 单元交给 ``_emit`` 归并进 ``ctx.pending``，静默几秒后才由
+        flusher 线程取最全的版本投递（见 ``pending.py``）。
 
         解析失败**不能**回 4xx/5xx：手机端收到错误会重传同一帧，而这一帧的
         形状问题是重传解决不了的，只会把日志刷满。所以记一条 WARNING、
@@ -1111,7 +1200,7 @@ class _Handler(BaseHTTPRequestHandler):
             frame = parse_frame(text)
         except ParseError as exc:
             log.warning("手机画面解析失败（这一帧跳过）：%s", exc)
-            return [], "解析失败", False, 0
+            return [], "解析失败", False
 
         if not frame.is_chat:
             # 用户点开了 @ 面板、群信息、搜索页 —— 屏上是一排排人名和身份标签，
@@ -1137,7 +1226,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "现在一条消息都不会转发。用 tools/android_capture.py "
                         "抓一帧看 page_reason", self.ctx.skip_streak, frame.page_reason)
                     self.ctx.last_skip_note = note
-            return [], note, False, 0
+            return [], note, False
 
         self.ctx.skip_streak = 0
         self.ctx.last_skip_note = ""
@@ -1186,24 +1275,29 @@ class _Handler(BaseHTTPRequestHandler):
                 differ.note_scroll(frame.units)
                 self._clear_long()
                 # 拼齐了就别再发那半截，只发拼好的完整消息。
-                return [merged], "长消息补全", False, 0
+                return [merged], "长消息补全", False
             pending, note, _ = self._ingest_fill(frame)
             differ.note_scroll(frame.units)
-            return pending, note, False, 0
+            return pending, note, False
 
-        # ── H5 卡片渲染中：扣住待稳 ─────────────────────────────────
-        # 钉钉机器人消息是 H5 卡片，节点坐标常年是坏的（frame.garbled），
-        # 而且**内容分批长出来**：第一帧可能只有标题，表格单元要再过几百毫秒
-        # 才渲染完。抓到半成品就转发，群里收到的就是「有标题没数据」的残废
-        # 消息（2026-10-17 拦截跟单日报真机事故）；等渲染完的那一帧锚点又
-        # 对不上（气泡指纹变了）被静默重建基线，缺的那部分永远补不回来。
+        # ── H5 卡片：不再在这里扣住 ─────────────────────────────────
+        # 钉钉机器人消息是 H5 卡片，节点坐标常年是坏的（frame.garbled），而且
+        # **内容分批长出来**：第一帧可能只有标题，表格单元要再过几百毫秒才
+        # 渲染完。抓到半成品就转发，群里收到的就是「有标题没数据」的残废消息
+        # （2026-10-17 拦截跟单日报真机事故）。
         #
-        # 所以 garbled 帧改走 peek（不推进锚点）：
-        #   · 新内容第一次见 → 扣住，回 hold 让手机 800ms 后重报；
-        #   · **同样的内容第二次见**（渲染稳定了）→ commit + 正常投递；
-        #   · 内容一直变、或基线/锚点一直建不起来 → HOLD_MAX 眼内放行兜底
-        #     （宁可发一条可能不完整的，也不能永远不发）。
-        # 原生消息（坐标正常）不经过这条路，延迟零增加。
+        # 早期在这里做「扣住待稳」：新内容第一次见先不发，让手机 800ms 后
+        # 重报，等「同样的内容见到第二次」再发。**这个办法在真机上基本没
+        # 工作过** —— 2026-10-18 全天日志：扣住第 1 眼 14 次、进到第 2 眼
+        # 0 次、终投递 1 条。原因是它的前提不成立：H5 卡片每重绘一次，整批
+        # 节点的指纹都会变，于是 `hold_key` 每帧都对不上，`seen` 永远等于 1。
+        #
+        # 现在改成「攒」：这一帧解析出什么就**原样收进 `ctx.pending`**，由
+        # `PendingBuffer` 按 (发送者, 时间窗) 归并、只保留最全的版本、静默
+        # 几秒后投递。好处是**不需要屏幕上连续两帧一致** —— 卡片长了几截就
+        # 攒几截，重绘换指纹、锚点丢失、被系统通知挤出屏幕都不再有影响。
+        #
+        # 所以这里不再扣住，也不再请手机重报（少一轮往返，消息反而更早到）。
         garbled = frame.garbled
         # 一律先 peek（只判定、不动锚点）。原生帧过去直接 feed，锚点立刻被
         # 覆盖成本帧 —— 那样「锚点丢失后翻一屏试探」就永远对不上了（旧锚点
@@ -1213,16 +1307,6 @@ class _Handler(BaseHTTPRequestHandler):
         diff = differ.peek(frame.units)
 
         if garbled and (diff.baseline or diff.anchor_lost):
-            # 基线/锚点先不建：现在记住的是半成品，渲染完就「锚点丢失」了。
-            key = "B" if diff.baseline else "L"
-            seen = self.ctx.hold_seen + 1 if self.ctx.hold_key == key else 1
-            self.ctx.hold_key, self.ctx.hold_seen = key, seen
-            self.ctx.hold_total += 1
-            if seen < 2 and self.ctx.hold_total < HOLD_MAX:
-                what = "基线先不建" if diff.baseline else "锚点先不重建"
-                log.info("安卓画面解析：屏上有 H5 卡片还在渲染，%s（第 %d 眼）",
-                         what, seen)
-                return [], f"H5 渲染中，{what}", False, HOLD_MS
             if not diff.baseline:
                 # H5 帧的锚点丢失同样先试探一次（理由同下面原生帧那处）。
                 # **必须在 commit 之前**：commit 会把锚点覆盖成当前这屏，
@@ -1232,15 +1316,14 @@ class _Handler(BaseHTTPRequestHandler):
                     log.warning("安卓画面解析：H5 卡片的锚点对不上 —— "
                                 "已请手机翻一屏试着找回（第 %d 次）",
                                 self.ctx.align_tried)
-                    return [], "锚点丢失，翻一屏找", True, 0
+                    return [], "锚点丢失，翻一屏找", True
             differ.commit(frame.units)
-            self.ctx.hold_key, self.ctx.hold_seen, self.ctx.hold_total = "", 0, 0
             if diff.baseline:
                 log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
                          "此后只转发基线之后的新消息", len(frame.units))
-                return [], "已建立基线", False, 0
+                return [], "已建立基线", False
             log.warning("安卓画面解析：锚点丢失，基线已重建到当前画面")
-            return [], "锚点丢失", False, 0
+            return [], "锚点丢失", False
 
         if diff.baseline:
             differ.commit(frame.units)          # peek 之后必须自己推进锚点
@@ -1252,7 +1335,7 @@ class _Handler(BaseHTTPRequestHandler):
             why = needs_scroll(frame)
             if why:
                 log.info("安卓画面解析：当前屏有消息没显示全（%s）", why)
-            return [], "已建立基线", False, 0
+            return [], "已建立基线", False
         if diff.anchor_lost:
             # 锚点丢失 ≠ 一定是翻历史。真机上最常见的两个原因恰恰是**漏发**：
             #   · 新消息太长，把上一帧的锚点整条挤出了屏幕；
@@ -1272,42 +1355,13 @@ class _Handler(BaseHTTPRequestHandler):
                 log.warning("安卓画面解析：上一帧的锚点在本帧里找不到 —— "
                             "已请手机翻一屏试着找回（第 %d 次）",
                             self.ctx.align_tried)
-                return [], "锚点丢失，翻一屏找", True, 0
+                return [], "锚点丢失，翻一屏找", True
             differ.commit(frame.units)          # 认输了，基线重建到当前画面
             log.warning("安卓画面解析：上一帧的锚点在本帧里找不到（翻历史／换群／"
                         "一屏全换）—— 本帧不转发，基线已重建到当前画面")
-            return [], "锚点丢失", False, 0
+            return [], "锚点丢失", False
 
         new = list(diff.units)
-
-        # ── 这是「上次扣住」那批的重报帧吗？──────────────────────────
-        # 扣住时故意不 commit，所以同一屏重报时 peek 会判出「新增 0 条」
-        # —— 扣住的那批就再也看不到了。这里先拿 hold_units 跟本帧里的单元
-        # 对一遍，把「还在屏上、且内容没再变」的挑出来：
-        #   · 全部没变 → 渲染稳定了，投递；
-        #   · 有变化   → 还在长，更新 hold_units 再扣一轮（受 HOLD_MAX 约束）。
-        resumed = self._resume_hold(frame) if self.ctx.hold_units else None
-        if resumed is not None:
-            units, note, fresh = resumed
-            if units:
-                differ.commit(frame.units)
-                self._clear_hold()
-                log.info("安卓画面解析：H5 卡片内容已稳定（重报帧与扣住的一致），"
-                         "投递 %d 条", len(units))
-                return self._finish(units, frame, differ)
-            # 还在长：更新成新版批次，继续扣（受 HOLD_MAX 约束）。
-            self.ctx.hold_units = fresh
-            self.ctx.hold_total += 1
-            if self.ctx.hold_total < HOLD_MAX:
-                log.info("安卓画面解析：H5 卡片还在长，继续扣住（第 %d 眼）",
-                         self.ctx.hold_total)
-                return [], "H5 渲染中，扣住待稳", False, HOLD_MS
-            log.warning("安卓画面解析：H5 渲染等待超限（%d 眼还没稳下来），"
-                        "按现状投递 %d 条（可能不完整）",
-                        self.ctx.hold_total, len(fresh))
-            differ.commit(frame.units)
-            self._clear_hold()
-            return self._finish(fresh, frame, differ)
 
         # 这一帧正常判出了新内容 = 锚点是好的。清零试探计数，让下次真遇到
         # 「长消息挤掉锚点」时还有翻一屏的机会（不清零的话，一天里偶尔两次
@@ -1319,54 +1373,22 @@ class _Handler(BaseHTTPRequestHandler):
             # 的 _above_anchor_is_new）。这时「锚点」已经不可靠：不管把锚点
             # 推到帧尾还是推到旧锚点，下一帧都会重新判出同一条，同一条发
             # 好几遍（实测 4 帧抛 4 次）。直接重建基线到当前这一屏。
+            #
+            # ⚠ 旧实现在这里还要「扣住等渲染稳定」，现在不需要了：内容是
+            #   攒进 `ctx.pending` 的，重复收同一批只会被归并成同一个 key，
+            #   取最全的一版 —— 多收几遍不会多发。
             log.info("安卓画面解析：锚点上方来了新内容（卡片从屏幕顶挤进来），"
                      "锚点重建到当前这一屏")
-            if garbled and new:
-                # H5 卡片可能还在长，按「扣住待稳」那套等一帧再发。
-                key = "\n".join(u.fp for u in new)
-                seen = self.ctx.hold_seen + 1 if self.ctx.hold_key == key else 1
-                self.ctx.hold_key, self.ctx.hold_seen = key, seen
-                self.ctx.hold_total += 1
-                if seen < 2 and self.ctx.hold_total < HOLD_MAX:
-                    log.info("安卓画面解析：新消息在 H5 卡片里，扣住等渲染稳定"
-                             "（第 %d 眼，%d 条）", seen, len(new))
-                    self.ctx.hold_units = list(new)
-                    return [], "H5 渲染中，扣住待稳", False, HOLD_MS
-            differ.commit(frame.units)
-            self._clear_hold()
-            return self._finish(new, frame, differ)
 
-        if garbled and new:
-            # 新消息在 H5 卡片里：同一批指纹见到第二眼（内容没再长）才投递。
-            key = "\n".join(u.fp for u in new)
-            seen = self.ctx.hold_seen + 1 if self.ctx.hold_key == key else 1
-            self.ctx.hold_key, self.ctx.hold_seen = key, seen
-            self.ctx.hold_total += 1
-            if seen < 2 and self.ctx.hold_total < HOLD_MAX:
-                log.info("安卓画面解析：新消息在 H5 卡片里，扣住等渲染稳定"
-                         "（第 %d 眼，%d 条）", seen, len(new))
-                # ⚠ 必须把单元本身存下来：扣住时不 commit，重报帧的 peek
-                #   会判「新增 0 条」，只有靠这份记录才认得出「还是那批」。
-                self.ctx.hold_units = list(new)
-                return [], "H5 渲染中，扣住待稳", False, HOLD_MS
-            differ.commit(frame.units)
-            self._clear_hold()
-            if seen >= 2:
-                log.info("安卓画面解析：H5 卡片内容已稳定（连续两帧一致），"
-                         "投递 %d 条", len(new))
-            else:
-                log.warning("安卓画面解析：H5 渲染等待超限，按现状投递 %d 条"
-                            "（可能不完整）", len(new))
-        else:
-            # 原生帧照常推进；garbled 但没有新内容（旧卡片停在屏上）也推进 ——
-            # 锚点留在半成品上没有意义。
-            differ.commit(frame.units)
-            self._clear_hold()
+        # 原生帧、H5 卡片都走同一条路：推进锚点，把新内容交给「攒齐再发」
+        # 那一层。锚点必须推进 —— 不推进的话下一帧会重新判出同一批，
+        # 缓冲虽然能归并掉，但会白白续命（把 quiet 一直往后推）。
+        differ.commit(frame.units)
 
         # 一屏装不下的长消息：树里只有屏幕上那截，滚出去的部分根本不存在。
         return self._finish(new, frame, differ)
 
-    def _finish(self, new: list, frame, differ) -> tuple[list, str, bool, int]:
+    def _finish(self, new: list, frame, differ) -> tuple[list, str, bool]:
         """常规帧的收尾：处理「长消息只露了半截」这一种情况。
 
         ⚠ 这里**不再先发半截**。旧做法是「照常转发 + 请手机翻一屏补全」，
@@ -1385,13 +1407,13 @@ class _Handler(BaseHTTPRequestHandler):
             # 划走了），顺手清掉，免得下一次误拼到别的消息上。
             if self.ctx.long_like:
                 self._clear_long()
-            return new, "", False, 0
+            return new, "", False
 
         sus, rest = self._long_suspects(new, frame)
         if not sus:
             log.warning("安卓画面解析：%s —— 这一屏新转的消息可能不完整，"
                         "已请手机往上翻一屏补全", why)
-            return new, "消息可能不完整", True, 0
+            return new, "消息可能不完整", True
 
         # 只攒**最下面那条**（最新的那条长消息）：上面那些已经被后面的消息
         # 挤过去了，翻一屏也补不到它们的前半截。
@@ -1408,7 +1430,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "按现状投递（可能只有后半截）", LONG_WAIT_MAX)
             self._clear_long()
             log.warning("安卓画面解析：%s —— 这一屏新转的消息可能不完整", why)
-            return new, "消息可能不完整", True, 0
+            return new, "消息可能不完整", True
 
         if not self.ctx.long_like or self.ctx.long_key != target.fp:
             self._remember_long(target, why)
@@ -1427,8 +1449,8 @@ class _Handler(BaseHTTPRequestHandler):
             differ.commit(before)
         # 其余正常消息照发，不因为一条长消息把整批都压住。
         if rest:
-            return rest, "长消息待补全", True, 0
-        return [], "长消息待补全", True, 0
+            return rest, "长消息待补全", True
+        return [], "长消息待补全", True
 
     def _should_probe(self, frame_md5: str) -> bool:
         """锚点对不上时，该不该先请手机翻一屏试试？
@@ -1526,61 +1548,6 @@ class _Handler(BaseHTTPRequestHandler):
             return [], "补全帧没有新内容", False
         log.info("安卓画面解析：上翻补全到 %d 条此前没看到的内容", len(kept))
         return kept, "补全帧", False
-
-    # --- H5 卡片扣住 ---
-
-    def _resume_hold(self, frame) -> tuple[list, str, list] | None:
-        """这一帧是不是「上次扣住那批」的重报？是则返回 (要投递的, 说明, 新版批次)。
-
-        返回 ``None`` = 不是重报帧（或扣住的那批已经不在屏上了），照常走
-        diff 流程。
-
-        ── 为什么需要这个 ──────────────────────────────────────────
-        H5 卡片扣住时**故意不 commit**（锚点留在旧位置）。手机按 hold 指令
-        重报同一屏时，``peek`` 拿锚点去比 —— 锚点本来就是这一屏，于是判
-        「新增 0 条」。扣住的那批就这么静默蒸发：不投递、不告警，日志里只
-        留一行「扣住等渲染稳定」。2026-10-18 实测丢了两条真业务消息
-        （拦截跟单日报、按需派送履约风险提醒），就是这条路。
-
-        判据只看**指纹集合**：
-          · 本帧里能找全扣住的那批、且指纹一个没变 → 渲染稳定，投递；
-          · 指纹有变化、或只找得回一部分 → 还在长，返回空列表让它再扣一轮，
-            并把「新版批次」传给调用方更新记录。
-        两侧的单元都在 ``frame.units`` 里按指纹索引，不依赖坐标。
-
-        ⚠ 「新版批次」**只取扣住那批占的位置**，不能拿整帧：整帧里有更早的
-        旧消息，把它们当成新消息投递就是重复转发。
-        """
-        held = self.ctx.hold_units
-        if not held:
-            return None
-        by_fp = {u.fp for u in frame.units}
-        still = [u for u in held if u.fp in by_fp]
-        if not still:
-            # 一条都找不回来了：H5 卡片整块重绘换了指纹（还在长），或者
-            # 用户划走了/换了群。
-            # 判据用「本帧末尾那几条的发送者对不对得上」——卡片重绘时发送者
-            # 不变，划走时对不上。
-            want = {norm_sender(u.sender) for u in held}
-            tail = frame.units[-len(held):] if len(frame.units) >= len(held) \
-                else list(frame.units)
-            if tail and {norm_sender(u.sender) for u in tail} <= want:
-                return [], "H5 指纹全变（还在长）", tail
-            return None                      # 真划走了，交给调用方清掉
-        if len(still) == len(held):
-            return still, "H5 已稳定", still
-
-        # 只回来一部分：卡片重绘换了指纹，还在长。
-        # 新版批次 = 本帧**末尾 len(held) 条**（扣住的是最新那批，位置在帧尾）。
-        fresh = frame.units[-len(held):] if len(frame.units) >= len(held) \
-            else list(frame.units)
-        return [], "H5 还在长", fresh
-
-    def _clear_hold(self) -> None:
-        self.ctx.hold_key = ""
-        self.ctx.hold_seen = 0
-        self.ctx.hold_total = 0
-        self.ctx.hold_units = []
 
     # --- 长消息攒齐 ---
 
@@ -1691,55 +1658,52 @@ class _Handler(BaseHTTPRequestHandler):
         self.ctx.long_at = 0.0
 
     def _emit(self, units: list) -> int:
-        """把消息单元交给下游，返回成功条数。
+        """把消息单元**归并进缓冲**，返回收下的条数。
 
-        投递前多一道**近似去重**（见 ``fingerprint.is_same_message``）：同一条
-        钉钉机器人卡片在手机上会换渲染形态（表格横排 ↔ 一格一行），指纹跟着
-        变、uid 跟着变，下游的 ``is_duplicate`` 完全挡不住 —— 实测
-        2026-10-17 18:07:03 与 18:07:07 同一条「拦截跟单日报」被发了两遍，
-        用户的原话是「我手机往上翻页，会发重复的」。
+        ── 为什么不再直接投递 ─────────────────────────────────────────
+        钉钉机器人消息是 H5 卡片，内容分批渲染（先标题、后表格）。拿「这一帧
+        看到的样子」直接发，群里收到的就是残废消息。
 
-        只在 ``NEAR_DUP_WINDOW`` 秒内拦：机器人日报每天的**数字**不同
-        （判据保留全部数字，不会撞），但人工连发两条一样的「收到」是正常
-        操作，过了窗口就该照发。
+        早期对策是「扣住等渲染稳定」（新内容第一次见先不发，等重报帧里指纹
+        一致了再发）。它在真机上**基本没工作过**：2026-10-18 全天日志里
+        「扣住第 1 眼」14 次、「进到第 2 眼」0 次、终投递 1 条。原因是它的
+        前提不成立 —— H5 卡片每重绘一次，整批节点的**指纹都会变**，于是
+        「还是同一条吗」永远答「不是」，`seen` 永远等于 1。
+
+        现在改成不问「两帧一样吗」（H5 上无解），改问「这条消息我见过的最全
+        版本是什么」：每帧的解析结果都按 (发送者, 时间窗) 归并进
+        `PendingBuffer`，**保留更长的那个版本**，静默 `pending.QUIET` 秒后
+        由 `_flush_pending` 投递最全的那版。
+
+        于是卡片分批渲染、重绘换指纹、锚点丢失、被系统通知挤出屏幕 —— 这些
+        真机故障全都不再有影响，因为它们都只影响「哪一帧看得到什么」，而这
+        一层只关心「见过的所有版本里哪个最全」。
         """
         if not units or self.ctx.on_message is None:
             return 0
+        buf = self.ctx.pending
+        if buf is None:
+            return 0
         msgs = units_to_messages(units, chat_name=self.ctx.chat_name or "",
                                  companies=self.ctx.companies)
-        now = time.monotonic()
-        emitted = 0
+        took = 0
         for msg in msgs:
-            sender = norm_sender(msg.sender_name)
-            with self.ctx.lock:
-                # 顺手清理过期的，dict 不会因为长期运行而无限长
-                for k, (_, _, at) in list(self.ctx.recent_keys.items()):
-                    if now - at > NEAR_DUP_WINDOW:
-                        del self.ctx.recent_keys[k]
-                dup_age = next(
-                    (now - at for s, old, at in self.ctx.recent_keys.values()
-                     if s == sender and is_same_message(old, msg.content)),
-                    None)
-            if dup_age is not None:
-                log.info("同一卡片换了渲染形态（%.0f 秒前已发过同一条），跳过：%s",
-                         dup_age, msg.content[:40].replace("\n", " "))
-                with self.ctx.lock:
-                    self.ctx.count["rejected"] += 1
-                continue
-            try:
-                self.ctx.on_message(msg)
-                emitted += 1
-                with self.ctx.lock:
-                    self.ctx.recent_keys[msg.uid] = (sender, msg.content,
-                                                     time.monotonic())
-            except Exception:                                  # 单条出错不拖垮整帧
-                log.exception("下游处理消息失败：%s", msg.uid)
-        with self.ctx.lock:
-            self.ctx.count["accepted"] += emitted
-        if emitted:
-            head = msgs[0].content[:40].replace("\n", " ")
-            log.info("安卓画面新增 %d 条消息：%s", emitted, head)
-        return emitted
+            action = buf.offer(
+                msg.sender_name, msg.content,
+                chat_name=msg.chat_name or self.ctx.chat_name or "",
+                join=_join_fragments,
+                # 整条 Message 原样带上：缓冲只负责「哪一版最全」，
+                # uid / msg_time / company 这些下游要用的字段别丢。
+                message=msg)
+            took += 1
+            if action == "grow":
+                log.info("安卓画面解析：%s 的卡片又长了一截（现 %d 字），"
+                         "继续攒着不发", msg.sender_name, len(msg.content))
+            elif action == "new":
+                log.info("安卓画面解析：收到 %s 的一条消息（%d 字），"
+                         "先攒着，静默 %.0f 秒后发最全的版本",
+                         msg.sender_name, len(msg.content), buf.quiet)
+        return took
 
 
 def _make_handler(ctx: _Ctx):
@@ -1825,6 +1789,11 @@ class AndroidGatewaySource(Source):
                    companies=self.companies, on_message=on_message,
                    parse=self.parse, offline_after=self.offline_after,
                    differ=FrameDiffer() if self.parse else None)
+        # 「先攒后发」缓冲 + 把它定期排空的线程。
+        # 关掉 parse 时不建（那种模式只收不转，没有消息要投）。
+        if self.parse and on_message is not None:
+            ctx.pending = PendingBuffer()
+        self._ctx = ctx               # 给 flush_pending_now / 排障工具用
 
         # 手机端 APK 下载（/app、/app.apk）。目录在这里算而不是写死在模块里：
         # 打包成 exe 后模块文件在临时解包目录下，与用户看到的程序目录无关。
@@ -1871,6 +1840,15 @@ class AndroidGatewaySource(Source):
                         "要开启解析：config.yaml 的 dingtalk.android_parse 设为 true"
                         "（先用 tools/android_capture.py 看过一帧真实画面的解析结果）")
 
+        # ---- 「先攒后发」排空线程 ----
+        if ctx.pending is not None:
+            self._flusher_stop = threading.Event()
+            threading.Thread(target=_flush_loop,
+                             args=(ctx, self._flusher_stop),
+                             name="android-flush", daemon=True).start()
+            log.info("  消息缓冲已开启：同一张卡片分批渲染的内容会先攒起来"
+                     "（静默 %.0f 秒），只发最全的那一版", ctx.pending.quiet)
+
         # ---- 失联看门狗 ----
         self._watchdog_stop = threading.Event()
         if self.offline_after > 0:
@@ -1889,6 +1867,23 @@ class AndroidGatewaySource(Source):
             server.serve_forever(poll_interval=0.5)
         finally:
             self._watchdog_stop.set()
+            fs = getattr(self, "_flusher_stop", None)
+            if fs is not None:
+                fs.set()
+            # 停止运行时把缓冲里还没到点的消息**照现状发掉**：它们已经被手机
+            # 采集到了，丢掉就是真丢消息。等不到「静默」也无所谓 —— 宁可发
+            # 一版可能不完整的，也不能因为程序退出而吞掉。
+            if ctx.pending is not None:
+                rest = ctx.pending.flush_all()
+                if rest:
+                    log.info("停止运行：把缓冲里还没发的 %d 条消息照现状发出",
+                             len(rest))
+                    try:
+                        _deliver_ready(ctx, [e.extra.get("message")
+                                             for e in rest
+                                             if e.extra.get("message") is not None])
+                    except Exception:
+                        log.exception("停止运行：发缓冲消息失败")
             server.server_close()
             self._server = None
             self.count = dict(ctx.count)
@@ -1908,6 +1903,23 @@ class AndroidGatewaySource(Source):
     def wait_ready(self, timeout: float = 5.0) -> bool:
         """等监听套接字真正就绪（自检工具与测试用）。"""
         return self._ready.wait(timeout)
+
+    def flush_pending_now(self) -> int:
+        """立刻把「先攒后发」缓冲里的消息全部投出去，返回条数。
+
+        给测试和排障用：正常情况下由 flusher 线程按 ``FLUSH_TICK`` 节拍、
+        等消息静默够久了才发；这里不等，直接清空。**不要在生产路径里调它**
+        —— 它会把还在长的半成品也发出去。
+        """
+        ctx = getattr(self, "_ctx", None)
+        if ctx is None or ctx.pending is None:
+            return 0
+        ready = ctx.pending.flush_all()
+        if not ready or ctx.on_message is None:
+            return 0
+        return _deliver_ready(ctx,
+                              [m for m in (_rebuild_message(e) for e in ready)
+                               if m is not None])
 
     def describe(self) -> str:
         return (f"安卓网关 | 监听 {self.host}:{self.port} | "

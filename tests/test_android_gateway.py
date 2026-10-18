@@ -29,7 +29,7 @@ from bridge.config import Config, DingTalkConfig, RouteConfig, StorageConfig, We
 from bridge.fingerprint import fp_of, norm_sender, unit_fp
 from bridge.service import BridgeService
 from bridge.sources.android_gateway import (
-    HEARTBEAT_GRACE, HOLD_MAX, MAX_BATCH, MAX_SCREEN_BODY, OFFLINE_REMIND_EVERY,
+    HEARTBEAT_GRACE, MAX_BATCH, MAX_SCREEN_BODY, OFFLINE_REMIND_EVERY,
     AndroidGatewaySource, _Ctx, _find_apk, _online_now, _watchdog_step,
     build_messages, lan_ips, set_apk_dirs,
 )
@@ -256,6 +256,24 @@ class GatewayCase(unittest.TestCase):
     def url(self, path: str, token: str | None = None) -> str:
         base = f"http://127.0.0.1:{self.port}{path}"
         return f"{base}?token={quote(token)}" if token else base
+
+    def settle(self, wait: float = 1.0) -> None:
+        """等「先攒后发」的缓冲把消息投出来。
+
+        为什么测试需要这一步：网关不再「解析出消息就立刻投递」，而是先攒够
+        （静默 ``pending.QUIET`` 秒、只发最全的那版）再发 —— 这是为了对付
+        H5 卡片分批渲染。所以断言「收到几条」之前必须先让它攒完。
+
+        实现上直接驱动缓冲的 ``drain``（把 last_at 往前拨到「早就该发了」），
+        不走 ``FLUSH_TICK`` 真实等待：否则每个用例都要多睡 3 秒，全套测试
+        会慢到没人愿意跑。``wait`` 只是给 flusher 线程一个插队的机会。
+        """
+        if wait:
+            time.sleep(wait)          # 让 flusher 线程先跑一轮
+        # 兜底：有些用例故意卡在「还在长」，这里按「立即到期」强制排空
+        self.source.flush_pending_now()
+        if wait:
+            time.sleep(0.15)
 
     def post(self, payload, token: str | None = TOKEN, path: str = "/messages"):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -813,6 +831,7 @@ class TestScreenParse(GatewayCase):
                            self.row("第二条", 700, "签收跟单专员"))
         body = self.post_frame(more)
         self.assertEqual(body["messages"], 1)
+        self.settle()
         self.assertEqual(len(self.received), 1)
         msg = self.received[0]
         self.assertEqual(msg.sender_name, "签收跟单专员")
@@ -832,6 +851,7 @@ class TestScreenParse(GatewayCase):
             f'package="{self.PKG}" bounds="[500,600][600,640]"></node>',
             self.row("第二条", 700)))
         self.assertEqual(body["messages"], 1)
+        self.settle()
         self.assertEqual([m.content for m in self.received], ["第二条"])
 
     def test_scrolling_back_does_not_flood(self):
@@ -931,6 +951,7 @@ class TestScreenParse(GatewayCase):
             self.row("旧消息A", 300),
             self.row("新消息B", 500, "签收跟单专员"),
             self.long_row("履约跟单专员", 1400, 3200)))
+        self.settle()
         contents = [m.content for m in self.received]
         self.assertIn("新消息B", contents, "被长消息挤掉的那条没补回来")
         # 长消息只算一条：补全帧里它既露头又被切着，不能出现两次
@@ -948,6 +969,7 @@ class TestScreenParse(GatewayCase):
         b4 = self.post_frame(self.screen(
             self.long_row("履约跟单专员", 300, 1900), self.row("新消息C", 2000)))
         self.assertEqual(b4["messages"], 1)
+        self.settle()
         self.assertEqual(self.received[-1].content, "新消息C")
 
     def test_second_miss_gives_up_and_rebuilds_baseline(self):
@@ -972,6 +994,7 @@ class TestScreenParse(GatewayCase):
         b4 = self.post_frame(self.screen(self.row("更早的历史1", 300),
                                          self.row("其实很新的消息", 900)))
         self.assertEqual(b4["messages"], 1)
+        self.settle()
         self.assertEqual(self.received[-1].content, "其实很新的消息")
 
     def test_probe_is_not_repeated_for_the_same_frame(self):
@@ -1011,6 +1034,7 @@ class TestScreenParse(GatewayCase):
             self.row("标签履约周累计达成 1012-1015", 200, "履约跟单专员"),
             self.row(alert, 385, "服务诊断专员")))
         self.assertEqual(body["messages"], 1, "锚点上方的卡片没被转发")
+        self.settle()
         self.assertEqual([m.sender_name for m in self.received], ["履约跟单专员"])
         self.assertIn("标签履约周累计达成", self.received[0].content)
 
@@ -1071,6 +1095,7 @@ class TestScreenParse(GatewayCase):
                           body="这是被切掉的前半截，很长的正文……"),
             self.long_row("履约跟单专员", 700, 3200)))
         self.assertEqual(body["messages"], 1, "补全后应当发一条完整的")
+        self.settle()
         self.assertEqual(len(self.received), 1, "补全不该额外多发一条")
         self.assertEqual(self.received[0].content, "这是被切掉的前半截，很长的正文……")
 
@@ -1093,6 +1118,7 @@ class TestScreenParse(GatewayCase):
                 self.row("旧消息A", 400, "签收跟单专员"),
                 self.long_row("履约跟单专员", 700, 3200)))
         self.assertEqual(body["messages"], 1, "超时后必须放行")
+        self.settle()
         self.assertEqual(len(self.received), 1)
 
     def test_fill_frame_with_unknown_anchor_is_dropped(self):
@@ -1113,6 +1139,7 @@ class TestScreenParse(GatewayCase):
         body = self.post_frame(self.screen(self.row("旧消息A", 400),
                                            self.row("新消息B", 700)))
         self.assertEqual(body["messages"], 1)
+        self.settle()
         self.assertEqual(self.received[-1].content, "新消息B")
 
     # ---- H5 卡片「扣住待稳」 --------------------------------------------
@@ -1134,43 +1161,54 @@ class TestScreenParse(GatewayCase):
         return xml.replace('</node></hierarchy>', badge + '</node></hierarchy>')
 
     def test_garbled_frame_holds_then_delivers_when_stable(self):
-        """H5 新消息：第一次见扣住，同样内容第二次见才投递。"""
+        """H5 卡片的每条都要发出来，且同一条只发一次。
+
+        这条原本锁的是旧「扣住等第二眼」机制（第 1 眼扣、第 2 眼建基线、
+        第 3 眼没新内容）。那个机制在真机上没通 —— 卡片重绘会让指纹全变，
+        「第 2 眼」几乎等不到。现在改成「收进缓冲、静默几秒发最全的」，
+        所以断言换成新机制该有的样子。
+
+        ⚠ 第一帧只建基线（防翻历史灌屏），所以要先单独把「旧消息A」报一遍
+        当基线，H5 卡片才算是「新消息」。
+        """
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+
         xml = self.garbled(self.screen(self.row("旧消息A", 400),
                                        self.row("H5报表正文", 700)))
         b1 = self.post_frame(xml)
-        self.assertEqual(b1["messages"], 0)          # 基线被扣住
-        self.assertIn("hold", b1)
-        b2 = self.post_frame(xml)
-        self.assertEqual(b2["messages"], 0)          # 基线建立（第 2 眼）
-        self.assertNotIn("hold", b2)
-        b3 = self.post_frame(xml)
-        self.assertEqual(b3["messages"], 0)          # 没有新内容
-        self.assertNotIn("hold", b3)
+        self.assertEqual(b1["messages"], 1, "H5 条目应当被收进缓冲")
+        self.assertGreaterEqual(b1.get("buffered", 0), 1)
+        # 收进缓冲那一条就算这一帧解析出的「新单元数」，手机端按它判断
+        # 这一屏有没有产生转发。真正投递要等 settle()。
 
         xml2 = self.garbled(self.screen(self.row("旧消息A", 400),
                                         self.row("H5报表正文", 700),
                                         self.row("拦截跟单日报 表格数据", 980)))
-        b4 = self.post_frame(xml2)
-        self.assertEqual(b4["messages"], 0)          # 新内容第 1 眼：扣住
-        self.assertEqual(b4.get("hold"), 800)
-        b5 = self.post_frame(xml2)
-        self.assertEqual(b5["messages"], 1)          # 第 2 眼：内容稳定，投递
-        self.assertEqual(self.received[-1].content, "拦截跟单日报 表格数据")
+        self.post_frame(xml2)
+        self.settle()
+        got = [m.content for m in self.received]
+        self.assertIn("H5报表正文", got, "第一张 H5 卡片丢了")
+        self.assertIn("拦截跟单日报 表格数据", got, "第二张 H5 卡片丢了")
+        self.assertEqual(len(got), 2, "同一条卡片发了不止一次")
 
     def test_h5_content_growing_is_delivered_by_total_cap(self):
-        """内容一直长（key 一直变）也不能永远扣 —— 总眼数到顶就放行。"""
-        base = self.screen(self.row("旧消息A", 400))
-        self.post_frame(self.garbled(base))          # 扣
-        self.post_frame(self.garbled(base))          # 基线
-        prev = base
-        delivered = 0
-        for i in range(HOLD_MAX + 2):
-            prev = self.screen(self.row("旧消息A", 400),
-                               self.row(f"长到第{i}段", 700))
-            body = self.post_frame(self.garbled(prev))
-            delivered += body.get("messages", 0)
-        self.assertEqual(delivered, 1)               # 到顶放行，只发一次
-        self.assertIn("长到第", self.received[-1].content)
+        """内容一直长（每帧都不一样）也必须发出去，且只发最全的那版。
+
+        旧机制靠 `hold_total` 撞到 `HOLD_MAX` 才放行，是因为它拿指纹判「还是
+        同一条」——内容一变指纹就变，永远等不到稳定。新机制不判指纹，改成
+        「同一发送者窗口内保留最长版本」，所以多少帧都不会卡住。
+        """
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        prev = ""
+        for i in range(6):          # 长 6 截，远超旧机制的 4 眼上限
+            prev = " ".join(f"长到第{j}段" for j in range(i + 1))
+            self.post_frame(self.garbled(self.screen(
+                self.row("旧消息A", 400), self.row(prev, 700))))
+        self.settle()
+        self.assertEqual(len(self.received), 1,
+                         "长了几截就发了几条 —— 应当只发最全的那一版")
+        self.assertEqual(self.received[-1].content, prev,
+                         "发的不是最全的那一版")
 
     def test_native_frame_has_zero_extra_latency(self):
         """原生消息（坐标正常）不扣：一次上报直接投递。"""
@@ -1179,41 +1217,66 @@ class TestScreenParse(GatewayCase):
                                            self.row("普通消息B", 700)))
         self.assertEqual(body["messages"], 1)
         self.assertNotIn("hold", body)
+        self.settle()
         self.assertEqual(self.received[-1].content, "普通消息B")
 
-    def test_hold_survives_when_phone_reports_the_same_screen(self):
-        """扣住后手机按 hold 重报**同一屏**，这条必须投递出去。
+    def test_h5_card_is_not_lost_after_hold_window(self):
+        """H5 卡片的这条必须投递出去 —— 不靠「第二眼」，靠攒。
 
         2026-10-18 真机事故：用户报「拦截跟单日报」「按需派送履约风险提醒」
-        两条都没转发。日志里「扣住等渲染稳定（第 1 眼）」出现十几次，几乎
-        从没等到第 2 眼。
+        两条都没转发。全天日志：扣住第 1 眼 14 次、进到第 2 眼 **0 次**、
+        终投递 1 条 —— 也就是说「等重报帧指纹一致」这条路在真机上基本没通。
 
-        根因：扣住时故意不 commit（锚点留在旧位置），手机 hold-confirm 重报
-        同一屏时，``peek`` 拿锚点去比 —— 锚点本来就是这一屏，判「新增 0 条」。
-        扣住的那批就这么静默蒸发，不投递也不告警。
+        根因是它的前提不成立：H5 卡片每重绘一次，**整批节点指纹都会变**，
+        于是 `hold_key` 每帧都对不上，`seen` 永远等于 1。
 
-        修法：扣住时把单元本身记进 ``hold_units``，重报帧先跟它对一遍。
+        现在不再问「两帧一样吗」，改成「见过的所有版本里哪个最全」：
+        卡片长了几截就攒几截，静默几秒后发最全的那版。这个用例锁的就是
+        「无论重绘多少次、指纹怎么变，这条最终都要发出去，且只发一次」。
         """
         self.post_frame(self.screen(self.row("旧消息A", 400)))
         xml = self.garbled(self.screen(self.row("旧消息A", 400),
                                        self.row("拦截跟单日报 表格数据", 700)))
         b1 = self.post_frame(xml)
-        self.assertEqual(b1["messages"], 0, "H5 首见不该直接发")
-        self.assertEqual(b1.get("hold"), 800, "没让手机等一下重报")
+        self.assertEqual(b1["messages"], 1, "H5 卡片应当被**收进缓冲**（不是直接丢）")
 
-        # 手机 800ms 后 hold-confirm 重报同一帧 —— 这才是真机发生的事
-        b2 = self.post_frame(xml)
-        self.assertEqual(b2["messages"], 1,
-                         "扣住的 H5 消息在重报帧里丢了 —— 真机上就是这条"
-                         "「拦截跟单日报」/「按需派送履约风险提醒」丢了")
-        self.assertEqual(len(self.received), 1, "不该重复投递")
+        # 手机按 hold 重报同一帧（真机上常发生，且指纹会变）
+        self.post_frame(xml)
+        self.settle()
+        self.assertEqual(len(self.received), 1,
+                         "H5 卡片丢了 —— 真机上就是「拦截跟单日报」"
+                         "「按需派送履约风险提醒」这种情况")
         self.assertEqual(self.received[0].content, "拦截跟单日报 表格数据")
 
-    def test_hold_units_dropped_when_gone_from_screen(self):
-        """扣住的那批滑出屏幕后，不能被拼到别的消息上投递出去。
+    def test_growing_h5_card_only_the_fullest_version_is_sent(self):
+        """卡片分批长出来：只发最全的那一版，不是发三遍。
 
-        判据是「新屏末尾那几条的发送者对不上」→ 判定真划走了，清掉扣住
-        记录。这里只锁这一点：**别把「H5卡片内容」当成新消息补发**。
+        这是「先攒后发」的核心场景 —— 真机上 H5 卡片先出标题、再出正文、
+        最后表格单元格才长全。每一帧的指纹都不同（所以旧机制永远等不到
+        「稳定」），但内容是一次比一次全的。
+        """
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        # 解析器把一屏里的多行合并成空格分隔的一行（真机 XML 里就是一个
+        # TextView，没有换行）—— 所以期望值也按空格写。
+        stages = ["拦截跟单日报",
+                  "拦截跟单日报 今天共拦截 37 票",
+                  "拦截跟单日报 今天共拦截 37 票 明细：马伟豪 17 票"]
+        for text in stages:
+            self.post_frame(self.garbled(self.screen(
+                self.row("旧消息A", 400), self.row(text, 700))))
+        self.settle()
+        self.assertEqual(len(self.received), 1, "卡片长了几截就发了几条")
+        self.assertEqual(self.received[0].content, stages[-1],
+                         "发的不是最全的那一版")
+
+    def test_hold_units_dropped_when_gone_from_screen(self):
+        """H5 卡片还没发出去就被划走了 —— 不能事后当新消息补发。
+
+        旧机制用「扣住的那批单元」判这个；现在扣住的记录没了，靠缓冲的
+        时间窗 + 内容包含关系：卡片停在屏上时每帧都是同一个 key 在续命，
+        一旦用户划走、屏上换成别人的内容，它就再也不会被续命，静默到期后
+        发出的仍是**当时收到的最全版本**（而不是被划走后的别的消息）。
+        这里只锁一点：**别把「H5卡片内容」和后来那条混成一条**。
         """
         self.post_frame(self.screen(self.row("旧消息A", 400)))
         xml = self.garbled(self.screen(self.row("旧消息A", 400),
@@ -1245,6 +1308,7 @@ class TestScreenParse(GatewayCase):
             self.row("拦截跟单日报 正文", 1300)))
         self.assertEqual(body["messages"], 1,
                          "系统通知不该让业务消息跟着丢")
+        self.settle()
         self.assertEqual(self.received[-1].content, "拦截跟单日报 正文")
 
 
@@ -1272,10 +1336,13 @@ class TestScreenParse(GatewayCase):
         a = self.post_frame(self.screen(self.row("旧消息A", 400),
                                         self.row(self.CARD_A, 700)))
         self.assertEqual(a["messages"], 1)
+        self.settle()
+        self.assertEqual(len(self.received), 1, "第一种形态没发出来")
         b = self.post_frame(self.screen(self.row("旧消息A", 400),
                                         self.row(self.CARD_B, 700)))
-        self.assertEqual(b["messages"], 0, "换了渲染形态的同一条卡片又被发了一遍")
-        self.assertEqual(len(self.received), 1)
+        self.assertEqual(b["messages"], 1, "第二种形态仍需被收下（它还没投递）")
+        self.settle()
+        self.assertEqual(len(self.received), 1, "换了渲染形态的同一条卡片又被发了一遍")
 
     def test_different_report_with_new_numbers_still_goes_out(self):
         """隔天的日报格式一样、数字不同 —— 必须照发（判重不能吃掉真消息）。"""
@@ -1286,6 +1353,7 @@ class TestScreenParse(GatewayCase):
         body = self.post_frame(self.screen(self.row("旧消息A", 400),
                                            self.row(changed, 700)))
         self.assertEqual(body["messages"], 1)
+        self.settle()
         self.assertEqual(len(self.received), 2)
 
 

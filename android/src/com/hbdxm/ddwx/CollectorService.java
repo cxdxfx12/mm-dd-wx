@@ -346,7 +346,8 @@ public class CollectorService extends AccessibilityService {
             Log.i(TAG, "上报成功 #" + posts + " 文本 " + tree.texts.size()
                     + " 字节 " + xml.length());
             maybeFillTruncated(r.body, token);
-            maybeHoldConfirm(r.body, token);
+            // 2026-10-18：不再调 maybeHoldConfirm —— 电脑侧改成「先攒后发」，
+            // 不再下发 hold 指令（理由见该方法的注释）。
         } else {
             failures++;
             lastResult = "上报失败：" + r.detail;
@@ -406,9 +407,17 @@ public class CollectorService extends AccessibilityService {
      * 单元格要再过几百毫秒才长全。电脑侧扣住新内容不放，等这里重报的帧里
      * 内容稳定了才投递 —— 手机只做「听话」，怎么判稳是电脑的事。
      *
-     * <p>电脑侧见到同样的内容第二次就会放行（或超限兜底），所以这里每收到
-     * 一次 hold 只重报一次，不会死循环。
+     * <p><b>2026-10-18 起电脑侧已不再返回 hold</b>：改成「先攒后发」——
+     * 每帧解析结果按 (发送者, 时间窗) 归并、只留最全的版本，静默几秒再投。
+     * 原因是旧机制的判据（重报帧指纹一致）在 H5 卡片上不成立：卡片每重绘
+     * 一次整批指纹都变，于是「第二次看到」永远等不到（真机全天 14 次扣住、
+     * 0 次进入第二眼）。
+     *
+     * <p>这里**只删了调用点，方法体留着**：升级过渡期用户可能还装着旧版
+     * 电脑端（会继续下发 hold），留着不会有害；旧版也没坏到必须马上停用。
+     * 等确认所有用户都升到 2026-10-18 以后的版本，这个方法可以整段删掉。
      */
+    @SuppressWarnings("unused")
     private void maybeHoldConfirm(String resp, String token) {
         if (!resp.contains("\"hold\"")) {
             return;
