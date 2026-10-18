@@ -86,6 +86,16 @@ class BridgeService:
                      (msg.content or "").replace("\n", " ")[:40])
             return True
 
+        # 只入库不投递（`no_forward`）。目前唯一的来源是「建基线时补全出来的
+        # 长消息」：正文补齐了、值得留档，但它在基线里 = 多半几十分钟前就发过，
+        # 自动发出去就是往业务群刷历史。留档即可，要补发用 forward_recent.py。
+        if msg.no_forward:
+            self.counter["filtered"] += 1
+            log.info("只入库不转发（基线补全的历史消息，%d 字）：%s",
+                     len(msg.content or ""),
+                     (msg.content or "").replace("\n", " ")[:40])
+            return True
+
         matched = self.router.match(msg)
         if not matched.targets:
             self.counter["filtered"] += 1

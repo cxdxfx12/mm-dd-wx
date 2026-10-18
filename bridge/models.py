@@ -21,6 +21,11 @@ class Message:
     media_path: str = ""              # 图片/文件落地后的本地路径
     msg_time: datetime | None = None  # 源消息时间
     raw_id: str = ""                  # 源平台消息 ID，优先用作去重键
+    # 只入库、不投递。用于「补全出来的历史消息」这类**内容有用但不该刷群**的
+    # 情况：建基线时屏上那条被切掉的长消息，补全后正文是完整的，可它多半
+    # 几十分钟前就转发过了 —— 落库留档（forward_recent.py 能查、能人工补发），
+    # 但绝不自动投递。
+    no_forward: bool = False
 
     @property
     def uid(self) -> str:

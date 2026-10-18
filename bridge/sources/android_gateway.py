@@ -602,6 +602,12 @@ def _deliver_ready(ctx: "_Ctx", msgs: list) -> int:
     now = time.monotonic()
     emitted = 0
     for msg in msgs:
+        # ⚠ `no_forward`（基线里补全出来的历史消息）**不在这里拦**。
+        #   本模块不持数据库，拦在这里 = 既不入库也不投递 = 消息彻底消失，
+        #   而这条正文的价值恰恰是「留档，事后能用 forward_recent.py 查」。
+        #   正确落点是 `service.handle()`：它先 save_message 再判 no_forward
+        #   决定发不发。网关这一层的责任只是**别把标记弄丢**（`_rebuild_message`
+        #   用 replace 重建，字段会原样带过去）。
         sender = norm_sender(msg.sender_name)
         with ctx.lock:
             for k, (_, _, at) in list(ctx.recent_keys.items()):
@@ -871,6 +877,18 @@ class _Ctx:
     # 按内容重叠把它们对齐，再决定新露出来的是「上面的一段」还是「下面的一段」。
     long_frags: list = field(default_factory=list)
     long_blocked: set = field(default_factory=set)
+    # 这条长消息是**建基线那一帧**发现的。
+    #
+    # 建基线时的语义是「屏上已有的都算旧内容，不转发」。但屏上那条如果被切掉
+    # 后半截，用户看到的就是半截 —— 补全是必须的。矛盾在于：补全完的那份到底
+    # 该不该发？**不能发** —— 它在基线里，多半几分钟前就转发过了（真机
+    # 2026-10-18：16:39 已发过完整版 829 字，20:10 建基线时又被翻出来）。
+    # 盲发就是重复刷群。
+    #
+    # 所以这个标志的意思是：**照常补全，但收尾时只入库、不投递**。补来的
+    # 完整正文会落库，事后用 forward_recent.py 能查、能人工补发；
+    # 而「把历史消息重复甩进业务群」这种事故一次都不该有。
+    long_baseline: bool = False
     companies: list[str] = field(default_factory=list)
     on_message: MessageHandler | None = None
     count: dict = field(default_factory=lambda: {"requests": 0, "accepted": 0,
@@ -1472,11 +1490,34 @@ class _Handler(BaseHTTPRequestHandler):
             differ.commit(frame.units)          # peek 之后必须自己推进锚点
             log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
                      "此后只转发基线之后的新消息", len(frame.units))
-            # 基线帧也要报截断：新装/重启那一刻屏上可能正好卡着一条长消息，
-            # 不补的话要等到下次滚动才看得见。但**不让手机滚动** —— 建基线
-            # 时滚动会把刚记下的基线弄脏，得不偿失，只记日志。
+            # ── 基线帧上被切的长消息：补全，但**不发** ──────────────
+            #
+            # 旧实现这里只 log.info 一句就完了，理由是「建基线时滚动会把刚
+            # 记下的基线弄脏」。那条顾虑是错的：`differ.commit()` 已经把锚点
+            # 推到本帧，手机往上翻屏走的是 scroll-fill 通道，`_ingest_fill`
+            # 根本不动基线（它只 peek），脏不了。
+            #
+            # 而不补的代价是实打实的：程序重启／新装那一刻，屏上正好卡着一条
+            # 长消息 → 它进了基线 → 补全逻辑（要求 `new` 非空）一辈子不会再
+            # 碰它 → 后半截永久丢失，且日志里只有一行 info，没人会注意到。
+            # 真机 2026-10-18 20:10：这条 1181 字的卡片结尾停在
+            # 「查看完整月报明细（Exce」，就是这么来的。
+            #
+            # 但要补全**不等于**要投递：它在基线里，多半几分钟前就发过了
+            # （同一条 16:39 已转发过完整版）。所以打上 `long_baseline`，
+            # 一路补全、收尾时只入库不投递。
             why = needs_scroll(frame)
             if why:
+                sus, _ = self._long_suspects(frame.units, frame)
+                if sus:
+                    log.info("安卓画面解析：基线帧里有一条长消息没显示全（%s）"
+                             "—— 请手机补全一次，补到的完整版只记录不转发"
+                             "（它在基线里，多半已经发过）", why)
+                    self._remember_long(sus[-1], why,
+                                        top_cut=min(sus[-1].y0, sus[-1].y1)
+                                        < frame.view[1] - 12)
+                    self.ctx.long_baseline = True
+                    return [], "基线里的长消息，只补全不转发", True
                 log.info("安卓画面解析：当前屏有消息没显示全（%s）", why)
             return [], "已建立基线", False
         if diff.anchor_lost:
@@ -1907,9 +1948,19 @@ class _Handler(BaseHTTPRequestHandler):
         text = c.long_head or c.long_tail
         sender = c.long_sender
         kind = c.long_kind or "text"
+        # ⚠ **先取值再清状态。** `_clear_long()` 会把 `long_baseline` 复位，
+        #   顺序写反的话这里永远读到 False —— 2026-10-18 实测就是：
+        #   基线补全出的 231 字正文被当成普通新消息投进业务群。
+        baseline_only = c.long_baseline
         self._clear_long()
         if not text:
             return None
+        if baseline_only:
+            log.info("安卓画面解析：基线里的长消息补全完毕（%s）—— 共 %d 字，"
+                     "只入库不转发（它在基线里，多半已经发过）", why, len(text))
+            unit = Unit(sender=sender, content=text, kind=kind, y0=0, y1=0)
+            unit.baseline_only = True       # 只入库：service.handle 拦投递
+            return unit
         log.info("安卓画面解析：长消息收尾（%s）—— 共 %d 字，投递 1 条",
                  why, len(text))
         return Unit(sender=sender, content=text, kind=kind, y0=0, y1=0)
@@ -1927,6 +1978,7 @@ class _Handler(BaseHTTPRequestHandler):
         c.long_top_seen = False
         c.long_exhausted = False
         c.long_frags = []
+        c.long_baseline = False
 
     def _emit(self, units: list) -> int:
         """把消息单元**归并进缓冲**，返回收下的条数。

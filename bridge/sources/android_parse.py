@@ -239,6 +239,9 @@ class Unit:
     kind: str = "text"                  # text | image | file | voice | …
     y0: int = 0
     y1: int = 0
+    # 只入库、不投递。唯一产生它的是「建基线时补全出来的长消息」：
+    # 它在基线里，多半已经发过了，再发一次就是往业务群刷历史。
+    baseline_only: bool = False
     # 被屏幕下沿夹掉的高度（px），0 = 没被夹。
     # 钉钉裁 bounds 时不是「把 bottom 夹到可视区」，而是**把 top 换到真实位置、
     # bottom 留在可视区** —— 于是 top > bottom。这个差值就是没露出来的高度。
@@ -1515,5 +1518,6 @@ def units_to_messages(units: list[Unit], *, chat_name: str,
                                                 "link") else "unknown",
             msg_time=now,
             raw_id=f"{fp}:{seq}",
+            no_forward=getattr(unit, "baseline_only", False),
         ))
     return out

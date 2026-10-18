@@ -909,10 +909,22 @@ class TestScreenParse(GatewayCase):
             self.row("第二条", 700, "签收跟单专员")))
         self.assertNotIn("scroll", body)
 
-    def test_baseline_frame_never_asks_to_scroll(self):
-        """建基线时不许滚：刚记下的基线会被自己滚脏。"""
+    def test_baseline_frame_nev_asks_to_scroll_for_ordinary_messages(self):
+        """建基线时，**普通消息**不许滚：群聊一直在来消息，滚起来收不住。
+
+        ⚠ 2026-10-18 语义变更：旧用例名是 ``test_baseline_frame_never_asks_
+        to_scroll``，断言「建基线一律不许滚」，理由是「刚记下的基线会被自己
+        滚脏」。那个理由**不成立** —— `differ.commit()` 已把锚点推到本帧，
+        手机翻页走 scroll-fill 通道，`_ingest_fill` 只用 `locate_anchor`
+        定位、全程不 commit，脏不了基线。
+        而不补的代价是实打实的：重启那一刻屏上卡着的长消息一进基线就再也
+        补不到后半截（真机 20:10 那条 1181 字卡片，停在「（Exce」）。
+
+        现在规则收窄为：**只有发现长消息被切才滚**，其余情况照旧不滚。
+        本用例保护的就是「其余情况照旧」这一半。
+        """
         body = self.post_frame(self.screen(
-            self.long_row("履约跟单专员", 400, 3200)))
+            self.row("普通件滞留7天 96票", 400, "签收跟单专员")))
         self.assertEqual(body["note"], "已建立基线")
         self.assertNotIn("scroll", body)
 
@@ -1192,6 +1204,60 @@ class TestScreenParse(GatewayCase):
                 f'<node text="{body}" class="android.widget.TextView" '
                 f'package="{self.PKG}" bounds="[80,{top + 70}][1000,{bottom - 10}]">'
                 f'</node></node>')
+
+    # ---- 建基线时发现被切的长消息：补全，但不转发 ----------------------
+    #
+    # 真机 2026-10-18 20:10（用户问「标签履约月累计达成（1001-1016）这个」）：
+    # 程序重启后建基线，那一屏上正好卡着这条 1181 字的卡片，结尾停在
+    # 「查看完整月报明细（Exce」。旧实现只 log.info 一句「当前屏有消息没
+    # 显示全」就完了 —— 而它一进基线，补全逻辑（要求有 `new` 非空）就再也
+    # 不会碰它，后半截永久丢失。
+    #
+    # 但它**不能补全完就发**：这条 16:39 已经转发过完整版了（库里 rowid 28），
+    # 再发一次就是往业务群刷历史。所以规则是「照常补全，收尾时只入库不投递」。
+
+    def test_baseline_frame_with_clipped_long_message_asks_for_fill(self):
+        """建基线那一帧发现长消息被切 → 必须请手机补全，不能只记日志。"""
+        body = self.post_frame(self.screen(
+            self.one_long("履约跟单专员", 400, 3200, self._seg("A"))))
+        self.assertEqual(body["note"], "基线里的长消息，只补全不转发")
+        self.assertTrue(body.get("scroll"), "基线帧里的长消息被切了却不让手机补全")
+        self.assertEqual(self.received, [], "建基线本身一条都不许发")
+
+    def test_baseline_fill_is_recorded_but_not_forwarded(self):
+        """补全出来的完整正文只入库、不投递 —— 它在基线里，多半已经发过。
+
+        帧的造法与真机一致：手机往上翻一屏，**新露出来的那屏与原来那屏
+        首尾重叠**（这里是 9 个字）。没有重叠的两段在真机上不会出现 ——
+        也拼不起来，会被当成两条独立消息，那就测不到「补全」这条路了。
+        """
+        a = self._seg("A")
+        b = self._seg("B")
+        # ⚠ 切片下标必须是 4 的倍数（每段 = 字母 + 三位数字），否则会把
+        #   "A002" 切成 "2A003…" 这种残字，看起来像丢了一屏。
+        seen = a[28:]          # 建基线时屏幕上看到的后半截：A028..A029
+        filled = a[8:] + b     # 翻一屏后：A008.. 打头，叠着 A028 起那截
+        # 建基线时只看到第一截
+        body = self.post_frame(self.screen(
+            self.one_long("履约跟单专员", 400, 3200, seen)))
+        self.assertEqual(body["note"], "基线里的长消息，只补全不转发")
+        # 手机翻一屏补全
+        self.post_fill(self.screen(
+            self.one_long("履约跟单专员", 200, 3200, filled)))
+        self.settle(1.5)
+
+        # 网关这一层照常把消息交给 on_message（它不持库，丢弃 = 连档都没了），
+        # 但必须**带着 no_forward=True** —— service.handle 就是认这个标记
+        # 「只 save 不 forward」。标记丢了就等于放任它刷群。
+        self.assertEqual(len(self.received), 1,
+                         f"补全的正文没交出去（或交了多份）：{[m.content[:20] for m in self.received]}")
+        msg = self.received[0]
+        self.assertTrue(msg.no_forward,
+                        "no_forward 标记丢了 —— service 会把它当新消息转进群里")
+        self.assertIn("B005B006", msg.content, "补全的正文不完整")
+        # a[8:] 的起点是 A002（A000 占 0-3、A001 占 4-7），别手算错
+        self.assertTrue(msg.content.startswith("A002A003"),
+                        f"开头不对：[{msg.content[:20]}]")
 
     def test_three_screen_message_is_collected_over_rounds(self):
         """3 屏长消息要一轮一轮补齐 —— 中间段不能丢，而且只发一条。
