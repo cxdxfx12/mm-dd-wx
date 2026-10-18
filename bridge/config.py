@@ -50,11 +50,17 @@ class WeChatConfig:
     interval: float = 3.0                   # 相邻两条消息的最小发送间隔（秒），防风控
     targets: list[str] = field(default_factory=list)
     wxauto_path: str = "../wxauto-main"
-    driver: str = "auto"                    # auto | wxauto(微信3.9) | ui4(微信4.x)
+    # auto | wxauto(微信3.9) | ui4(微信4.x UIA) | ocr(微信4.x 截图+OCR)
+    # ⚠ 2026-10-18 起微信 4.x 不再暴露 mmui:: 控件树，auto 探测到 4.x 会自动走 ocr。
+    driver: str = "auto"
     # 微信「显示/隐藏主窗口」全局热键。微信用 Esc 或点最小化会把主窗口收进
     # 托盘（UIA 里整个消失），此时桥用这个热键把窗口唤回来。
     # 若你在微信「设置 → 快捷键」里改过，这里要跟着改。
     show_hotkey: str = "{Ctrl}{Alt}w"
+    # ---- OCR 投递端（driver: ocr）专属 ----
+    ocr_verify: bool = True                 # 发送后回读截图校验（检测发出气泡）
+    ocr_keep_clipboard: bool = True         # 用完恢复用户原有剪贴板内容
+    ocr_match_threshold: float = 0.62       # 会话名匹配阈值，低于此值拒发
 
 
 @dataclass
