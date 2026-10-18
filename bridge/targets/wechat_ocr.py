@@ -364,6 +364,29 @@ class WeChatOcrTarget(Target):
         ⚠ 点击后必须用标题栏确认会话真的打开了：本机微信对模拟点击
         偶尔不响应（点搜索框也遇到过），只信「点了」会静默丢消息。
         """
+        # ---- 短路：当前已经打开的就是目标，不必扫列表 ----
+        #
+        # ⚠ 这一步**必须放在 `_snapshot()` 之前**。历史实现是先全量扫一遍
+        #   会话列表（抓帧 + 3x OCR，300~500ms），扫完才在 `self._current`
+        #   上判「已在目标会话」—— 钱已经花了。同一批消息连发多条时，
+        #   除第一条外每次都在为一个已知答案付全价。
+        #   代价只是先读一次标题栏（一次裁剪 + 小图 OCR，约 1/5 成本）。
+        #
+        # ⚠ 只信 OCR 标题栏，不信 `self._current`：后者是内存态，重启后为空，
+        #   而且可能因为用户手动切了会话而失真。两者一致才放行。
+        #
+        # ⚠ `fast_*` 还有第二个用途：记录**点击之前**右侧开着的是什么。
+        #   如果点击前标题栏可读且**不是目标**，后面标题栏偶发读不到时
+        #   **不能用面板兜底** —— 面板非空可能只是「本来就开着的那个群」，
+        #   兜底放行 = 把消息发进别人的群（见 `_open_chat` 尾部注释）。
+        fast_ok, fast_title = self._current_chat_title(hwnd)
+        if fast_ok and self._title_matches(target, fast_title):
+            self._current = target
+            log.info("已打开目标会话「%s」，跳过会话列表扫描", target)
+            return True, f"已在目标会话（标题栏：{fast_title[:24]}）"
+        # 点击前是否「确认开着一个别的会话」
+        other_open_before = fast_ok and not self._title_matches(target, fast_title)
+
         img, items = self._snapshot(hwnd)
         if img is None:
             return False, (
@@ -387,6 +410,10 @@ class WeChatOcrTarget(Target):
                 f"当前可见会话：{sample}")
 
         if self._current == hit["text"]:
+            # 上面的短路已经查过一次标题栏，走到这里说明标题栏**没读到**或
+            # **对不上**（读者：读不到时 fast_ok=False）。所以这里只认
+            # `self._current` 与列表命中的**双重一致**，且不再单独放行 ——
+            # 统一交给下面的点击+确认流程，避免「标题栏明明对不上却跳过点击」。
             opened, title = self._current_chat_title(hwnd)
             if opened and self._title_matches(target, title):
                 return True, "已在目标会话"
@@ -419,6 +446,30 @@ class WeChatOcrTarget(Target):
                 return True, (
                     f"已切到「{hit['text']}」（相似度 {score:.2f}，"
                     f"第 {attempt} 次点击，标题栏：{title[:20]}）")
+
+            # ---- 第二段判据：标题读不到，就看聊天面板里到底有没有会话 ----
+            #
+            # ⚠ 这里**只在「标题栏读不到」时才兜底**，标题读到但**对不上**
+            #   的情况绝不能放行 —— 那说明点进了别的会话，放过去就是把
+            #   消息发错群（比投递失败严重得多）。
+            # ⚠ 还有一道闸：**点击前就确认开着别的会话时也不兜底**。
+            #   那种情况下「面板非空」证明不了点击生效 —— 可能点击被吞、
+            #   面板显示的还是原来那个群。只有点击前没有可确认的会话
+            #   （fast 读不到/没开），点击后面板出现内容，才说明是这次
+            #   点击打开的。
+            if not opened and not other_open_before:
+                img = self._grab(hwnd)
+                if img is not None:
+                    pane_open, why = self._pane_is_open(img)
+                    if pane_open:
+                        self._current = hit["text"]
+                        log.info("会话「%s」标题栏读不到（%s），但聊天面板已打开"
+                                 "（%s）—— 按成功处理，第 %d 次点击",
+                                 hit["text"], title, why, attempt)
+                        return True, (
+                            f"已切到「{hit['text']}」（相似度 {score:.2f}，"
+                            f"第 {attempt} 次点击；标题栏读不到，"
+                            f"按聊天面板判据确认）")
             log.warning("点击会话后标题栏未确认（第 %d 次）：%r",
                         attempt, title)
         return False, (
@@ -433,6 +484,60 @@ class WeChatOcrTarget(Target):
         s = re.sub(r"\s+", "", title)
         s = re.sub(r"\(\d+\)$", "", s)           # 「群名 (84)」
         return bool(t) and (t in s or s[:len(t)] in t)
+
+    def _pane_is_open(self, img) -> tuple[bool, str]:
+        """右侧聊天区**是否真的打开了一个会话**（不看标题栏）。
+
+        这是标题栏读不到时的兜底判据 —— 思路来自 wxauto 4.x 复刻版的
+        `_pane_has_content`：标题栏 OCR 会因重绘/抖动/字体渲染偶发返回空，
+        但那不代表会话没打开，直接判失败会白重试一轮（历史上一天 17 次）。
+
+        ⚠ 判据不能用「消息区有文字」：微信没打开任何会话时，右侧是
+        「微信」大 logo 加一句提示，OCR 照样有字。真正区分两者的是
+        **有没有消息气泡**——用「消息区里存在非背景色的成片像素」代替
+        「有文字」，比 OCR 便宜（纯像素统计，不用跑模型）而且更稳。
+
+        返回 `(是否打开, 说明)`，说明用于日志定位是哪一路救回来的。
+        """
+        import numpy as np
+
+        W, H = img.size
+        x0, y0, x1, y1 = _LAYOUT["message"]
+        crop = np.array(img.crop((int(W * x0), int(H * y0),
+                                  int(W * x1), int(H * y1))))
+        if crop.size == 0:
+            return False, "消息区裁剪为空"
+
+        g = crop[:, :, 1].astype(int)
+        r = crop[:, :, 0].astype(int)
+        b = crop[:, :, 2].astype(int)
+
+        # ① 我方绿气泡（最硬的证据：能投递说明多半刚发过）
+        if self._has_outgoing_bubble(img):
+            return True, "消息区有发出气泡"
+
+        # ② 背景色估计：取四边一圈的中位数。微信浅色主题近白、深色主题近黑，
+        #    两种都靠「和边缘不一样」来判，不写死具体色值。
+        edge = np.concatenate([
+            crop[0, :, :].reshape(-1, 3), crop[-1, :, :].reshape(-1, 3),
+            crop[:, 0, :].reshape(-1, 3), crop[:, -1, :].reshape(-1, 3),
+        ])
+        bg = np.median(edge, axis=0)
+        diff = (np.abs(r - bg[0]) + np.abs(g - bg[1]) + np.abs(b - bg[2]))
+        # 只看明显偏离背景的像素（阈值 60 可滤掉渐变和压缩噪点）
+        strong = diff > 60
+        # 气泡/头像/文字块会形成较大连片区域；空面板只有零星细节。
+        #
+        # ⚠ 阈值 2% 是**用真机量出来的**（2026-10-18，720×1088）：
+        #   打开着的真实聊天（头像+气泡+大段文字）≈ 53%，离阈值一个量级；
+        #   合成的稀疏画面（4 个白气泡+深色文字行）≈ 5.4%。
+        #   首版写的 4% 会把「只有气泡、文字被 OCR 遮住」的极端画面判死，
+        #   降到 2% 给头像/图片消息留余量 —— 纯空白是 0.0%，不会误放行。
+        #   改这个值之前先真机抓帧量一遍，别拍脑袋。
+        frac = float(np.count_nonzero(strong)) / float(strong.size)
+        if frac >= self.PANE_MIN_FRAC:
+            return True, f"消息区非空白（内容占比 {frac:.1%}）"
+        return False, f"消息区基本空白（内容占比 {frac:.1%}）"
 
     def _search_chat(self, hwnd: int, target: str) -> tuple[bool, str]:
         """点搜索框 → 输入群名 → 回车选第一条 → 标题栏确认。
@@ -494,25 +599,29 @@ class WeChatOcrTarget(Target):
             if ok and self._title_matches(target, title_txt):
                 return True, (
                     f"已通过搜索（OCR 定位）切到目标（标题栏：{title_txt[:24]}）")
+            # 标题读不到 → 看聊天面板（同 `_open_chat` 的兜底逻辑）
+            if not ok:
+                img = self._grab(hwnd)
+                if img is not None:
+                    pane_open, why = self._pane_is_open(img)
+                    if pane_open:
+                        log.info("搜索结果「%s」标题栏读不到，但聊天面板已打开"
+                                 "（%s）—— 按成功处理", hit["text"], why)
+                        return True, (
+                            f"已通过搜索（OCR 定位）切到目标"
+                            f"（标题栏读不到，按聊天面板判据确认）")
         return False, (
             f"点击搜索结果「{hit['text']}」后标题栏未确认到目标"
             f"（读到：{title_txt or '空'}）")
 
     def _current_chat_title(self, hwnd: int) -> tuple[bool, str]:
         """OCR 右侧聊天区标题栏，确认当前打开的会话。"""
-        import numpy as np
-
         img = self._grab(hwnd)
         if img is None:
             return False, "抓帧失败"
-        W, H = img.size
-        x0, y0, x1, y1 = _LAYOUT["title"]
-        crop = img.crop((int(W * x0), int(H * y0), int(W * x1), int(H * y1)))
-        if crop.width < 20 or crop.height < 10:
-            return False, "标题栏区域过小"
-        arr = np.array(crop.resize((crop.width * 3, crop.height * 3)))
+        items, _box, _zoom = self._ocr_region(img, "title")
         texts = []
-        for b, text, conf in self._ocr(arr):
+        for _b, text, conf in items:
             text = (text or "").strip()
             if text and float(conf or 0) >= 0.6:
                 texts.append(text)
@@ -870,6 +979,42 @@ class WeChatOcrTarget(Target):
             self._engine = _build_ocr_engine()
         return self._engine(arr)
 
+    # 小字号区域放大倍数。
+    #
+    # ⚠ 这个值不是随手定的，来源是 wxauto 4.x 复刻版的实测结论：
+    #   **中文放大 3 倍识别率最高，超过 5 倍反而整块返回空**（模型对
+    #   过大的字有感受野上限，切碎后拼不回来）。
+    #   标题栏原本就是 3 倍（历史值，实测有效）；会话列表是 2 倍 ——
+    #   列表行高更小、字更小，同样 3 倍更稳。
+    #   调这个值前先在真机上各跑一遍「标题栏读 20 次 + 列表认 20 次」，
+    #   别只凭一次成功就改。
+    OCR_ZOOM = 3
+
+    # 「聊天面板已打开」的最小非背景像素占比（见 `_pane_is_open` 的量测记录）。
+    PANE_MIN_FRAC = 0.02
+
+    def _ocr_region(self, img, guide_name: str, zoom: int = 0):
+        """按 `_LAYOUT[guide_name]` 裁一块区域，放大 `zoom` 倍后 OCR。
+
+        返回 `(items, box, zoom)`：`items` 是引擎原始三元组
+        `(box_points, text, conf)`，坐标是**放大后**的，调用方自己除。
+
+        为什么要抽成一个方法：放大倍率和坐标还原是「多除一个 N」的关系，
+        散在各处写死迟早出现「一处 2 倍一处 3 倍，坐标还原漏除」——
+        这类 bug 的表现是「识别都对、点击却偏了一半」，极难排查。
+        """
+        zoom = zoom or self.OCR_ZOOM
+        W, H = img.size
+        x0, y0, x1, y1 = _LAYOUT[guide_name]
+        box = (int(W * x0), int(H * y0), int(W * x1), int(H * y1))
+        crop = img.crop(box)
+        if crop.width < 20 or crop.height < 10:
+            return [], box, zoom
+        if zoom != 1:
+            crop = crop.resize((crop.width * zoom, crop.height * zoom))
+        import numpy as np
+        return self._ocr(np.array(crop)), box, zoom
+
     def _ocr_sessions(self, img) -> list[dict]:
         """OCR 左侧会话列表。
 
@@ -881,17 +1026,11 @@ class WeChatOcrTarget(Target):
 
         坐标一律是**截图内**像素。
         """
-        import numpy as np
-
-        W, H = img.size
-        x0, y0, x1, y1 = _LAYOUT["list"]
-        box = (int(W * x0), int(H * y0), int(W * x1), int(H * y1))
-        crop = img.crop(box)
-        if crop.width < 20 or crop.height < 20:
+        # 放大倍率见 `OCR_ZOOM`（3x）。旧值是写死的 2x —— 统一走
+        # `_ocr_region` 之后，坐标还原的除数跟着 zoom 走，不会再漏除。
+        items, box, zoom = self._ocr_region(img, "list")
+        if not items:
             return []
-        # 2x 放大：小字号中文在这个倍率下识别率最高（钉钉侧同参数）
-        arr = np.array(crop.resize((crop.width * 2, crop.height * 2)))
-        items = self._ocr(arr)
 
         raw = []
         for b, text, conf in items:
@@ -906,14 +1045,14 @@ class WeChatOcrTarget(Target):
             ys = [float(p[1]) for p in b]
             if not xs or not ys:
                 continue
-            # 2x 缩放 → 回到裁切坐标 → 回到整图坐标
+            # zoom 缩放 → 回到裁切坐标 → 回到整图坐标
             raw.append({
                 "text": text,
                 "kind": "raw",
-                "x0": min(xs) / 2.0 + box[0],
-                "x1": max(xs) / 2.0 + box[0],
-                "y0": min(ys) / 2.0 + box[1],
-                "y1": max(ys) / 2.0 + box[1],
+                "x0": min(xs) / zoom + box[0],
+                "x1": max(xs) / zoom + box[0],
+                "y0": min(ys) / zoom + box[1],
+                "y1": max(ys) / zoom + box[1],
                 "conf": float(conf or 0),
             })
         if not raw:
