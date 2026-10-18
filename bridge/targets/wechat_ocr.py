@@ -249,13 +249,21 @@ class WeChatOcrTarget(Target):
         verified, why = self._verify_sent(hwnd, text)
         if verified:
             return SendResult(True, target, why)
-        # 兜底：内容可能还留在输入框里，清掉以免下一条拼在一起
-        self._click(hwnd, *_LAYOUT["input"])
-        self._clear_input()
+        # 兜底清输入框：**必须先确认会话还开着**。
+        # 会话没开时点输入框区域 = 点在空白处，而 Ctrl+A/Backspace 会落到
+        # 会话列表上，把列表滚动/状态弄乱（2026-10-18 实测踩过）。
+        opened, _title = self._current_chat_title(hwnd)
+        if opened:
+            self._click(hwnd, *_LAYOUT["input"])
+            self._clear_input()
         return SendResult(False, target, why)
 
     def _open_chat(self, hwnd: int, target: str) -> tuple[bool, str]:
-        """在会话列表里找到目标群并点开。列表里没有就改用搜索框。"""
+        """在会话列表里找到目标群并点开。列表里没有就改用搜索框。
+
+        ⚠ 点击后必须用标题栏确认会话真的打开了：本机微信对模拟点击
+        偶尔不响应（点搜索框也遇到过），只信「点了」会静默丢消息。
+        """
         img, items = self._snapshot(hwnd)
         if img is None:
             return False, (
@@ -265,26 +273,51 @@ class WeChatOcrTarget(Target):
             return False, "会话列表 OCR 为空，无法定位目标群"
 
         hit, score = self._best_match(target, items)
-        if hit is not None:
-            if self._current == hit["text"]:
+        if hit is None:
+            # ---- 列表里没有（未在首屏）→ 用搜索框 ----
+            log.info("会话列表首屏未见「%s」（最高 %.2f），改用搜索框", target, score)
+            ok, why = self._search_chat(hwnd, target)
+            if ok:
+                return True, why
+            sample = "、".join(it["text"] for it in items
+                               if it.get("kind") == "session")[:5] or "（无）"
+            return False, (
+                f"会话列表首屏没找到「{target}」（最高相似度 {score:.2f} < "
+                f"{self.match_threshold}），搜索也没成功：{why}。"
+                f"当前可见会话：{sample}")
+
+        if self._current == hit["text"]:
+            opened, title = self._current_chat_title(hwnd)
+            if opened and self._title_matches(target, title):
                 return True, "已在目标会话"
+
+        # 点击（最多两次：本机微信偶尔吞掉第一次模拟点击）
+        last_title = ""
+        for attempt in (1, 2):
             if not self._click_abs(hwnd, hit["cx"], hit["cy"]):
                 return False, f"点击会话「{hit['text']}」失败"
-            time.sleep(0.5)
-            self._current = hit["text"]
-            return True, f"已切到「{hit['text']}」（相似度 {score:.2f}，列表直选）"
-
-        # ---- 列表里没有（未在首屏）→ 用搜索框 ----
-        log.info("会话列表首屏未见「%s」（最高 %.2f），改用搜索框", target, score)
-        ok, why = self._search_chat(hwnd, target)
-        if ok:
-            return True, why
-        sample = "、".join(it["text"] for it in items
-                           if it.get("kind") == "session")[:5] or "（无）"
+            time.sleep(0.6)
+            opened, title = self._current_chat_title(hwnd)
+            last_title = title
+            if opened and self._title_matches(target, title):
+                self._current = hit["text"]
+                return True, (
+                    f"已切到「{hit['text']}」（相似度 {score:.2f}，"
+                    f"第 {attempt} 次点击，标题栏：{title[:20]}）")
+            log.warning("点击会话后标题栏未确认（第 %d 次）：%r",
+                        attempt, title)
         return False, (
-            f"会话列表首屏没找到「{target}」（最高相似度 {score:.2f} < "
-            f"{self.match_threshold}），搜索也没成功：{why}。"
-            f"当前可见会话：{sample}")
+            f"点击「{hit['text']}」后标题栏未出现目标会话"
+            f"（标题栏读到：{last_title or '空'}）—— 右侧聊天区可能没有会话打开")
+
+    @staticmethod
+    def _title_matches(target: str, title: str) -> bool:
+        """标题栏文本是否指向目标会话（群名可能带人数后缀/被截断）。"""
+        import re
+        t = re.sub(r"\s+", "", target)
+        s = re.sub(r"\s+", "", title)
+        s = re.sub(r"\(\d+\)$", "", s)           # 「群名 (84)」
+        return bool(t) and (t in s or s[:len(t)] in t)
 
     def _search_chat(self, hwnd: int, target: str) -> tuple[bool, str]:
         """点搜索框 → 输入群名 → 点第一条结果。"""
