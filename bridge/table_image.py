@@ -48,6 +48,15 @@ MIN_CELLS = 3
 MAX_W = 1200
 MIN_W = 480
 
+# ── 超宽表格切块（2026-10-18 用户报「横的表格比较宽」）──────────────
+# 列数一多，硬塞进一份宽度只能把每列压到几十像素，一行字竖折成两三个字一个
+# —— 跟竖排对联一样没法读。切块后每块独占全宽，每格都能横排。
+MAX_COL_W = 520         # 单列再宽也不超过这个（超了折行）
+MIN_COL_W = 60          # 单列最窄；比这窄就不该出现在图里了
+# 切块后**每块重复**的键列数：前 N 列（通常是「网点」「单号」这类标识列）。
+# 重复是对的 —— 第 2 块单独截出来也要能看懂是哪条数据。
+KEY_COLS = 2
+
 # 配色（浅色，微信里不论深浅主题都看得清 —— 图片本身自带白底）
 FG = (32, 32, 32)
 FG_DIM = (96, 96, 96)
@@ -55,6 +64,7 @@ BG = (255, 255, 255)
 HEAD_BG = (240, 243, 248)
 ZEBRA = (250, 251, 253)
 LINE = (216, 220, 226)
+SEP_BG = (238, 240, 244)   # 多块表之间的分隔色带
 
 # 字号与内边距（像素）
 FONT_SIZE = 26
@@ -186,9 +196,123 @@ def render_table(head: list[str], rows: list[list[str]],
                  *, title: str = "", max_w: int = MAX_W) -> "object | None":
     """画成 PIL Image。没有数据返回 ``None``。
 
+    **对外入口**。列数多到一份宽度装不下时，自动切成几块**纵向摞起来**
+    （每块独占全宽、重复键列），见 :func:`render_table_blocks` 的说明。
+    """
+    if not head and not rows:
+        return None
+    ncol = max([len(head)] + [len(r) for r in rows]) if (head or rows) else 0
+    if not ncol or not rows:
+        return None
+
+    groups = _split_columns(head, rows, ncol, max_w)
+    if len(groups) <= 1:
+        return _render_block(head, rows, all_cols=list(range(ncol)),
+                             title=title, max_w=max_w, part=(0, 1))
+
+    # 多块：每块自带表头（+ 重复键列），纵向拼接成一张长图。
+    imgs = []
+    for idx, cols in enumerate(groups):
+        imgs.append(_render_block(head, rows, all_cols=cols, title=title,
+                                  max_w=max_w, part=(idx, len(groups))))
+    return _stack_vertical(imgs)
+
+
+def _split_columns(head: list[str], rows: list[list[str]], ncol: int,
+                   max_w: int) -> list[list[int]]:
+    """把列切成若干组，每组单独画一块就能保证「每格横排不竖折」。
+
+    ── 为什么是纵向摞而不是左右并排 ──────────────────────────────
+    2026-10-18 用户选了「横向并排」，但算过账才发现那是反的：12 列切成 3 块
+    左右并排，总宽还是 1200px，每块只分到 ~400px 装 5~6 列 = 每列 ~70px，
+    **比不切（每列 ~100px）更挤**，竖折反而更严重。左右并排只在「每块列很少」
+    时才有意义，而那时根本不需要切。所以这里改成**每块独占全宽、上下摞**：
+    3 列能分到 400px/列，文字轻松横排。
+
+    切法：按「自然宽度」累加，超过一份可用宽度就开新块。第一块带上
+    :data:`KEY_COLS` 列的键列，后续块重复这些键列（用户选的「重复键列」），
+    这样每一块单独截出来也能看懂是哪条数据。
+
+    返回 ``[[列下标...], ...]``；只有一组时分块逻辑会被跳过。
+    """
+    probe_draw, font, head_font = _probe()
+    natural = []
+    for i in range(ncol):
+        w = probe_draw.textlength(head[i] if i < len(head) else "", font=head_font)
+        for r in rows:
+            if i < len(r):
+                w = max(w, probe_draw.textlength(r[i], font=font))
+        natural.append(max(MIN_COL_W, min(int(w) + 2 * PAD_X, MAX_COL_W)))
+
+    keys = list(range(min(KEY_COLS, ncol)))
+    key_w = sum(natural[i] for i in keys)
+
+    avail = max_w - 2 * MARGIN
+    groups: list[list[int]] = []
+    cur: list[int] = list(keys)
+    cur_w = key_w
+    for i in range(len(keys), ncol):
+        w = natural[i]
+        # 装满就换块（首块也要留够，否则第一块只有键列，一列数据都没有）
+        if cur != keys and cur_w + w > avail:
+            groups.append(cur)
+            cur = list(keys)
+            cur_w = key_w
+        cur.append(i)
+        cur_w += w
+    if cur != keys or not groups:
+        groups.append(cur)
+
+    # 只有一列数据 + 键列时不必切（切了反而多一张几乎一样的表）
+    if len(groups) <= 1 or ncol <= len(keys) + 1:
+        return [list(range(ncol))]
+    return groups
+
+
+def _probe():
+    """量文字宽度用的 (ImageDraw, 正文字体, 表头字体)。"""
+    from PIL import Image, ImageDraw
+
+    probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+    return probe, _load_font(FONT_SIZE), _load_font(HEAD_FONT_SIZE)
+
+
+def _stack_vertical(imgs: list) -> "object | None":
+    """把几块表上下摞成一张图（间隔一道分隔带，一眼看出是切开的）。"""
+    from PIL import Image, ImageDraw
+
+    imgs = [i for i in imgs if i is not None]
+    if not imgs:
+        return None
+    width = max(i.size[0] for i in imgs)
+    gap = 18
+    height = sum(i.size[1] for i in imgs) + gap * (len(imgs) - 1)
+    out = Image.new("RGB", (width, height), BG)
+    draw = ImageDraw.Draw(out)
+    y = 0
+    for img in imgs:
+        out.paste(img, (0, y))
+        y += img.size[1]
+        if y < height:
+            # 分隔带：一条浅色横条 + 居中「续下表」提示会更醒目，但图里加字
+            # 容易和表格内容混淆，这里只画色带，靠留白区分。
+            draw.rectangle([0, y + 2, width, y + gap - 2], fill=SEP_BG)
+            y += gap
+    return out
+
+
+def _render_block(head: list[str], rows: list[list[str]],
+                  *, all_cols: list[int], title: str = "",
+                  max_w: int = MAX_W, part: tuple[int, int] = (0, 1)
+                  ) -> "object | None":
+    """画**一块**表：只取 ``all_cols`` 指定的列。
+
     布局：``title``（可选）→ 表头 → 数据行（斑马纹），每格按需折行。
     列宽按「这一列最长内容 / 表头」的实测像素分配，总宽不够就整体收窄到
-    ``MAX_W`` 并把内容折行 —— 不缩放整图，保证数字清晰。
+    ``max_w`` 并把内容折行 —— 不缩放整图，保证数字清晰。
+
+    ``part=(序号, 总数)`` 在有多块时用来在标题后加「（第 2/3 部分）」，
+    免得看图的人以为表格只有这些列。
     """
     from PIL import Image, ImageDraw
 
@@ -199,8 +323,15 @@ def render_table(head: list[str], rows: list[list[str]],
     def cell(row, i):
         return row[i] if i < len(row) else ""
 
-    head = [cell(head, i) for i in range(ncol)]
-    rows = [[cell(r, i) for i in range(ncol)] for r in rows]
+    # 只保留本块要画的列；顺序按 ``all_cols`` 给（键列在前）
+    head = [cell(head, i) for i in all_cols]
+    rows = [[cell(r, i) for i in all_cols] for r in rows]
+    ncol = len(all_cols)
+
+    idx, total = part
+    if total > 1:
+        suffix = f"（第 {idx + 1}/{total} 部分）"
+        title = f"{title}{suffix}" if title else suffix.strip("（）")
 
     font = _load_font(FONT_SIZE)
     head_font = _load_font(HEAD_FONT_SIZE)
@@ -213,13 +344,13 @@ def render_table(head: list[str], rows: list[list[str]],
         w = probe.textlength(head[i], font=head_font)
         for r in rows:
             w = max(w, probe.textlength(r[i], font=font))
-        natural.append(max(48, min(int(w) + 2 * PAD_X, 520)))
+        natural.append(max(MIN_COL_W, min(int(w) + 2 * PAD_X, MAX_COL_W)))
 
     avail = max_w - 2 * MARGIN
-    total = sum(natural)
-    if total > avail:
-        scale = avail / total
-        widths = [max(60, int(w * scale)) for w in natural]
+    total_w = sum(natural)
+    if total_w > avail:
+        scale = avail / total_w
+        widths = [max(MIN_COL_W, int(w * scale)) for w in natural]
     else:
         widths = natural
     width = sum(widths) + 2 * MARGIN

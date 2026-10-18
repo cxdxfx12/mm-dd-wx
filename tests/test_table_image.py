@@ -108,6 +108,55 @@ class TestRender(unittest.TestCase):
         self.assertLessEqual(img.size[0], 1200 + 4, "超宽内容应该折行而不是撑爆")
 
 
+class TestWideTableSplits(unittest.TestCase):
+    """超宽表格自动切块、纵向摞（2026-10-18 用户报「横的表格比较宽」）。
+
+    旧实现把 12 列硬压进 1200px：每列 ~100px，一格竖折成两三字一行，
+    「跟竖排对联一样」。新实现切成几块、每块独占全宽、重复键列。
+    """
+
+    def setUp(self):
+        try:
+            import PIL                     # noqa: F401
+        except ImportError:
+            self.skipTest("本机没装 Pillow，渲染测试跳过")
+
+    HEAD = ["网点", "单号", "运单号", "客户名称", "问题类型", "登记时间",
+            "处理人", "状态", "时效", "金额", "备注", "跟进结果"]
+
+    def _rows(self, n=8):
+        return [[f"义乌{i}", f"SF{9000 + i}", "773123456789012",
+                 f"杭州某某电子商务有限公司{i}", "派送延误-超时未签收",
+                 f"2026-10-18 1{i}:30:00", "张三丰", "处理中", "超时28小时",
+                 "128.50", "客户已催三次", "待回访"] for i in range(n)]
+
+    def test_wide_table_is_split_into_blocks(self):
+        from bridge.table_image import _split_columns
+        groups = _split_columns(self.HEAD, self._rows(), len(self.HEAD), 1200)
+        self.assertGreater(len(groups), 1, "12 列必须切出多块")
+        # 每块的列并集 = 全部列；键列（前 2 列）每块都有
+        seen = [c for g in groups for c in g]
+        self.assertEqual(sorted(set(seen)), list(range(len(self.HEAD))),
+                         "切块丢了列")
+        for g in groups[1:]:
+            self.assertIn(0, g, "非首块没重复键列（网点）")
+            self.assertIn(1, g, "非首块没重复键列（单号）")
+
+    def test_split_image_stays_readable_width(self):
+        img = render_table(self.HEAD, self._rows(),
+                           title="标签履约月累计达成")
+        self.assertIsNotNone(img)
+        self.assertLessEqual(img.size[0], 1200 + 4, "切块后仍不得超宽")
+        # 每块都有表头 → 图比单块高；但更重要的是「能被切开」本身
+
+    def test_narrow_table_is_not_split(self):
+        from bridge.table_image import _split_columns
+        head = ["网点", "单号", "状态"]
+        rows = [["义乌", "SF9000", "处理中"]]
+        self.assertEqual(len(_split_columns(head, rows, 3, 1200)), 1,
+                         "3 列不该被切")
+
+
 class TestServiceIntegration(unittest.TestCase):
     """service.handle 在文字之后补发表格图（不发图不给文字丢掉）。"""
 
