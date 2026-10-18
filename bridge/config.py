@@ -47,7 +47,14 @@ class DingTalkConfig:
 @dataclass
 class WeChatConfig:
     dry_run: bool = True
-    interval: float = 3.0                   # 相邻两条消息的最小发送间隔（秒），防风控
+    # 相邻两条消息的间隔（秒），防风控。
+    # interval 是**下限**；另外在 [interval*0.8, interval*1.6] 之间随机抖动，
+    # 避免出现「固定 3 秒一条」这种一眼是机器人的节奏，见 service._throttle()。
+    interval: float = 5.0
+    # 随机长停顿：每隔若干条消息插入一次更长的等待，模拟真人离开/思考。
+    interval_jitter_long: bool = True       # 是否启用长停顿
+    interval_long_every: int = 3            # 每发几条插入一次长停顿
+    interval_long_range: list = field(default_factory=lambda: [8.0, 20.0])
     targets: list[str] = field(default_factory=list)
     wxauto_path: str = "../wxauto-main"
     # auto | wxauto(微信3.9) | ui4(微信4.x UIA) | ocr(微信4.x 截图+OCR)

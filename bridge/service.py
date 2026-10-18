@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from collections import Counter
@@ -36,6 +37,7 @@ class BridgeService:
         self.last_target_check: tuple[bool, str] = (True, "尚未检查")
         self._last_send = 0.0
         self._send_lock = threading.Lock()
+        self._send_count = 0                    # 已发送条数，用于插入随机长停顿
 
         # ---- 通知相关 ----
         self.notifier: DingTalkNotifier | None = DingTalkNotifier.from_config(
@@ -128,12 +130,45 @@ class BridgeService:
             self._consec_fail = 0
 
     def _throttle(self) -> None:
-        """相邻两条发送之间保持最小间隔，降低微信风控风险。"""
-        interval = max(0.0, float(self.cfg.wechat.interval))
+        """相邻两条发送之间保持随机间隔，降低微信风控风险。
+
+        固定间隔（例如永远 3.0 秒一条）本身就很容易被识别为机器人节奏，
+        所以这里做两层随机：
+        1. **基础间隔**在 [interval*0.8, interval*1.6] 之间抖动 ——
+           配置 5.0 时实际落在 4.0~8.0 秒；
+        2. **长停顿**：每发 interval_long_every 条插一次
+           interval_long_range 里的随机等待（默认 8~20 秒），
+           模拟真人「发几条、停一会儿」的行为。
+
+        需要精确复现时把 interval_jitter_long 关掉并把两个边界设成相等即可。
+        """
+        base = max(0.0, float(self.cfg.wechat.interval))
         with self._send_lock:
-            delta = time.time() - self._last_send
-            if delta < interval:
-                time.sleep(interval - delta)
+            now = time.time()
+            self._send_count += 1
+
+            if base <= 0:
+                self._last_send = now
+                return
+
+            wait = random.uniform(base * 0.8, base * 1.6)
+
+            every = int(getattr(self.cfg.wechat, "interval_long_every", 0) or 0)
+            if getattr(self.cfg.wechat, "interval_jitter_long", False) and every > 0 \
+                    and self._send_count % every == 0:
+                rng = getattr(self.cfg.wechat, "interval_long_range", None) or [8.0, 20.0]
+                try:
+                    lo, hi = float(rng[0]), float(rng[1])
+                except (TypeError, IndexError, ValueError):
+                    lo, hi = 8.0, 20.0
+                if hi < lo:
+                    lo, hi = hi, lo
+                wait += random.uniform(lo, hi)
+                log.info("随机长停顿：本次等待 %.1f 秒（每 %d 条一次）", wait, every)
+
+            delta = now - self._last_send
+            if delta < wait:
+                time.sleep(wait - delta)
             self._last_send = time.time()
 
     # ---------- 通知：生命周期 ----------
