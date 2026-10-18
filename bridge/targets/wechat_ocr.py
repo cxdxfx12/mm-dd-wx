@@ -218,6 +218,40 @@ class WeChatOcrTarget(Target):
 
     # ---------- 主流程 ----------
 
+    # 已验证 OCR 坐标可用的窗口尺寸范围（实测 520~1100 宽双栏布局正常）。
+    # ⚠ 最大化（如 2576 宽）时微信把列表压成 ~90px 固定窄条，**不是等比
+    # 缩放**，比例坐标全部失效 → 匹配不到任何会话。所以发送前把窗口
+    # 恢复到标准尺寸，用户平时怎么拉窗口都不影响。
+    STD_W, STD_H = 720, 1088
+    MIN_OK_W, MAX_OK_W = 520, 1100
+    MIN_OK_H = 800
+
+    def _ensure_layout_safe(self, hwnd: int) -> None:
+        """窗口尺寸不在已验证范围内就恢复到标准尺寸（720×1088）。
+
+        最大化 → SW_RESTORE 后再 MoveWindow（只还原不恢复，位置会乱）；
+        过小 → 可能触发微信「单栏模式」折叠列表；过大 → 比例坐标失效。
+        恢复动作用户可见（窗口会跳一下），但只发生在发送前的一瞬间。
+        """
+        r = self._rect(hwnd)
+        if not r:
+            return
+        w, hgt = r[2] - r[0], r[3] - r[1]
+        style = user32.GetWindowLongW(wt.HWND(hwnd), -16)   # GWL_STYLE
+        maximized = bool(style & 0x01000000)                # WS_MAXIMIZE
+        in_range = (self.MIN_OK_W <= w <= self.MAX_OK_W
+                    and hgt >= self.MIN_OK_H)
+        if in_range and not maximized:
+            return
+        if maximized:
+            user32.ShowWindow(wt.HWND(hwnd), 9)             # SW_RESTORE
+            time.sleep(0.5)
+        user32.MoveWindow(wt.HWND(hwnd), r[0], r[1],
+                          self.STD_W, self.STD_H, True)
+        time.sleep(0.8)
+        log.info("微信窗口尺寸 %dx%d 超出已验证范围，已恢复为 %dx%d",
+                 w, hgt, self.STD_W, self.STD_H)
+
     def _send_live(self, target: str, text: str) -> SendResult:
         hwnd = self._find_window()
         if not hwnd:
@@ -225,6 +259,7 @@ class WeChatOcrTarget(Target):
 
         if not self._activate(hwnd):
             return SendResult(False, target, "无法把微信窗口切到前台（可能被系统禁止抢占焦点）")
+        self._ensure_layout_safe(hwnd)
 
         # 1. 切到目标会话
         ok, detail = self._open_chat(hwnd, target)
