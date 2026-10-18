@@ -158,7 +158,12 @@ _LAYOUT = {
     "search": (0.24, 0.053),
     # 右侧聊天区标题栏（回读校验「当前打开的是哪个群」）：
     # 720 宽实测标题在 y∈[38,72]，避开 y<32 的系统按钮行
-    "title": (0.45, 0.034, 0.90, 0.068),
+    # ⚠ 2026-10-18 加宽：旧值 (0.034, 0.068) 裁出来只有 37px 高，标题文字
+    #   **顶着裁剪区上沿**——窗口刚被顶回前台时位置会抖一两个像素，文字被
+    #   切掉半截 OCR 就返回空，表现为「标题栏无文字」（一天 17 次，每次
+    #   白等一轮重试）。改成 (0.030, 0.075)：上沿多让出避按钮行的余量、
+    #   下沿多含一行缓冲，文字落在裁剪区中间，抖动也切不到。
+    "title": (0.45, 0.030, 0.90, 0.075),
     # 输入框点击点（相对比例）
     "input": (0.70, 0.90),
     # 发送按钮（相对比例，点不到时回落到回车）
@@ -386,13 +391,28 @@ class WeChatOcrTarget(Target):
             if opened and self._title_matches(target, title):
                 return True, "已在目标会话"
 
-        # 点击（最多两次：本机微信偶尔吞掉第一次模拟点击）
+        # 点击（最多两次点击：本机微信偶尔吞掉第一次模拟点击）
+        #
+        # ⚠ 每次点击后**分两段等**，别把「点击没生效」和「界面没画完」混为一谈
+        #   （2026-10-18：日志里「点击会话后标题栏未确认」一天 17 次，每次都要
+        #   白等一轮才成功 —— 微信切会话要加载消息、重绘聊天区，固定 0.6 秒
+        #   经常不够，但直接拉长又会让「真被吞点击」的情况变得极慢）：
+        #     第一段 0.6 秒：绝大多数会话这时已切完，正常路径不变快也不变慢；
+        #     第二段再多等 ~1.5 秒：**只在第一段没读到时才补等**，纯增容错。
+        #   只加等待、不加点击次数 —— 多点是危险的（可能点进别的会话）。
         last_title = ""
         for attempt in (1, 2):
             if not self._click_abs(hwnd, hit["cx"], hit["cy"]):
                 return False, f"点击会话「{hit['text']}」失败"
             time.sleep(0.6)
             opened, title = self._current_chat_title(hwnd)
+            if not (opened and self._title_matches(target, title)):
+                # 界面可能还在重绘：补等一轮再看，别急着判失败
+                for _ in range(3):
+                    time.sleep(0.5)
+                    opened, title = self._current_chat_title(hwnd)
+                    if opened and self._title_matches(target, title):
+                        break
             last_title = title
             if opened and self._title_matches(target, title):
                 self._current = hit["text"]
