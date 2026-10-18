@@ -1142,6 +1142,193 @@ class TestScreenParse(GatewayCase):
         self.settle()
         self.assertEqual(self.received[-1].content, "新消息B")
 
+    # ---- 多屏长消息：一轮一轮往上补 --------------------------------------
+    #
+    # 用户 2026-10-18 原话：「1.6 屏不够，要 3 屏才够，有的消息很长的」。
+    # 旧实现只翻一次 62% 屏高、只拼两截，3 屏的正文会得到「第 1 屏 + 第 3 屏」，
+    # 中间那段被跳过，而日志一切正常 —— 是最难发现的那种丢失。
+    #
+    # 新实现：手机每收到一次 scroll 就翻一屏并重报一帧；电脑侧每轮把新露出的
+    # 那段对齐进全文，直到这条消息**顶边不再被切**（= 已经是第一屏）才收尾。
+
+    def _seg(self, tag: str, n: int = 30) -> str:
+        """造一段可辨识、且段与段之间不会偶然撞上重叠的正文。"""
+        return "".join(f"{tag}{i:03d}" for i in range(n))
+
+    def _three_screens(self):
+        """造一条 3 屏长消息的四段可见内容：``(第1屏, 第2屏, 第3屏, 首帧看到的)``。
+
+        ⚠ **相邻两屏必须真的重叠**（每段结尾 9 个字与下一段开头相同）。
+        手机每轮只翻 62% 屏高，重叠是设计使然，也是 `_align_fragment` 唯一的
+        对齐依据 —— 造几个首尾不相接的字符串，测的就不是真机形状了。
+        """
+        a = self._seg("A")
+        b = self._seg("B")
+        c = self._seg("C")
+        # ⚠ 每段 4 个字符（字母 + 三位数字），切片下标必须是 4 的倍数，
+        #   否则会把 "A004" 切成 "3A004" 这种残字，看起来像丢了一屏。
+        # s1 = A015..A029（结尾 A027A028A029 与 s2 开头重叠 9 字）
+        # s2 = A027..A029 + B000..B029
+        # s3 = B027..B029 + C000..C029
+        s1 = a[60:]                 # A015 起
+        s2 = a[108:] + b            # A027 起 + 第 2 屏
+        s3 = b[108:] + c            # B027 起 + 第 3 屏
+        # 首帧：手机停在最新处，只看到第 3 屏（最下面那截）
+        return s1, s2, s3, s3
+
+    def one_long(self, sender: str, top: int, bottom: int, body: str) -> str:
+        """**一条**长消息（单个正文节点）。
+
+        ⚠ 不能拿两个 ``long_row`` 拼同一屏来模拟「上下两段」：解析器按坐标把
+        相邻气泡归并成一条消息，两段会被拼成一条（y 顺序也不保证），测的
+        就不是真实形状了。真机上「一条消息被切成两段」只发生在**不同帧**里。
+        """
+        return (f'<node class="android.widget.LinearLayout" package="{self.PKG}" '
+                f'bounds="[60,{top}][1020,{bottom}]">'
+                f'<node text="{sender}" class="android.widget.TextView" '
+                f'package="{self.PKG}" bounds="[80,{top}][420,{top + 60}]"></node>'
+                f'<node text="{body}" class="android.widget.TextView" '
+                f'package="{self.PKG}" bounds="[80,{top + 70}][1000,{bottom - 10}]">'
+                f'</node></node>')
+
+    def test_three_screen_message_is_collected_over_rounds(self):
+        """3 屏长消息要一轮一轮补齐 —— 中间段不能丢，而且只发一条。
+
+        真机上的形状：每一轮手机只多露 0.6 屏，刚露出来的那屏**顶边仍被
+        切着**，电脑侧据此再要一次 scroll；直到某一轮顶边贴住列表上沿
+        （= 已经是第一屏）才收尾。第 2 屏就是在中间那几轮里补齐的。
+        """
+        s1, s2, s3, first_text = self._three_screens()
+
+        self.post_frame(self.screen(self.row("旧消息A", 200, "签收跟单专员")))
+        first = self.post_frame(self.screen(
+            self.row("旧消息A", 200, "签收跟单专员"),
+            self.one_long("履约跟单专员", 250, 3200, first_text)))
+        self.assertTrue(first.get("scroll"), "第一次见长消息就该请手机翻页")
+        self.assertEqual(first["messages"], 0)
+
+        # ① 第 1 轮：翻上来看到第 2 屏 + 第 3 屏开头，顶边仍被切 → 还要翻
+        r1 = self.post_fill(self.screen(
+            self.one_long("履约跟单专员", -100, 3200, s2)))
+        self.assertTrue(r1.get("scroll"), "顶边还切着就必须继续翻（否则中间段丢失）")
+        self.assertEqual(r1["messages"], 0, "没齐之前不许发半截")
+        self.settle()
+        self.assertEqual(self.received, [], "多轮补全期间不该有消息发出去")
+
+        # ② 第 2 轮：翻到顶，第 1 屏顶边贴住列表上沿 → 收尾，发一条完整的
+        r2 = self.post_fill(self.screen(
+            self.one_long("履约跟单专员", 200, 3200, s1)))
+        self.assertNotIn("scroll", r2, "已经到顶了还让手机翻 —— 会翻出历史")
+        self.assertEqual(r2["messages"], 1, "齐了应当发一条")
+        self.settle()
+        self.assertEqual(len(self.received), 1, "多轮补全只许投递一条")
+        got = self.received[0].content
+        self.assertIn("B010B011B012", got, "中间那一屏丢了")
+        self.assertTrue(got.startswith("A015A016A017"), f"开头不是第一屏：[{got[:30]}] len={len(got)}")
+        self.assertTrue(got.endswith("C027C028C029"), "结尾不是第三屏")
+
+    def test_five_screen_message_is_fully_collected(self):
+        """5 屏的正文（用户说「有的消息很长的」）也要一路补到第一屏。
+
+        每轮手机只多露 60% 屏高，5 屏要走 4~5 轮。这里按真机节奏一轮一轮喂，
+        最后一轮顶边贴住列表上沿才算齐 —— 而且自始至终只投递一条。
+        """
+        segs = [self._seg(chr(ord("A") + i)) for i in range(5)]   # A..E
+        overlap = 9
+        # 第 i 屏可见文本 = 上一屏尾巴 overlap 字 + 本屏全文
+        screens = []
+        for i, s in enumerate(segs):
+            head = segs[i - 1][-overlap:] if i else ""
+            screens.append(head + s)
+        last = screens[-1]
+
+        self.post_frame(self.screen(self.row("旧消息A", 200, "签收跟单专员")))
+        first = self.post_frame(self.screen(
+            self.row("旧消息A", 200, "签收跟单专员"),
+            self.one_long("履约跟单专员", 250, 3200, last)))
+        self.assertTrue(first.get("scroll"))
+
+        rounds = 0
+        # 手机从最下面一屏开始，每轮往上退一屏
+        for idx in range(len(screens) - 2, -1, -1):
+            rounds += 1
+            body = self.post_fill(self.screen(
+                self.one_long("履约跟单专员", 200 if idx == 0 else -100,
+                              3200, screens[idx])))
+            if idx > 0:
+                self.assertTrue(body.get("scroll"),
+                                f"第 {rounds} 轮顶边还切着，必须继续翻")
+                self.assertEqual(body["messages"], 0)
+            else:
+                self.assertNotIn("scroll", body, "到顶了还翻")
+                self.assertEqual(body["messages"], 1)
+        self.assertGreaterEqual(rounds, 4, "5 屏的正文轮数不该少到 4 以下")
+
+        self.settle()
+        self.assertEqual(len(self.received), 1, "始终只许投一条")
+        got = self.received[0].content
+        for i, s in enumerate(segs):
+            self.assertIn(s[:12], got, f"第 {i + 1} 屏的内容丢了")
+            self.assertIn(s[-9:], got, f"第 {i + 1} 屏的结尾丢了")
+        self.assertTrue(got.startswith(segs[0]), "开头不是第一屏")
+        self.assertTrue(got.endswith(segs[-1]), "结尾不是最后一屏")
+
+    def test_fill_rounds_are_capped(self):
+        """翻满上限就按现状投递，不许让手机无限翻。"""
+        body0 = self._seg("X")
+        self.post_frame(self.screen(self.row("旧消息A", 200, "签收跟单专员")))
+        self.post_frame(self.screen(
+            self.row("旧消息A", 200, "签收跟单专员"),
+            self.one_long("履约跟单专员", 250, 3200, body0)))
+        # 每轮都「顶边被切」且每轮都多一段新内容 —— 永远不判齐，
+        # 只能靠轮数上限收尾。
+        prev = body0
+        res = None
+        for i in range(1, 30):
+            tag = chr(ord("D") + (i % 20)) + "z"
+            nxt = self._seg(tag, 12) + prev
+            res = self.post_fill(self.screen(
+                self.one_long("履约跟单专员", -100, 3200, nxt)))
+            prev = nxt
+            if not res.get("scroll"):
+                break
+        self.assertIsNotNone(res)
+        self.assertFalse(res.get("scroll"), "手机被要求一直翻 —— 轮数上限没生效")
+        self.assertIn("轮数上限", res.get("note", ""))
+        self.settle()
+        self.assertEqual(len(self.received), 1, "到头来只发一条")
+        self.assertEqual(self.received[0].content, prev, "应当发攒到的最全版本")
+
+    def test_plain_frame_between_rounds_does_not_drop_the_long_message(self):
+        """补全中间夹一帧「没有截断也没有新消息」，不能把攒着的长消息清掉。
+
+        旧实现在这种帧上顺手 `_clear_long()`（理由是「用户可能划走了」）。
+        多轮补全要翻五六次，中间必然夹着手机翻页的中间态帧 —— 在那里清掉
+        等于前面几轮白翻，而且再也没人请手机继续翻。
+        """
+        s1, s2, s3, first_text = self._three_screens()
+        self.post_frame(self.screen(self.row("旧消息A", 200, "签收跟单专员")))
+        self.post_frame(self.screen(
+            self.row("旧消息A", 200, "签收跟单专员"),
+            self.one_long("履约跟单专员", 250, 3200, first_text)))
+        r1 = self.post_fill(self.screen(
+            self.one_long("履约跟单专员", -100, 3200, s2)))
+        self.assertTrue(r1.get("scroll"))
+
+        # 中间态帧：屏幕上还是最初那半截，既无新内容、也无截断提示
+        gap = self.post_frame(self.screen(
+            self.row("旧消息A", 200, "签收跟单专员")))
+        self.assertEqual(gap["messages"], 0)
+
+        # 接着翻：这一轮露到第一屏，顶边贴住 → 齐了
+        r2 = self.post_fill(self.screen(
+            self.one_long("履约跟单专员", 200, 3200, s1)))
+        self.assertNotIn("scroll", r2)
+        self.settle()
+        self.assertEqual(len(self.received), 1, "中间态帧把长消息弄丢了")
+        self.assertIn("A015", self.received[0].content)
+        self.assertIn("C020", self.received[0].content)
+
     # ---- H5 卡片「扣住待稳」 --------------------------------------------
     #
     # 真机事故（2026-10-17 拦截跟单日报）：机器人消息是 H5 卡片，内容分批

@@ -101,7 +101,19 @@ PROBE_MAX = 2
 # 长消息「攒齐再发」最多等多久（秒）。等不到补全帧就发手头那半截 ——
 # 手机没手势权限、用户在操作别的界面、群消息太快把前半截顶掉，都可能让
 # 补全永远不来。宁可发一条不完整的，也不能永远不发。
-LONG_WAIT_MAX = 25.0
+#
+# 2026-10-18 从 25 秒放到 45 秒：补全从「翻一次」变成「最多翻 6 次」，每次
+# 翻完要等界面安定 + 上报 + 排空缓冲，四五个来回就要十几秒。25 秒会在第
+# 3 屏还没翻到的时候就把半截放行 —— 而放行之后这条就再也补不回来了。
+LONG_WAIT_MAX = 45.0
+# 同一条长消息最多补几轮。每轮 = 手机往上翻一屏（约 0.6 屏高）。
+#
+# 用户 2026-10-18 原话：「1.6 屏不够，要 3 屏才够，有的消息很长的」。
+# 4 到 5 屏的正文轮数在 12 左右，但**不能让手机无限翻** —— 翻得越多，
+# 翻出几个月前历史消息的概率越大，那些会被当成长消息的一部分转进业务群。
+# 所以取 6：能稳稳覆盖 3~3.5 屏的正文（每轮 0.6 屏，两头还有重叠余量），
+# 再长的消息按「翻到第 6 轮为止」交付，宁可少一节，不灌历史。
+FILL_MAX_ROUNDS = 6
 # 看门狗多久检查一次「手机还在不在」（秒）。比心跳间隔（手机端 60s）小得多，
 # 所以失联的发现延迟最多是「心跳间隔 + 这个 tick」。
 OFFLINE_TICK = 10.0
@@ -170,6 +182,62 @@ def _join_fragments(head: str, tail: str, *, u_first: int = 0) -> str | None:
     for n in range(limit, 7, -1):
         if b.endswith(a[:n]):
             return b + a[n:]
+    return None
+
+
+# 判断「新截出来的一段接在全文的哪一头」时，最少要重叠几个字才算数。
+# 和 `_join_fragments` 里的 8 对齐：比这更短的重叠容易偶然撞上（中文里
+# 「的」「了」这种高频字两端凑巧相同是常事），撞上就会把顺序接反，
+# 结果是一段顺序错乱的正文 —— 比缺一段更难发现。
+_ALIGN_MIN = 8
+
+
+def _align_fragment(known: str, fresh: str) -> tuple[str, str] | None:
+    """把新截出来的一段正文对齐到已拼好的全文上。拼不上返回 ``None``。
+
+    返回 ``(新全文, 方向)``，方向是 ``"up"``（这一段接在上面）或
+    ``"down"``（接在下面）。
+
+    ── 为什么不直接用 `_join_fragments`
+    `_join_fragments(head, tail)` 回答的是「怎么拼成一段」，但它**假定了谁在
+    上谁在下**（先试 head 结尾 = tail 开头，再试反向）。补全是多轮的：第 2 轮
+    新露出的那截可能在全文上面（继续往上翻），也可能在下面（手机翻回来时列表
+    底部又露出了新的），方向必须由调用方从**内容**判断出来，不能猜。
+    猜错的后果是正文顺序错乱，而且拼出来照样「像一段完整的话」。
+
+    判据按可靠性排序：
+      ① 完全相同 / 互为包含 —— 取长的那个（没长进也算对齐，方向沿用）；
+      ② 已知全文的**结尾**出现在新段**开头** → 新段在下面；
+      ③ 已知全文的**开头**出现在新段**结尾** → 新段在上面；
+      ④ 新段**整个落在**已知全文中间 → 没长进，原样返回（不算失败）。
+
+    ①②③④ 都不成立就是拼不上（多半不是同一条消息，或者中间漏了一整屏）。
+    此时**绝不硬拼** —— 拼出来的是一段顺序错乱的正文，比缺一段更难发现。
+
+    ── ④ 为什么必须有
+    多轮补全里，某几轮手机只多露一点点，新段可能整段都落在已经攒好的全文
+    里面（完全被覆盖）。判成「拼不上」的话，这一轮被记成「没有进展」，连续
+    两轮就会被当成「翻不动了」提前收尾 —— 而实际上再翻一轮还能接着补。
+    """
+    a, b = (known or "").strip(), (fresh or "").strip()
+    if not a:
+        return (b, "down") if b else None
+    if not b:
+        return a, "down"
+    if a == b:
+        return a, "down"
+    if a in b:
+        return b, "down"            # 新段把已知全文整个包含了，更全
+    if b in a:
+        return a, "down"            # 新段落在已知全文里，没长进（见 ④）
+
+    limit = min(len(a), len(b))
+    for n in range(limit, _ALIGN_MIN - 1, -1):
+        if a.endswith(b[:n]):
+            return a + b[n:], "down"
+    for n in range(limit, _ALIGN_MIN - 1, -1):
+        if b.endswith(a[:n]):
+            return b + a[n:], "up"
     return None
 
 
@@ -764,11 +832,33 @@ class _Ctx:
     # 用户的原话是「内容特别长的消息转发还是有问题」。
     #
     # 改成「攒」：第一次见长消息不发，只请手机翻一屏；等补全帧回来，
-    # 把「上半截 + 下半截」拼成一条再投。long_key 记住在等哪一条（用指纹），
-    # long_like 存第一次见到的那半截，long_at 是开始等的时刻（超时就放行）。
+    # 把「上半截 + 下半截」拼成一条再投。long_tail 存第一次见到的那半截。
+    #
+    # 2026-10-18：从「一个 dict」改成「一个**整体状态**」——
+    #   · rounds  已经补了几轮（每次翻一屏算一轮，上限 FILL_MAX_ROUNDS）；
+    #   · head    目前拼出来的全文（每轮归并后更新，不丢中间段）；
+    #   · tail    最初见到的那半截（屏幕上最下面那段），每轮都要重新和它
+    #             对位置 —— 因为全文里还没盖到它也说不定；
+    #   · top_seen 上一轮帧里有没有「顶边被切掉」的单元。还在切 = 上面还有
+    #             内容 → 继续翻。这一条是**唯一**的停手判据。
+    #
+    # 为什么必须多轮：用户原话「1.6 屏不够，要 3 屏才够」。一次只翻 62% 屏高，
+    # 3 屏的正文要翻四五轮才露全，而旧结构（一个只有两个槽的 dict）只有
+    # 「上半截 + 下半截」两个槽，第三屏中间那段根本没有地方放。
     long_key: str = ""
-    long_like: dict | None = None
     long_at: float = 0.0
+    long_rounds: int = 0
+    long_head: str = ""                     # 全文（按每轮目击顺序对出来的）
+    long_order: str = "down"                # "down" = 后写的在下；"up" = 在上
+    long_tail: str = ""                     # 最初见到的那半截
+    long_sender: str = ""
+    long_kind: str = ""
+    long_top_seen: bool = False
+    long_exhausted: bool = False            # 已经翻到顶 / 翻不动了
+    # 每轮补全里「按发送者归并后的最佳版本」。不放进 long_head 直接拼 ——
+    # 手机每轮只多露 0.6 屏，同一段正文会在相邻两轮里各出现一次，必须先
+    # 按内容重叠把它们对齐，再决定新露出来的是「上面的一段」还是「下面的一段」。
+    long_frags: list = field(default_factory=list)
     long_blocked: set = field(default_factory=set)
     companies: list[str] = field(default_factory=list)
     on_message: MessageHandler | None = None
@@ -1267,18 +1357,60 @@ class _Handler(BaseHTTPRequestHandler):
             # 补全帧只**挪锚点**、不做常规判定：它的新内容在锚点上方，喂给
             # FrameDiffer 等于白翻（实测「新增 0 条」）。
             #
-            # 但在捡「从没见过的新单元」之前，**先看它是不是刚才那条长消息的
-            # 前半截** —— 是的话拼成一条发，而不是把前半截当成一条新消息。
-            merged = self._merge_long(frame)
-            if merged is not None:
-                pending, note, _ = self._ingest_fill(frame)
-                differ.note_scroll(frame.units)
-                self._clear_long()
-                # 拼齐了就别再发那半截，只发拼好的完整消息。
-                return [merged], "长消息补全", False
+            # 这一帧承载两件事，顺序不能换：
+            #   ① 把「刚才那条长消息」又露出来的那段接进全文（_merge_long）；
+            #   ② 捡起屏上其它从没见过的新内容（_ingest_fill）—— 锚点丢失时
+            #      被挤掉的那条消息就靠这一步捡回来。
+            #
+            # 长消息**攒齐之前不许把它当新消息发**：多轮补全期间每一帧都会
+            # 看到它，发出去就是「第 1 段 → 第 12 段 → 完整版」连着好几条刷屏
+            # （旧实现里的「残句 + 完整消息」就是这么来的）。
+            c = self.ctx
+            progressed = False
+            if c.long_head:
+                progressed = self._merge_long(frame) is not None
             pending, note, _ = self._ingest_fill(frame)
             differ.note_scroll(frame.units)
-            return pending, note, False
+
+            out = list(pending)
+            extra_note = note
+            want_more = False
+            if c.long_head:
+                c.long_rounds += 1
+                if self._long_settled(frame):
+                    done = self._long_done("已经翻到顶（顶边不再被切）")
+                    if done is not None:
+                        out.append(done)
+                    extra_note = "长消息补全"
+                elif c.long_rounds >= FILL_MAX_ROUNDS:
+                    done = self._long_done(
+                        f"翻满 {FILL_MAX_ROUNDS} 轮仍没到顶，按现状投递")
+                    if done is not None:
+                        out.append(done)
+                    extra_note = "长消息补全（已到轮数上限）"
+                elif self._long_timed_out():
+                    done = self._long_done("等待超时")
+                    if done is not None:
+                        out.append(done)
+                    extra_note = "长消息补全（已超时）"
+                elif not progressed and c.long_rounds >= 2:
+                    # 连着两轮一个字都没多 —— 再翻也是白翻（常见原因：手机
+                    # 已经到列表顶、或者这条消息被后面的新消息顶走了）。别让
+                    # 手机空翻，把已补到的发出去。
+                    done = self._long_done("连续两轮没有新内容，停止翻页")
+                    if done is not None:
+                        out.append(done)
+                    extra_note = "长消息补全（翻不动了）"
+                else:
+                    # 上面还有内容：请手机**接着往上翻**。这是多轮补全的核心
+                    # ——手机端每收到一次 scroll 就翻一屏并重报一帧，直到我们
+                    # 不再下发为止。
+                    want_more = True
+                    extra_note = f"长消息补全中（第 {c.long_rounds} 轮）"
+                    log.info("安卓画面解析：长消息还没露全（已 %d 字，第 %d/%d 轮），"
+                             "请手机继续上翻", len(c.long_head), c.long_rounds,
+                             FILL_MAX_ROUNDS)
+            return out, extra_note, want_more
 
         # ── H5 卡片：不再在这里扣住 ─────────────────────────────────
         # 钉钉机器人消息是 H5 卡片，节点坐标常年是坏的（frame.garbled），而且
@@ -1397,43 +1529,50 @@ class _Handler(BaseHTTPRequestHandler):
         作为**一条新消息**又发了一遍。群里看到的是「残句 → 完整消息」，
         用户的原话是「内容特别长的消息转发还有问题」。
 
-        改成「攒」：先把这条扣住不发，只请手机翻一屏；补全帧回来时由
-        ``_merge_long`` 拼成一条再投。等不到（超时 ``LONG_WAIT_MAX``）才放行
-        手头这半截 —— 宁可发一条不完整的，也不能永远不发。
+        改成「攒」：先把这条扣住不发，只请手机翻页；补全帧回来时由
+        ``_merge_long`` 一轮一轮接进全文。等不到（超时 ``LONG_WAIT_MAX``）
+        或翻满 ``FILL_MAX_ROUNDS`` 轮才按现状放行 —— 宁可发一条不完整的，
+        也不能永远不发。
         """
         why = needs_scroll(frame)
         if not (why and new):
-            # 这一帧没有截断，且之前扣着的长消息如果还挂着（用户可能已经
-            # 划走了），顺手清掉，免得下一次误拼到别的消息上。
-            if self.ctx.long_like:
-                self._clear_long()
+            # ⚠ 这里**不能**顺手把攒着的长消息清掉。
+            #   旧实现清掉的理由是「用户可能已经划走了」。但多轮补全要翻
+            #   五六次，中间必然夹着「这一帧没有截断、也没有新消息」的帧
+            #   （手机翻页的中间态、系统通知插队、列表还没停稳）。
+            #   在这种帧上清掉 = 前面几轮白翻，而且不会再有人请手机继续翻，
+            #   长消息就永远停在「攒了 2 屏」的状态直到 45 秒超时。
+            #   真正该清的地方只有两处：攒齐/翻满/超时（`_long_done`），
+            #   或者补全帧里确认已经换了话题（见 `_ingest_fill`）。
             return new, "", False
 
         sus, rest = self._long_suspects(new, frame)
         if not sus:
             log.warning("安卓画面解析：%s —— 这一屏新转的消息可能不完整，"
-                        "已请手机往上翻一屏补全", why)
+                        "已请手机往上翻页补全", why)
             return new, "消息可能不完整", True
 
         # 只攒**最下面那条**（最新的那条长消息）：上面那些已经被后面的消息
-        # 挤过去了，翻一屏也补不到它们的前半截。
+        # 挤过去了，翻页也补不到它们的前半截。
         target = sus[-1]
+        c = self.ctx
         # ⚠ 顺序不能反：**先判超时，再记住这条**。
         #   反过来写的话，同一条长消息每上报一帧都会被 `_remember_long` 把
         #   `long_at` 重置成「现在」，elapsed 永远是 0，超时这条路一辈子走
         #   不到 —— 手机会在「翻上去、翻回来」之间无限来回，消息永远不发。
         #   这正是 `test_long_message_sent_once_when_fill_never_comes` 抓到的
         #   那个 bug（`LONG_WAIT_MAX` patch 成 0 仍然返回「待补全」）。
-        if self.ctx.long_like and self.ctx.long_key == target.fp \
-                and self._long_timed_out():
-            log.warning("安卓画面解析：长消息等了 %.0f 秒还没补齐，"
-                        "按现状投递（可能只有后半截）", LONG_WAIT_MAX)
-            self._clear_long()
-            log.warning("安卓画面解析：%s —— 这一屏新转的消息可能不完整", why)
-            return new, "消息可能不完整", True
+        if c.long_head and c.long_key == target.fp and self._long_timed_out():
+            log.warning("安卓画面解析：长消息等了 %.0f 秒还没补齐，按现状投递"
+                        "（可能只有后半截，共 %d 字）", LONG_WAIT_MAX,
+                        len(c.long_head))
+            done = self._long_done("等待超时")
+            out = ([done] if done is not None else []) + list(rest)
+            return out, "消息可能不完整", True
 
-        if not self.ctx.long_like or self.ctx.long_key != target.fp:
-            self._remember_long(target, why)
+        if not c.long_head or c.long_key != target.fp:
+            top_cut = min(target.y0, target.y1) < frame.view[1] - 12
+            self._remember_long(target, why, top_cut=top_cut)
 
         # ⚠ 扣住这条长消息时，**锚点必须退回它之前**。
         #   调用方在这之前已经 commit 过（把锚点推到了本帧结尾 = 长消息本身）。
@@ -1444,7 +1583,7 @@ class _Handler(BaseHTTPRequestHandler):
         #   退回「长消息之前最后一条」之后，长消息每次上报都仍然是"新消息"，
         #   攒齐/超时两条路都能正常走到。
         before = [u for u in frame.units if u.fp != target.fp
-                  and u.y1 <= target.y0]
+                  and max(u.y0, u.y1) <= min(target.y0, target.y1)]
         if before:
             differ.commit(before)
         # 其余正常消息照发，不因为一条长消息把整批都压住。
@@ -1590,56 +1729,140 @@ class _Handler(BaseHTTPRequestHandler):
             (sus if u.fp in cut else rest).append(u)
         return sus, rest
 
-    def _remember_long(self, unit, reason: str) -> None:
-        """记下「正在等这条长消息的前半截」。"""
-        key = unit.fp
-        self.ctx.long_key = key
-        self.ctx.long_like = {"sender": unit.sender, "content": unit.content,
-                              "kind": unit.kind}
+    def _remember_long(self, unit, reason: str,
+                       *, top_cut: bool = False) -> None:
+        """开始攒一条长消息：记下最初见到的半截，等手机翻页补全。"""
+        self.ctx.long_key = unit.fp
+        self.ctx.long_sender = unit.sender
+        self.ctx.long_kind = unit.kind
+        self.ctx.long_tail = unit.content or ""
+        self.ctx.long_head = self.ctx.long_tail
+        self.ctx.long_frags = [self.ctx.long_tail] if self.ctx.long_tail else []
+        self.ctx.long_order = "down"
+        self.ctx.long_rounds = 0
+        self.ctx.long_top_seen = top_cut
+        self.ctx.long_exhausted = False
         self.ctx.long_at = time.monotonic()
         log.info("安卓画面解析：这条消息没显示全（%s，现有 %d 字）—— 先不发，"
-                 "请手机往上翻一屏取前半截", reason, len(unit.content))
+                 "请手机往上翻页取前半截（最多 %d 轮）",
+                 reason, len(unit.content), FILL_MAX_ROUNDS)
 
     def _merge_long(self, frame) -> object | None:
-        """补全帧里找「刚才那条长消息」，把两截拼成一条。
+        """把这一帧里「刚才那条长消息」的可见部分归并进攒着的全文。
 
-        拼接规则：**谁在上面谁在前**。真机上长消息的前半截在上、后半截在下，
-        但手机只翻了 62% 高度，两块之间可能重叠 —— 所以不能简单相加，
-        要么前缀重叠就接上、要么整段包含就取长的。
+        返回 ``None`` = 这一帧没让全文变长（可能压根没看到它，也可能只是
+        同一段又露了一遍）。调用方靠返回值判「这一轮有没有收获」，**不靠它判
+        「补完了没有」** —— 由 ``_long_settled`` 按「顶边还切不切」定。
+
+        ── 多轮累积（2026-10-18）
+        旧版本只拼两截（攒住的那半截 + 帧里最长的候选），所以一条 3 屏的正文
+        只能得到「第 1 屏 + 第 3 屏」，中间那段没有地方放 —— 而屏幕上已经
+        翻过去了，事后再也拿不回来，日志还全绿。用户原话「1.6 屏不够，
+        要 3 屏才够，有的消息很长的」。
+
+        现在改成：每轮把「本帧里同一发送者的**所有候选逐个**拿去对齐」，取能
+        拼出最长全文的那个，再判它接在全文的哪一头。重叠的部分自然被吃掉，
+        中间段一轮一轮补齐。
+
+        ── 两个不能省的细节
+        ① **不能只取本帧里最长的那段**。补全帧里同一条长消息通常有两块：上面
+           那块是新翻上来的（内容更多，但因为顶部被切而**短**），下面那块是
+           原本就在屏上的半截（文字更多）。按长度取最长的会稳定选中下面那块
+           —— 它当然能对齐（它就是已攒的那段），于是「本轮没有进展」，手机
+           白翻一屏，第 2 屏永远补不上。真机原型日志：
+           `已攒 220 字 / 新的 40 字 ... 对不上，忽略`。
+        ② 攒住的 ``long_tail`` 不能丢：手机翻回底部后屏幕上又是最初那半截，
+           它会被 ``_align_fragment`` 认成「已知全文的一部分」，长度不变、
+           全文不乱。这样来回翻也不会把已经补齐的正文弄丢。
         """
-        like = self.ctx.long_like
-        if not like:
+        c = self.ctx
+        if not c.long_head:
             return None
-        ns = norm_sender(like["sender"])
-        # ⚠ 补全帧里**同一条长消息会出现两次**：先是翻上来的前半截（更全），
-        #   下面是原本那半截（就是 `like["content"]` 本身）。逐个比对时后者
-        #   会拼出「原样不动」，如果让循环里最后一条覆盖前面的结果，就会
-        #   拿着没变化的那条去判「没拼上」→ 返回 None → 长消息永远补不齐。
-        #   所以要**收集全部候选、取拼出来最长的那个**。
+        ns = norm_sender(c.long_sender)
+        # ⚠ **不能只取本帧里最长的那一段**。补全帧里同一条长消息通常有两块：
+        #   上面那块是新翻上来的（内容更多，但因为顶部被切而**短**），
+        #   下面那块是原本就在屏上的半截（内容少，但节点高度大、文字反而多）。
+        #   按长度取「最长的」会稳定选中下面那块 —— 它当然能对齐（它就是
+        #   已攒的那段），于是「本轮没有进展」，手机白翻一屏，第 2 屏永远
+        #   补不上。真机日志：`已攒 220 字 / 新的 40 字 ... 对不上，忽略`。
+        #   所以必须**逐个候选都试一次对齐**，取能拼出最长全文的那个。
         best = None
         for u in frame.units:
             if norm_sender(u.sender) != ns:
                 continue
-            merged = _join_fragments(like["content"], u.content, u_first=u.y0)
-            if merged is None:
+            text = (u.content or "").strip()
+            if not text:
                 continue
-            if best is None or len(merged) > len(best[1]):
-                best = (u, merged)
+            got = _align_fragment(c.long_head, text)
+            if got is None:
+                continue
+            if best is None or len(got[0]) > len(best[1][0]):
+                best = (u, got)
         if best is None:
+            # 整个帧里跟已攒的那段都拼不上：多半是中间漏了一整屏（同一屏里
+            # 翻得太多），或者这个人恰好又发了另一条长消息。**不硬拼** ——
+            # 硬拼出来的是一段顺序错乱的正文，比缺一段更难被发现。
+            log.info("安卓画面解析：补全帧里同发送者的正文跟已攒的（%d 字）"
+                     "对不上，本轮忽略", len(c.long_head))
             return None
-        u, text = best
-        # 拼出来的一模一样 = 这一帧看到的还是同一条后半截（没补到东西）。
-        # ⚠ 判据只能是「完全相同」，**不能写成 `len(text) <= len(old)`**：
-        #   补全帧里若前半截把后半截整个包含了（翻得够远时很常见），
-        #   `_join_fragments` 走「取长的」分支，长度可能正好相等，
-        #   用长度判就会把一条**已经完整**的消息当成没拼上而永远不发。
-        if text == like["content"]:
-            return None
-        unit = Unit(sender=u.sender or like["sender"], content=text,
-                    kind=like["kind"] or "text", y0=u.y0, y1=u.y1)
-        log.info("安卓画面解析：长消息已拼齐 —— %d 字 + %d 字 → %d 字，投递 1 条",
-                 len(like["content"]), len(u.content), len(text))
-        return unit
+        u, (merged, direction) = best
+        before = len(c.long_head)
+        c.long_head = merged
+        if len(c.long_head) > before:
+            if direction != c.long_order and c.long_rounds:
+                # 方向翻转 = 之前一直在往上翻，这次新内容出现在下面（手机
+                # 往下滚了 / 用户自己动了屏幕）。记一笔，排障时能看出来。
+                log.info("安卓画面解析：长消息补全方向变成「%s」"
+                         "（之前是「%s」）", direction, c.long_order)
+            c.long_order = direction
+            log.info("安卓画面解析：长消息第 %d 轮补全 —— %d → %d 字（接在%s）",
+                     c.long_rounds + 1, before, len(c.long_head),
+                     "上面" if direction == "up" else "下面")
+        return Unit(sender=c.long_sender or u.sender, content=c.long_head,
+                    kind=c.long_kind or "text", y0=u.y0, y1=u.y1)
+
+    def _long_settled(self, frame) -> bool:
+        """这一轮补完之后，长消息已经齐了吗？
+
+        ── 判据只能看「顶边还切不切」
+        唯一可靠的信号是：**这条消息在屏幕顶端还有没有内容被挡住**。还在挡
+        （``y0 < top``）= 上面还有，继续翻；贴顶了 = 已经是第一屏，齐了。
+
+        几条容易踩反的分支：
+          · 手机上翻到顶（列表滚到头）时，钉钉把 bounds 裁到可视区内，
+            ``y0`` 正好等于 ``top`` —— 这时也判「齐了」。这是对的：再翻也
+            没有了。翻到顶的副作用是第一屏那些旧消息会露出来，但
+            ``_ingest_fill`` 只在**锚点上方**捡内容、且带指纹与文本去重兜着，
+            不会把历史灌进群（见「翻过头一条都不许发」那条用例）。
+          · 帧里根本没看到这条长消息 → 不判齐，走超时放行。多半是它被后面
+            新来的消息顶出了屏幕，这时说「齐了」是瞎猜。
+        """
+        c = self.ctx
+        ns = norm_sender(c.long_sender)
+        unit = self._find_in_frame(frame, ns)
+        if unit is None:
+            return False
+        _, top, _, _ = frame.view
+        y0 = min(unit.y0, unit.y1)
+        still_cut = y0 < top - 12        # 12px 吃掉气泡圆角与滚动惯性
+        c.long_top_seen = still_cut
+        return not still_cut
+
+    @staticmethod
+    def _find_in_frame(frame, ns: str):
+        """本帧里这个发送者**最高的那个**单元（数组不保证按 y 排序）。
+
+        ⚠ 必须自己比 y，不能取第一个命中的：补全帧里同一条长消息的两段
+        都在，第一个命中的可能是下面那半截（贴底、看起来像「不切」），
+        于是会误判成「齐了」，中间那段永远补不上。
+        """
+        best = None
+        for u in frame.units:
+            if norm_sender(u.sender) != ns:
+                continue
+            if best is None or min(u.y0, u.y1) < min(best.y0, best.y1):
+                best = u
+        return best
 
     def _long_timed_out(self) -> bool:
         """等了太久还没等到补全 —— 放行，发手头这半截。
@@ -1649,13 +1872,41 @@ class _Handler(BaseHTTPRequestHandler):
 
         `>=` 而不是 `>`：等待上限为 0 时必须立刻放行。写成 `>` 时
         「`monotonic()` 差刚好等于 0」这一瞬间会被判成没超时，全量跑测试时
-        偶发命中（单跑不复现，因为两次调用之间总隔了几微秒）。
+        偶发命中（单跑不复现，因为两次调用之间总隔几微秒）。
         """
         return (time.monotonic() - self.ctx.long_at) >= LONG_WAIT_MAX
+
+    def _long_done(self, why: str) -> object | None:
+        """结束攒齐，返回「按现状能发的那个版本」。
+
+        任何一条收尾路径（齐了 / 轮数用完 / 超时 / 翻不动了）都走这里，
+        保证 **已经补到多少就发多少**，不会因为「没齐」就把辛苦补来的
+        中间段丢掉。
+        """
+        c = self.ctx
+        text = c.long_head or c.long_tail
+        sender = c.long_sender
+        kind = c.long_kind or "text"
+        self._clear_long()
+        if not text:
+            return None
+        log.info("安卓画面解析：长消息收尾（%s）—— 共 %d 字，投递 1 条",
+                 why, len(text))
+        return Unit(sender=sender, content=text, kind=kind, y0=0, y1=0)
+
     def _clear_long(self) -> None:
-        self.ctx.long_key = ""
-        self.ctx.long_like = None
-        self.ctx.long_at = 0.0
+        c = self.ctx
+        c.long_key = ""
+        c.long_at = 0.0
+        c.long_rounds = 0
+        c.long_head = ""
+        c.long_order = "down"
+        c.long_tail = ""
+        c.long_sender = ""
+        c.long_kind = ""
+        c.long_top_seen = False
+        c.long_exhausted = False
+        c.long_frags = []
 
     def _emit(self, units: list) -> int:
         """把消息单元**归并进缓冲**，返回收下的条数。

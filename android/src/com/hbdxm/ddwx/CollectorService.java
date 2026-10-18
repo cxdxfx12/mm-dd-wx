@@ -357,8 +357,20 @@ public class CollectorService extends AccessibilityService {
 
     // -------------------------------------------------------------- 长消息补全
 
-    /** 同一屏最多补一次。重复补会把屏幕来回拉，还可能把基线搞乱。 */
+    /**
+     * 已经连续补了几轮（每轮 = 往上翻一屏）。
+     *
+     * <p>2026-10-18 之前是「同一屏最多补一次」（用 md5 记账），因为那时电脑侧
+     * 只拼两截，翻多了没地方放。用户反馈「1.6 屏不够，要 3 屏才够，有的消息
+     * 很长的」之后改成多轮：电脑侧每轮判「这条长消息的顶边还被切着」就再下发
+     * 一次 scroll，手机翻一屏报一帧，直到电脑侧不再要为止。
+     *
+     * <p>所以这里的防抖从「同一屏只补一次」换成「转圈保护」：连续两轮翻完
+     * 手机上看到的还是同一屏内容（md5 一样），说明已经到列表顶了、翻不动了，
+     * 立刻停下 —— 否则会和电脑侧的轮数上限赛跑，白翻十几次。
+     */
     private String filledFor = "";
+    private int fillRounds = 0;
 
     /**
      * 正在补全中。补全会自己触发一串无障碍事件（滚动、重绘），
@@ -373,20 +385,23 @@ public class CollectorService extends AccessibilityService {
      * 可视区）在 Python 那边有现成的解析和回归测试，手机端再写一份必然会漂移。
      * 手机只做「听话」这一件事。
      *
-     * <p>三个必须守住的点：
+     * <p>四个必须守住的点：
      * <ol>
      *   <li><b>翻完一定要回来</b> —— 不回来基线就错位，表现为锚点丢失、整屏停转；</li>
      *   <li><b>回来后重置 sentMd5</b> —— 否则回到原位时 md5 跟 sentMd5 相同，
      *       新消息不会被发现（实际不会同，但留一手更稳）；</li>
-     *   <li><b>同一屏不重复补</b> —— 用触发时的 md5 记账。</li>
+     *   <li><b>不能无限翻</b> —— 电脑侧有轮数上限（<code>FILL_MAX_ROUNDS</code>），
+     *       手机侧再用「连续两轮同屏」兜一道；</li>
+     *   <li><b>补全帧本身不再触发补全</b> —— 靠 {@link #filling}，
+     *       否则一次 scroll 会递归出一串。</li>
      * </ol>
      */
     private void maybeFillTruncated(String resp, String token) {
         if (!resp.contains("\"scroll\"")) {
+            // 电脑侧不再要补全 = 这条长消息已经收尾，轮数清零，下一个从头算
+            fillRounds = 0;
+            filledFor = "";
             return;
-        }
-        if (lastMd5.equals(filledFor)) {
-            return;                       // 这一屏已经补过
         }
         if (!filling.compareAndSet(false, true)) {
             return;                       // 上一次补全还没收尾
@@ -453,7 +468,19 @@ public class CollectorService extends AccessibilityService {
     }
 
     private void doFillTruncated(String token) {
+        // 转圈保护：翻完这一屏，如果画面上来的还是和上一轮完全一样的内容，
+        // 说明已经到列表顶（或这一屏根本滚不动），再翻也是白翻。
+        // ⚠ 这一条不能省：电脑侧的轮数上限是 6，手机要是真到顶了还在翻，
+        //   就是六次白滑 —— 每次 700ms，期间读到的都是中间态帧。
+        boolean stuck = lastMd5.equals(filledFor) && fillRounds > 0;
         filledFor = lastMd5;
+        if (stuck) {
+            fillRounds = 0;
+            lastResult += " ｜ 已到列表顶部，不再上翻";
+            return;
+        }
+        fillRounds++;
+
         AccessibilityNodeInfo root = safeRoot();
         if (root == null) {
             return;
@@ -488,7 +515,7 @@ public class CollectorService extends AccessibilityService {
         }
         // 回到原位后画面必然还是老样子，把指纹清掉让下一帧照常上报。
         sentMd5 = "";
-        lastResult += " ｜ 已上翻一屏补全长消息并复位";
+        lastResult += " ｜ 已上翻一屏补全长消息并复位（第 " + fillRounds + " 轮）";
     }
 
     /** 把「当前这一屏」原样发上去（不判重、不动 sentMd5 —— 由调用方决定）。 */
