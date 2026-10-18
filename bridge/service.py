@@ -19,6 +19,7 @@ from .notify import (DingTalkNotifier, SYSTEM_PREFIX, in_hhmm_window,
                      install_alert_handler)
 from .router import Router
 from .storage import Storage
+from .table_image import render_message
 from .targets import build_target
 from .targets.base import Target
 
@@ -107,7 +108,48 @@ class BridgeService:
                 self._consec_fail += 1
                 log.error("投递失败 → %s | %s", tgt, result.detail)
                 self._alert_delivery_fail(tgt, result.detail)
+
+            # ---- 表格转图片（文字照发，表格补一张图）----
+            # 用户 2026-10-18 选定：钉钉卡片表格在微信里没有原生类型，转成
+            # PNG 补发。文字失败时**不补图**（会话都打不开，图更发不出）。
+            # 图片走 send_image —— 目标不支持（旧实现/其它平台）就跳过，
+            # 不算失败：文字已经发到了，表格图片是锦上添花。
+            if result.ok and self.cfg.wechat.table_image:
+                png = render_message(text, out_dir=self._table_png_dir(),
+                                     key=msg.uid, title=msg.sender_name)
+                if png is not None:
+                    self._throttle()
+                    try:
+                        r2 = self.target.send_image(tgt, str(png))
+                    except AttributeError:
+                        log.debug("投递端不支持发图片，跳过表格图：%s", tgt)
+                    except Exception:               # noqa: BLE001
+                        log.exception("表格图片投递异常（不影响文字）")
+                    else:
+                        self.storage.log_delivery(
+                            msg.uid, tgt, "ok" if r2.ok else "fail",
+                            f"表格图: {r2.detail}")
+                        if r2.ok:
+                            log.info("表格图片已投递 → %s（%s）", tgt, png.name)
+                        else:
+                            log.warning("表格图片投递失败 → %s | %s",
+                                        tgt, r2.detail)
         return True
+
+    def _table_png_dir(self) -> str:
+        """表格图片的落盘目录：跟数据库同一个目录下的 table-png/。
+
+        放在数据目录而不是临时目录：发送失败时用户还能手动把图翻出来发。
+        """
+        import tempfile
+        from pathlib import Path
+
+        base = Path(self.cfg.resolve(self.cfg.storage.db_path)).parent
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            return str(base / "table-png")
+        except OSError:
+            return tempfile.gettempdir()
 
     def _alert_delivery_fail(self, target: str, detail: str) -> None:
         """连续失败达到阈值才告警 —— 偶发一次多半是微信弹窗抢焦点，不值得打扰人。"""

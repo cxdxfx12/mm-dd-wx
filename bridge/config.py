@@ -68,6 +68,11 @@ class WeChatConfig:
     ocr_verify: bool = True                 # 发送后回读截图校验（检测发出气泡）
     ocr_keep_clipboard: bool = True         # 用完恢复用户原有剪贴板内容
     ocr_match_threshold: float = 0.62       # 会话名匹配阈值，低于此值拒发
+    # ---- 表格转图片 ----
+    # 钉钉卡片里的表格在微信没有原生类型；开着时把「列名: 值 ｜ 列名: 值」
+    # 形态的表格行画成 PNG、在文字消息之后补发一张图。文字照常发，图片
+    # 失败不影响文字（见 service.handle）。关掉就完全回到纯文字。
+    table_image: bool = True
 
 
 @dataclass

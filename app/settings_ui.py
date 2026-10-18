@@ -364,6 +364,8 @@ class SettingsDialog:
         w = self.cfg.get("wechat") or {}
 
         self.st["dry_run"] = tk.BooleanVar(value=bool(w.get("dry_run", True)))
+        self.st["table_image"] = tk.BooleanVar(
+            value=bool(w.get("table_image", True)))
         self.st["interval"] = tk.StringVar(value=str(w.get("interval", 3)))
         self.st["hotkey"] = tk.StringVar(
             value=str(w.get("show_hotkey") or "{Ctrl}{Alt}w"))
@@ -437,6 +439,12 @@ class SettingsDialog:
                                                           pady=(10, 2))
         _tip(box, "首次使用建议先开着（当前配置就是），确认识别到的内容无误后取消勾选，"
                   "再点「开始运行」就是真实转发了。").pack(fill="x", padx=14)
+        ttk.Checkbutton(box, text="钉钉卡片里的表格转成图片发到微信",
+                        variable=self.st["table_image"]).pack(anchor="w", padx=14,
+                                                              pady=(2, 2))
+        _tip(box, "微信没有表格消息类型。开着时，识别到表格（如「小件员名称: xx ｜ "
+                  "票数: 1票 ｜ 单号: xx」）会把表格画成一张图，在文字之后补发。"
+                  "文字照常发，图片失败不影响文字。").pack(fill="x", padx=14)
         grid = tk.Frame(box, bg=CARD)
         grid.pack(fill="x", padx=14, pady=(8, 12))
         self._spin(grid, 0, "钉钉轮询间隔（秒）", self.st["poll"], 3, 60,
@@ -1072,6 +1080,8 @@ class SettingsDialog:
         S("wechat", "dry_run", bool(self.st["dry_run"].get()), after="interval")
         S("wechat", "interval", interval, after="dry_run")
         S("wechat", "show_hotkey", hotkey, after="wxauto_path")
+        S("wechat", "table_image", bool(self.st["table_image"].get()),
+          after="show_hotkey")
 
         # ---- 钉钉通知 ----
         S("notify", "enabled", n_enabled)

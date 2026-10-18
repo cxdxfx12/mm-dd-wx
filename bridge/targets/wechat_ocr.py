@@ -81,10 +81,18 @@ kernel32.GlobalUnlock.restype = wt.BOOL
 kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
 kernel32.GlobalFree.restype = ctypes.c_void_p
 
+# 剪贴板贴图（CF_DIB）
+user32.GetClipboardData.argtypes = [wt.UINT]          # 已声明，重申给读者
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+
 PW_RENDERFULLCONTENT = 0x00000002
 DIB_RGB_COLORS = 0
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
+# 剪贴板贴图用：CF_DIB（设备无关位图）。微信输入框 Ctrl+V 认它。
+# 不用 CF_DIBV5 / PNG 格式：实测微信对 CF_DIB 的兼容最好。
+CF_DIB = 8
+BI_RGB = 0
 
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
@@ -856,6 +864,140 @@ class WeChatOcrTarget(Target):
             user32.SetClipboardData(CF_UNICODETEXT, ctypes.c_void_p(h))
         finally:
             user32.CloseClipboard()
+
+    # ---------- 贴图 ----------
+
+    def _put_clipboard_image(self, img) -> bool:
+        """把 PIL Image 以 CF_DIB 写进剪贴板。
+
+        DIB 的结构 = BITMAPINFOHEADER + 像素（自下而上的 BGRX 行序）。
+        PIL 自带 ``ImageWin.Dib`` 能干这事，但它的构造要 HWND 且老版本行为
+        不一 —— 手工组内存更可控：32 行代码，换来对每个字节的确切了解。
+
+        ⚠ 24 位图每行要 4 字节对齐，32 位（BGRX）天然对齐，所以统一转 RGB
+        后直接按 32 位写，别为了省内存用 24 位 —— 那个 stride 计算是本模块
+        两次 access violation 的来源。
+        """
+        from PIL import Image
+
+        w, h = img.size
+        rgba = img.convert("RGB")
+        # BGRX：每像素 4 字节，行序自下而上（biHeight 为正）
+        rows = []
+        for y in range(h - 1, -1, -1):          # 底行在前
+            row = bytearray()
+            px = rgba.load()
+            for x in range(w):
+                r, g, b = px[x, y][:3]
+                row += bytes((b, g, r, 0))
+            rows.append(bytes(row))
+        pixels = b"".join(rows)
+        header_size = 40                        # BITMAPINFOHEADER
+        total = header_size + len(pixels)
+
+        hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, total)
+        if not hmem:
+            return False
+        p = kernel32.GlobalLock(hmem)
+        if not p:
+            kernel32.GlobalFree(hmem)
+            return False
+        try:
+            # BITMAPINFOHEADER（40 字节，小端）
+            import struct
+
+            bi = struct.pack(
+                "<IiiHHIIiiII",
+                40,             # biSize
+                w,              # biWidth
+                h,              # biHeight（正 = 底行在前）
+                1,              # biPlanes
+                32,             # biBitCount
+                BI_RGB,         # biCompression
+                len(pixels),    # biSizeImage
+                0, 0, 0, 0,     # 分辨率与颜色表
+            )
+            ctypes.memmove(p, bi, header_size)
+            ctypes.memmove(p + header_size, pixels, len(pixels))
+        finally:
+            kernel32.GlobalUnlock(hmem)
+
+        if not user32.OpenClipboard(0):
+            kernel32.GlobalFree(hmem)
+            return False
+        try:
+            user32.EmptyClipboard()
+            if not user32.SetClipboardData(CF_DIB, ctypes.c_void_p(hmem)):
+                kernel32.GlobalFree(hmem)       # 转移失败自己释放
+                return False
+            # 成功后所有权归系统，不再 GlobalFree
+        finally:
+            user32.CloseClipboard()
+        return True
+
+    def send_image(self, target: str, image_path: str) -> SendResult:
+        """把一张本地图片发进会话（复制图 → Ctrl+V → 发送）。
+
+        与 send_text 共用「切窗口 → 开会话 → 点输入框 → 粘贴 → 发送 →
+        回读校验」这条主流程，只在「放什么进剪贴板」和「怎么校验」两处
+        分岔 —— 文本校验靠 OCR 出正文，图片校验只看绿色气泡出现
+        （OCR 认不出图里的内容，硬认就是自欺）。
+        """
+        from PIL import Image
+
+        if not target:
+            return SendResult(False, target, "目标为空")
+        path = Path(image_path)
+        if not path.is_file():
+            return SendResult(False, target, f"图片不存在：{image_path}")
+        try:
+            img = Image.open(path)
+            img.load()
+        except Exception as exc:
+            return SendResult(False, target, f"图片读取失败：{exc}")
+        if self.dry_run:
+            print(f"[dry-run] 发送图片到「{target}」: {image_path}")
+            return SendResult(True, target, "dry-run 未真实发送")
+        try:
+            return self._send_image_live(target, img)
+        except Exception as exc:
+            log.exception("OCR 图片投递失败")
+            return SendResult(False, target, f"{type(exc).__name__}: {exc}")
+
+    def _send_image_live(self, target: str, img) -> SendResult:
+        hwnd = self._find_window()
+        if not hwnd:
+            return SendResult(False, target,
+                              "未找到微信主窗口，请确认微信已登录且在桌面上")
+        if not self._activate(hwnd):
+            return SendResult(False, target,
+                              "无法把微信窗口切到前台（可能被系统禁止抢占焦点）")
+        self._ensure_layout_safe(hwnd)
+        ok, detail = self._open_chat(hwnd, target)
+        if not ok:
+            return SendResult(False, target, detail)
+        if not self._click(hwnd, *_LAYOUT["input"]):
+            return SendResult(False, target, "点击输入框失败")
+        time.sleep(0.2)
+        # 图片模式下不清输入框：Ctrl+A 在图和字混排时会连字一起选中再删，
+        # 其实清不清都一样（粘贴图会替换选区），跳过少一次按键风险。
+        if not self._put_clipboard_image(img):
+            return SendResult(False, target, "写入剪贴板（图片）失败")
+        time.sleep(0.1)
+        self._press(VK_V, ctrl=True)
+        time.sleep(0.4)          # 图片比文本粘贴慢，微信要解码
+        if not self._click(hwnd, *_LAYOUT["send_btn"]):
+            self._press(VK_RETURN)
+        time.sleep(self.send_delay)
+        if not self.verify:
+            return SendResult(True, target, "已发送图片（未校验）")
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            frame = self._grab(hwnd)
+            if frame is not None and self._has_outgoing_bubble(frame):
+                return SendResult(True, target, "已发送图片（检测到发出气泡）")
+            time.sleep(0.4)
+        return SendResult(False, target, "发送图片后未检测到气泡，请人工确认")
 
     # ---------- 回读校验 ----------
 
