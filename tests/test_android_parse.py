@@ -1108,11 +1108,26 @@ class TestClipped(unittest.TestCase):
         self.assertEqual(clipped_units(f), [])
         self.assertEqual(needs_scroll(f), "")
 
+    # 现场存档里**确实**被屏幕切掉的那几帧。判据见 clipped_units：
+    # 121909 那条消息 h=1753，正好等于可视区高度（265~2018）——
+    # 一条消息占满整屏，在手机上不可能「一屏正好装下」，它必然是被切开的。
+    # 旧用例断言「所有存档帧都不该报截断」，等于把这个真实缺陷锁进了测试里。
+    KNOWN_CLIPPED = {"screen-20261017_121909.xml"}
+
     def test_every_real_frame_is_clean(self):
-        """现场存下来的每一帧都不该被判定为截断。"""
+        """现场存档帧：该报的报、不该报的一个都不许误报。
+
+        误报的代价是手机会白滑一屏（还打乱锚点）；漏报的代价是长消息只转
+        后半截 —— 后者是用户实际反馈的问题（「内容特别长的消息转发还是有问题」），
+        所以两个方向都要守住。
+        """
         for path in sorted((BASE / "data").glob("screen-*.xml")):
             raw = path.read_text(encoding="utf-8", errors="replace")
             f = parse_frame(raw)
+            if path.name in self.KNOWN_CLIPPED:
+                self.assertTrue(clipped_units(f),
+                                f"{path.name} 是满屏长消息，应当报截断")
+                continue
             self.assertEqual(clipped_units(f), [], f"{path.name} 误报截断")
 
 

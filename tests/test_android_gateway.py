@@ -22,6 +22,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 from urllib.parse import quote
 
 from bridge.config import Config, DingTalkConfig, RouteConfig, StorageConfig, WeChatConfig
@@ -1048,21 +1049,51 @@ class TestScreenParse(GatewayCase):
             return json.loads(resp.read().decode("utf-8"))
 
     def test_fill_frame_delivers_the_upper_part(self):
-        """上翻后锚点上方的内容要真的转发出去，且已发过的不重复发。"""
-        self.post_frame(self.screen(self.row("旧消息A", 400, "签收跟单专员")))
-        self.post_frame(self.screen(self.row("旧消息A", 400, "签收跟单专员"),
-                                    self.long_row("履约跟单专员", 700, 3200)))
-        self.assertEqual([m.content for m in self.received], ["很长的正文……"])
+        """长消息攒齐后**只发一条完整的**，不是「半截 + 前半截」两条。
 
-        body = self.post_fill(self.screen(
-            self.long_row("前半截", 300, 1200, body="这是被切掉的前半截"),
+        旧行为是先发半截、补全帧再把前半截当新消息发一条 —— 群里看到的是
+        「残句 → 完整消息」（用户原话「内容特别长的消息转发还是有问题」）。
+        新行为：第一次见长消息不发，只请手机翻一屏；补全帧回来拼成一条投递。
+        """
+        self.post_frame(self.screen(self.row("旧消息A", 400, "签收跟单专员")))
+
+        # 第一眼：屏幕上只有后半截（"很长的正文……"）。**不发**，只要求补全。
+        first = self.post_frame(self.screen(
+            self.row("旧消息A", 400, "签收跟单专员"),
             self.long_row("履约跟单专员", 700, 3200)))
-        self.assertEqual(body["note"], "补全帧")
-        self.assertEqual(body["messages"], 1)
-        self.assertEqual(self.received[-1].content, "这是被切掉的前半截")
-        # 长消息本身不能因为补全再发第二遍
-        self.assertEqual(
-            sum(1 for m in self.received if m.content == "很长的正文……"), 1)
+        self.assertTrue(first.get("scroll"), "长消息没让手机补全")
+        self.assertEqual(first["messages"], 0, "半截长消息不该先发出去")
+        self.assertEqual(self.received, [], "半截长消息先发了 —— 群里会出现残句")
+
+        # 补全帧:上半截 + 屏幕上的后半截。两块有重叠，要拼成一条。
+        body = self.post_fill(self.screen(
+            self.long_row("履约跟单专员", 300, 1200,
+                          body="这是被切掉的前半截，很长的正文……"),
+            self.long_row("履约跟单专员", 700, 3200)))
+        self.assertEqual(body["messages"], 1, "补全后应当发一条完整的")
+        self.assertEqual(len(self.received), 1, "补全不该额外多发一条")
+        self.assertEqual(self.received[0].content, "这是被切掉的前半截，很长的正文……")
+
+    def test_long_message_sent_once_when_fill_never_comes(self):
+        """补全始终不来（手机没手势权限等）时，超时后仍要发出去。
+
+        宁可发一条不完整的，也不能永远不发 —— 这是「攒齐再发」的兜底。
+        """
+        self.post_frame(self.screen(self.row("旧消息A", 400, "签收跟单专员")))
+        self.post_frame(self.screen(
+            self.row("旧消息A", 400, "签收跟单专员"),
+            self.long_row("履约跟单专员", 700, 3200)))
+        self.assertEqual(self.received, [])
+
+        # 模拟「已经等超时了」：把上限设成负数，则 `elapsed > 负数` 恒成立。
+        # ⚠ 别写成 0.0 配 `>` —— elapsed 恰好等于 0 的那一瞬会被判「没超时」，
+        #   全量跑时偶发失败、单跑又不复现，是最难查的那种抖动。
+        with mock.patch("bridge.sources.android_gateway.LONG_WAIT_MAX", -1.0):
+            body = self.post_frame(self.screen(
+                self.row("旧消息A", 400, "签收跟单专员"),
+                self.long_row("履约跟单专员", 700, 3200)))
+        self.assertEqual(body["messages"], 1, "超时后必须放行")
+        self.assertEqual(len(self.received), 1)
 
     def test_fill_frame_with_unknown_anchor_is_dropped(self):
         """翻过头（对不上锚点）时一条都不许发 —— 那是历史消息。"""

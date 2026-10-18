@@ -95,6 +95,11 @@ BUBBLE_RID_RE = re.compile(
 # 这种半截行不该被转发 —— 内容可能不全，而且它多半早就发过了。
 MIN_ROW_HEIGHT = 60
 
+# 一条消息的高度达到「可视区高度」的这个比例，就认定它被切开了（见
+# `clipped_units` 的第 ③ 条）。取 0.95 而不是 1.0：真机上行级 bounds 会被
+# 裁剪到可视区，正好等于可视高度时常见，但也会差几个像素。
+FULL_SCREEN_RATIO = 0.95
+
 # 昵称后面会跟一个单独的「机器人」标签（机器人账号发消息时）。库里存的昵称
 # 不该带它 —— 指纹那边也会把尾部的「机器人」去掉，这里提前对齐，展示才一致。
 ROBOT_TAG_RE = re.compile(r"\s+机器人$")
@@ -709,60 +714,92 @@ def _table_rows(nodes: list[Node]) -> list[list[str]]:
     if len({b[0] for b in boxes}) < 3:
         return []
 
-    # 按行中心聚类。真机上同一行的格子 y 会差几十像素（网格自己没对齐：
-    # 表头 659~770、数据 810~869），但同一行的格子**垂直区间一定互相重叠**，
-    # 所以用「与行内已有盒子重叠」作为同行判据，不能用固定容差。
-    boxes.sort(key=lambda b: (b[1] + b[3]) / 2)
-    rows: list[list[tuple]] = []
-    for b in boxes:
-        placed = False
-        for r in reversed(rows[-3:]):               # 只看最近几行，避免误并
-            if any(min(b[3], x[3]) - max(b[1], x[1]) > 0 for x in r):
-                r.append(b)
-                placed = True
-                break
-        if not placed:
-            rows.append([b])
-
-    # 行内只按 left 排序 —— 真机上格子的 right 全被裁剪成屏幕宽度（都报 964），
-    # 左边界才是可信的列位置（实测 250 / 702 / 1154 …，每列递增 452）。
-    grid = [sorted(r, key=lambda b: b[0]) for r in rows]
-
-    # ⚠ 不能拿「列数最多的那一行」当表头 —— 气泡顶部那几个节点（头像、
-    # 昵称、"机器人"角标、正文首段）y 都在同一水平线上，会被聚成一行 4 列的
-    # "伪表头"，把真正的表头挤到后面去。真机 16:31 那张三列表就是这么被
-    # 判成「不是表格」的（整条消息连带表格压成一大坨纯文本）。
+    # ── 按「列起点」分组，再在组内按纵向位置排行 ────────────────
     #
-    # 可靠判据是**列起点**：表格的行里跑的是同一组 x（每一列左边界固定），
-    # 而正文/标题那一行是「靠左对齐的几句话」，x 各不相同。所以：
-    # 找出现次数最多的列起点组合，只有它的 x 集合与某行**完全一致**时，
-    # 那一行才算表格行。
-    def _sig(row: list[tuple]) -> tuple[int, ...]:
-        return tuple(b[0] for b in row)
+    # ⚠ H5 卡片的 y 坐标**不能用来聚行**：实测 top 恒为 265（列表顶），
+    # bottom 才是真实的下沿，而且同一条消息里它们不是单调的（-1470 → 877）。
+    # 早期版本按「垂直区间重叠」聚行，结果表格 5 行全被并成 1 行 ——
+    # 因为每个格子都横跨 265，互相都"重叠"。
+    #
+    # 真正稳定的信号是 **left**：同一列的所有格子 left 完全相同
+    # （实测 250 / 702 / 1154 …每列 +452）。所以先把格子按 left 分组成
+    # 「列」，每列内部按真实纵向位置（min/max 归一化后的下沿）排序，
+    # 第 i 列的第 n 个格子就是第 n 行的第 i 列 —— 行列一次对齐。
+    # ── 先找出「真正的表格列」─────────────────────────────────
+    #
+    # 判据不是「这一列有几格」，而是「它和其他列**在同一水平线上并排**」。
+    # 正文（left=212）在整条消息里是孤零零的一列，跟谁都不并排；
+    # 表格的列则每行都有 3~10 个格子落在几乎相同的 y 上。
+    #
+    # 踩过的坑：早期按「≥2 格」留列，两张正文（left 都是 212）被并成一个
+    # "2 格列"，于是「上面一句话 / 下面一句话」被当成两行一列的表，正文被
+    # 塞进单元格（`test_body_around_the_table_is_kept`）。
+    by_col: dict[int, list[tuple]] = {}
+    for b in boxes:
+        by_col.setdefault(b[0], []).append(b)
 
-    tally: dict[tuple[int, ...], int] = {}
-    for row in grid:
-        if len(row) >= 3:
-            tally[_sig(row)] = tally.get(_sig(row), 0) + 1
-    if not tally:
-        return []
-    # 出现最多的签名 = 表格主体的列布局；一样多时取列数多的那个。
-    main = max(tally, key=lambda s: (tally[s], len(s)))
-    if tally[main] < 2:
-        # 只有一行是这个列布局 —— 孤零零的一行三列，多半是正文里恰好
-        # 排了三个词，不是表格。宁可漏也不要把正文拆成「列名: 值」。
-        return []
-    body = [row for row in grid if _sig(row) == main]
+    def _row_peers(cell: tuple) -> int:
+        """这一格同一水平线上还有几个别的格子（按 y 区间重叠算）。"""
+        n = 0
+        for l, v in by_col.items():
+            if l == cell[0]:
+                continue
+            for o in v:
+                if min(cell[3], o[3]) - max(cell[1], o[1]) > 0:
+                    n += 1
+                    break
+        return n
 
-    # 表头：紧挨在表格主体**上方**、列数同样是 len(main) 的那一行。
-    # （真机上表头和数据行的 x 完全对齐，只是文字不同。）
-    first_at = grid.index(body[0])
-    head = None
-    for row in reversed(grid[:first_at]):
-        if len(row) == len(main):
-            head = row
-            break
-    return ([head] + body) if head else body
+    cols: dict[int, list[tuple]] = {}
+    for l, v in by_col.items():
+        if len(v) < 2:
+            continue
+        v = sorted(v, key=lambda b: b[3])
+        # 这一列里至少有一半格子与其他列并排 → 它属于表格。
+        peers = sum(1 for b in v if _row_peers(b) >= 2)
+        if peers * 2 < len(v):
+            continue
+        cols[l] = v
+    if len(cols) < 3:
+        return []
+
+    # 表格的列长度（行数）应当一致；取出现最多的那个长度当表体行数。
+    len_tally: dict[int, int] = {}
+    for v in cols.values():
+        len_tally[len(v)] = len_tally.get(len(v), 0) + 1
+    n_rows = max(len_tally, key=lambda k: (len_tally[k], k))
+    if n_rows < 2:
+        return []
+    # 参与表格的列：长度等于 n_rows（允许 ±0；短一格的列会被下面跳过）。
+    col_ids = sorted(l for l, v in cols.items() if len(v) == n_rows)
+    if len(col_ids) < 3:
+        return []
+    # 正文列的 left 是同一个值（实测 212），它会被当成"一列"且往往最长 ——
+    # 表格列 left 递增、间距稳定，用「与相邻列间距接近」再挡一道。
+    if len(col_ids) >= 3:
+        gaps = [col_ids[i + 1] - col_ids[i] for i in range(len(col_ids) - 1)]
+        med = sorted(gaps)[len(gaps) // 2] or 1
+        keep = [col_ids[0]]
+        for i, g in enumerate(gaps):
+            if 0.4 <= g / med <= 2.5:          # 间距同量级才算同一张表
+                keep.append(col_ids[i + 1])
+        col_ids = keep
+    if len(col_ids) < 3:
+        return []
+
+    grid = [[cols[l][r] for l in col_ids] for r in range(n_rows)]
+    # 表头：表格最上面那一行。判据不是位置，而是「这一行几乎都不是数字」
+    # —— 真机上周报的表头就是一堆中文列名，数据行至少有 left=250 那格是
+    # 网点名，但其余 9 格全是数字。表格至少要 2 行数据才成立，否则不要表头。
+    def _numeric(cell: tuple) -> bool:
+        s = (cell[4] or "").strip()
+        return bool(s) and sum(ch.isdigit() for ch in s) >= max(1, len(s) // 2)
+
+    if len(grid) >= 3:
+        head = grid[0]
+        if sum(_numeric(c) for c in head) <= len(head) // 3:
+            return grid
+    return grid
 
 
 def _render_table(grid: list[list[tuple]]) -> str:
@@ -955,11 +992,24 @@ def clipped_units(frame: Frame, *, tol: int = 24) -> list[Unit]:
     发出去，微信群那边收到的就是半截话 —— 而且它每帧都「看起来一样」，
     下游还以为发全了。
 
-    判据（都用行级 bounds，真机上是准的）：
-      · 消息底边越过列表可视区下沿 —— 下面还有内容没露出来；
-      · 消息顶边高于列表可视区上沿 —— 上面还有内容被挡住了。
-    首尾两条天然会贴着边界（一屏正好切在消息中间），所以 ``tol`` 给一点余量：
-    只有**明显**越界才算，避免每条消息都触发滚动。
+    ── 只认「被切掉」，不认「贴边」─────────────────────────────
+    ⚠ 一条消息滚到列表顶端时，它的 ``y0`` 会**正好等于可视区上沿**（钉钉把
+    bounds 裁剪到可视区内）。这是「这条消息完整地滚到了顶」，**不是**被切掉
+    —— 真机存档 screen-20261017_121851 的那条（853px / 299 字）就是这样，
+    内容以「🙌」收尾、明显是完整的。早期版本把 ``y0 <= top`` 当截断证据，
+    结果每一屏最上面那条都误报，手机会白滑（实测旧用例
+    ``test_every_real_frame_is_clean`` 立刻抓到这个误报）。
+
+    所以判据只有两条，都要求「**确实超出了可视区**」：
+      ① **底边越过可视区下沿**（``y1 > bottom``）：下面还有内容没露出来；
+      ② **顶边高于可视区上沿**（``y0 < top``）：上面还有内容被挡住。
+
+    外加一条「自己就把可视区撑满」：``h >= 可视高度 * 0.95``。一条消息占满
+    整屏，在手机上不可能「一屏正好装下」—— 它必然是被切开的。这时上下两条
+    边都贴在可视区边界上，①② 都因「没有越界」而放过，只能靠这条认出来。
+    （真机存档 screen-20261017_191838 的 814 字那条：h=1753 正好等于可视高度。）
+
+    ``tol`` 只用来吃掉气泡圆角、滚动惯性带来的几像素浮动。
 
     返回空列表 = 这一屏的消息都是完整的，不需要滚动补全。
     """
@@ -968,10 +1018,14 @@ def clipped_units(frame: Frame, *, tol: int = 24) -> list[Unit]:
     _, top, _, bottom = frame.view
     if bottom - top <= 0:               # 拿不到可视范围时不猜，当作没截断
         return []
+    view_h = bottom - top
     out = []
     for u in frame.units:
         y0, y1 = min(u.y0, u.y1), max(u.y0, u.y1)
-        if y1 > bottom + tol or y0 < top - tol:
+        tall = (y1 - y0) >= view_h * FULL_SCREEN_RATIO
+        below = y1 > bottom + tol         # ① 下面还有
+        above = y0 < top - tol            # ② 上面还有（**严格小于**，不含贴边）
+        if tall or below or above:
             out.append(u)
     return out
 
