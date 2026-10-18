@@ -72,6 +72,26 @@ user32.OpenClipboard.restype = wt.BOOL
 user32.CloseClipboard.restype = wt.BOOL
 user32.EmptyClipboard.restype = wt.BOOL
 
+# ── 遮挡检测（`_occluded_points`）──
+# WindowFromPoint 收的是**按值传的 POINT 结构体**，不是指针；不声明 argtypes
+# 时 ctypes 会把两个 int 当两个独立参数传，栈上的值会被读错 → 拿到的 hwnd
+# 是随机的，表现为「随机说被遮挡」。这几个签名必须写死。
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", wt.LONG), ("y", wt.LONG)]
+
+
+user32.WindowFromPoint.argtypes = [_POINT]
+user32.WindowFromPoint.restype = ctypes.c_void_p
+user32.GetAncestor.argtypes = [ctypes.c_void_p, wt.UINT]
+user32.GetAncestor.restype = ctypes.c_void_p
+user32.GetForegroundWindow.restype = ctypes.c_void_p
+user32.BringWindowToTop.argtypes = [ctypes.c_void_p]
+user32.BringWindowToTop.restype = wt.BOOL
+user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, wt.UINT]
+user32.SetWindowPos.restype = wt.BOOL
+
 kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
 kernel32.GlobalAlloc.restype = ctypes.c_void_p
 kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
@@ -86,6 +106,18 @@ user32.GetClipboardData.argtypes = [wt.UINT]          # 已声明，重申给读
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 
 PW_RENDERFULLCONTENT = 0x00000002
+
+# ── 窗口层级（`_activate` 用来把被挡住的微信提到最前）──────────────
+# HWND_TOPMOST / HWND_NOTOPMOST 在 Win32 里是 ``(HWND)-1`` / ``(HWND)-2``，
+# 用 c_void_p 的补码形式传（别写成 -1，argtypes 声明的是 c_void_p）。
+HWND_TOPMOST = ctypes.c_void_p(-1)
+HWND_NOTOPMOST = ctypes.c_void_p(-2)
+GA_ROOT = 2
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+
 DIB_RGB_COLORS = 0
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
@@ -268,6 +300,14 @@ class WeChatOcrTarget(Target):
         if not self._activate(hwnd):
             return SendResult(False, target, "无法把微信窗口切到前台（可能被系统禁止抢占焦点）")
         self._ensure_layout_safe(hwnd)
+
+        # ⚠ **必须在这里查遮挡**：`_grab` 抓的是屏幕像素，窗口被压住一块就
+        #   抓到别人的画面，之后每一步都建立在错的识别上 —— 表现成「会话列表
+        #   里找不到目标（相似度 0.14）」这种像识别失败的假象，白跑一遍点击，
+        #   还可能点到被压住位置下面的别的窗口上。
+        free, why = self._ensure_unoccluded(hwnd)
+        if not free:
+            return SendResult(False, target, why)
 
         # 1. 切到目标会话
         ok, detail = self._open_chat(hwnd, target)
@@ -505,7 +545,7 @@ class WeChatOcrTarget(Target):
         return r.left, r.top, r.right, r.bottom
 
     def _activate(self, hwnd: int) -> bool:
-        """把微信切到前台并确保可见。
+        """把微信切到前台并确保**没被别的窗口挡住**。
 
         微信 4.x 有三种「看不见」形态，全部要处理：
         1. 最小化（IsIconic）→ SW_RESTORE；
@@ -514,6 +554,23 @@ class WeChatOcrTarget(Target):
         3. 正常可见 → 只补前台。
         ⚠ PrintWindow 在窗口不可见时抓出来是**纯黑图**，OCR 全空，
         所以发送前必须确认 IsWindowVisible。
+
+        ── 为什么光 SetForegroundWindow 不够（2026-10-18 用户报「被挡住一点
+        就投递失败」）────────────────────────────────────────────────
+        `_grab()` 走的是 `ImageGrab.grab(bbox=窗口矩形)`，抓的是**屏幕像素**，
+        不是窗口自己的内容。窗口只要被压住一块，那块抓到的就是别人的画面。
+        而 `SetForegroundWindow` 有两道坎：
+
+          ① **前台锁**：当前前台属于别的进程时，系统**静默拒绝**，只在任务
+             栏闪一下，返回值也没法信。所以调完必须**回读**
+             `GetForegroundWindow()` 确认前台真的是 hwnd，不是就换招。
+          ② **置顶窗口**：即便切到前台，`HWND_TOPMOST` 的窗口照样压在它上面
+             （常见：各种悬浮球、录屏框、聊天工具的小窗），
+             `GetForegroundWindow()` 还会说是微信 —— 只看它照样误判。
+
+        所以这里做三级兜底：SetForegroundWindow → 校验 → (`BringWindowToTop`
+        + `SetWindowPos(NOACTIVATE/TOP`) → 再校验。最后交给 :meth:`_grab`
+        的**画面自检**兜底（遮挡到像素级仍能发现），不指望这一层包打天下。
         """
         try:
             if not user32.IsWindowVisible(wt.HWND(hwnd)):
@@ -525,15 +582,121 @@ class WeChatOcrTarget(Target):
             if user32.IsIconic(wt.HWND(hwnd)):
                 user32.ShowWindow(wt.HWND(hwnd), 9)          # SW_RESTORE
                 time.sleep(0.3)
+
             user32.SetForegroundWindow(wt.HWND(hwnd))
             time.sleep(self.focus_delay)
-            if not user32.IsWindowVisible(wt.HWND(hwnd)):
-                log.error("微信窗口 SW_SHOW 后仍不可见，画面会抓成黑图")
-                return False
-            return True
+            if self._is_foreground(hwnd):
+                return self._check_visible(hwnd)
+
+            # ── 兜底：前台锁拒了，或者被置顶窗口压着 ──────────────
+            # BringWindowToTop 对 belonging-to-same-thread 的窗口有效，
+            # 跨进程常被无视；真正管用的是 SetWindowPos(SWP_NOACTIVATE)。
+            # 用 NOACTIVATE 是刻意的：不抢焦点也能把它提到最前，
+            # 少干扰用户正在敲的东西。
+            log.info("微信没能切到前台（前台是 hwnd=%s），改用置顶兜底",
+                     user32.GetForegroundWindow())
+            user32.BringWindowToTop(wt.HWND(hwnd))
+            user32.SetWindowPos(
+                wt.HWND(hwnd), wt.HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+            # 立刻摘掉 topmost，否则微信会一直压着用户的窗口 ——
+            # 这个程序是长期后台跑的，绝不能把用户的桌面搞成「微信永远在最前」。
+            user32.SetWindowPos(
+                wt.HWND(hwnd), wt.HWND_NOTOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            user32.SetForegroundWindow(wt.HWND(hwnd))
+            time.sleep(self.focus_delay)
+            if not self._is_foreground(hwnd):
+                log.warning("微信仍不是前台窗口（当前 hwnd=%s）—— 抓帧可能抓到"
+                            "其它窗口的画面，交给画面自检判断",
+                            user32.GetForegroundWindow())
+            return self._check_visible(hwnd)
         except Exception as exc:
             log.warning("激活微信窗口失败：%s", exc)
             return False
+
+    @staticmethod
+    def _is_foreground(hwnd: int) -> bool:
+        """当前前台是不是这个窗口（含它的子窗口）。"""
+        try:
+            fg = user32.GetForegroundWindow()
+            if not fg:
+                return False
+            if fg == hwnd:
+                return True
+            # 前台可能是微信的某个子窗口 / 弹出层，向上找到顶层再比
+            return user32.GetAncestor(wt.HWND(fg), GA_ROOT) == hwnd
+        except Exception:                       # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _check_visible(hwnd: int) -> bool:
+        if not user32.IsWindowVisible(wt.HWND(hwnd)):
+            log.error("微信窗口 SW_SHOW 后仍不可见，画面会抓成黑图")
+            return False
+        return True
+
+    # ---------- 遮挡检测 ----------
+
+    def _occluded_points(self, hwnd: int) -> list[tuple[int, int]]:
+        """窗口矩形里被**别的窗口**压住的采样点（空 = 没被挡）。
+
+        为什么需要这个：``_grab`` 是 ``ImageGrab.grab(bbox=窗口矩形)``，
+        抓的是**屏幕像素**。窗口被压住一块，那块抓到的就是别人的画面，
+        OCR 随之全错 —— 但流程不会报错，只会表现为「会话列表里找不到目标
+        （相似度 0.14）」「标题栏读到别的东西」这类**看起来像识别问题**的
+        假象。2026-10-18 用户报「被挡住一点就投递失败」就是这个。
+
+        判据用 ``WindowFromPoint`` 而不是比对像素：它直接回答「这个屏幕坐标
+        上最顶层的窗口是谁」，不受主题/深色模式/缩放影响。点落在微信自己的
+        子窗口上也返回那个子窗口 —— 所以要 `GetAncestor(GA_ROOT)` 归到顶层
+        再比。
+
+        采样点刻意避开窗口最外圈（阴影/圆角）与标题栏最右上（可能是别家的
+        悬浮按钮），取**内容区**的几个关键位置：会话列表、聊天区、输入框。
+        """
+        r = self._rect(hwnd)
+        if not r:
+            return []
+        left, top, right, bottom = r
+        w, h = right - left, bottom - top
+        if w <= 0 or h <= 0:
+            return []
+        # 相对坐标（0~1）：左侧会话列表、右上标题栏、中间聊天区、底部输入框
+        probes = ((0.10, 0.10), (0.50, 0.05), (0.10, 0.50),
+                  (0.60, 0.50), (0.60, 0.90))
+        bad: list[tuple[int, int]] = []
+        for fx, fy in probes:
+            x = left + int(w * fx)
+            y = top + int(h * fy)
+            try:
+                at = user32.WindowFromPoint(_POINT(x, y))
+            except Exception:                    # noqa: BLE001
+                continue
+            if not at:
+                continue
+            try:
+                root = user32.GetAncestor(wt.HWND(at), GA_ROOT)
+            except Exception:                    # noqa: BLE001
+                root = at
+            if (root or at) != hwnd:
+                bad.append((x, y))
+        return bad
+
+    def _ensure_unoccluded(self, hwnd: int) -> tuple[bool, str]:
+        """确保没被挡住；挡了就再顶一次，还不行就如实报错。"""
+        bad = self._occluded_points(hwnd)
+        if not bad:
+            return True, ""
+        log.info("微信窗口有 %d 处被别的窗口压着（如 %s），再顶一次",
+                 len(bad), bad[0])
+        self._activate(hwnd)
+        bad = self._occluded_points(hwnd)
+        if not bad:
+            return True, ""
+        return False, (f"微信窗口被其它窗口遮挡（{len(bad)} 处，如坐标 "
+                       f"{bad[0]}）—— 抓到的画面不是微信，请关掉挡在微信前面的"
+                       f"窗口后重试")
 
     # ---------- 截图 ----------
 
