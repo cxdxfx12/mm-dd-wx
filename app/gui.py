@@ -89,6 +89,7 @@ _ensure_tkinter()
 
 import tkinter as tk                                    # noqa: E402
 from tkinter import messagebox, filedialog, ttk         # noqa: E402
+from tkinter import font as tkfont                       # noqa: E402
 
 import cfgfile                                          # noqa: E402
 import icon                                             # noqa: E402
@@ -111,6 +112,16 @@ AMBER = "#d99000"
 RED = "#e5484d"
 HEADER_BG = "#1e2a4a"
 HEADER_BG2 = "#2b3a67"
+
+# ---- 主按钮（开始运行 / 停止）的禁用态 ----
+# 设计原则：**能不能点，靠「实心 vs 空心」区分，不靠颜色深浅**。
+#   可用   → 实心彩底 + 白字（唯一强调色，视线落点）
+#   不可用 → 浅灰底 + 中灰字 + 细边框（"按钮存在但按不动"）
+# 早先的做法是「把颜色调淡」（浅蓝 #9db8e8 / 浅粉 #eeb4b6）当禁用态，
+# 结果两个按钮同屏都是彩色实心块，既没有主次、也看不出谁不能点。
+BTN_DISABLED_BG = "#f1f3f7"
+BTN_DISABLED_FG = "#9aa3b8"
+BTN_DISABLED_BORDER = "#dde2ec"
 
 F_UI = ("Microsoft YaHei UI", 10)
 F_SMALL = ("Microsoft YaHei UI", 9)
@@ -199,6 +210,10 @@ class App(tk.Tk):
         self._refresh_env_chips()
         self._apply_cfg_to_ui()
         self._start_db_loop()
+        # 启动即刷新一次按钮态：默认 state=idle，此时「开始运行」应为实心蓝、
+        # 「停止」应为灰色空心。不刷的话首帧停在 `_accent_btn()` 给的实心红 —
+        # 用户会看到一个「停止」可点但点了没用的假象，正好是本次要修的那个毛病。
+        self._refresh_state()
         if not gui_ok:
             self._log("⚠ 未找到带 tkinter 的解释器（不应出现，界面仍在运行）", "warn")
         if with_check:
@@ -246,16 +261,62 @@ class App(tk.Tk):
         st.configure("BG.TLabel", background=BG, foreground=TEXT, font=F_UI)
 
     def _accent_btn(self, parent, text: str, command, color: str,
-                    active: str) -> tk.Button:
-        """实心彩色按钮。
+                    active: str, width: int = 0) -> tk.Button:
+        """实心彩色按钮（可用态）。
 
         不用 ttk.Button：vista 主题会忽略 background，样式配置出来是白底白字。
+
+        禁用态由 `_paint_btn()` 统一绘制（浅灰底 + 中灰字 + 细边框），
+        这里只负责可用态的外观。
+
+        `width>0` 时锁死按钮像素宽，避免换文案（▶→··）时按钮伸缩抽搐。
+        注意 tk.Button 的 width 单位是「字符」，且 tk 内部按「字宽预算」而非
+        实际渲染宽度换算 —— 未挂到父容器前 winfo_reqwidth() 拿到的不是像素。
+        所以这里不二次校正，直接按 (px − 固定内边距) / 实测单字宽 求字符数。
         """
-        return tk.Button(parent, text=text, command=command, bg=color, fg="#ffffff",
-                         activebackground=active, activeforeground="#ffffff",
-                         relief="flat", bd=0, font=("Microsoft YaHei UI", 10, "bold"),
-                         padx=15, pady=8, cursor="hand2",
-                         disabledforeground="#e8ecf4")
+        btn = tk.Button(parent, text=text, command=command, bg=color, fg="#ffffff",
+                        activebackground=active, activeforeground="#ffffff",
+                        relief="flat", bd=0, font=("Microsoft YaHei UI", 10, "bold"),
+                        padx=15, pady=8, cursor="hand2",
+                        disabledforeground=BTN_DISABLED_FG)
+        if width:
+            try:
+                unit = tkfont.Font(font=("Microsoft YaHei UI", 10, "bold")
+                                   ).measure("0") or 1
+                inner = width - 15 * 2 - 2      # 减 padx*2 与边框/highlight
+                btn.configure(width=max(1, round(inner / unit)))
+            except Exception:
+                pass
+        return btn
+
+    @staticmethod
+    def _paint_btn(btn: tk.Button, enabled: bool, color: str,
+                   active: str) -> None:
+        """按可用/禁用重绘主按钮。
+
+        ⚠ tk.Button 的 `disabled` 只管住点击，不改变底色 —— 必须手动重绘，
+        否则禁用按钮仍是实心彩色，用户以为能点（点下去没反应，更困惑）。
+
+        ⚠ 几何量（bd / highlightthickness / padx / pady）**两态必须完全一致**：
+        tk 按「文字 + padx*2 + bd*2 + highlightthickness*2」算请求尺寸，任何一项
+        在两态之间变化，按钮就会跳一下。所以两态都用 bd=1 + highlightthickness=1，
+        只是禁用态把 highlight 环染成边框色（视觉上当 1px 描边用）。
+        """
+        if enabled:
+            btn.configure(bg=color, fg="#ffffff", activebackground=active,
+                          activeforeground="#ffffff", relief="flat", bd=1,
+                          highlightthickness=1, highlightbackground=color,
+                          highlightcolor=color, cursor="hand2",
+                          padx=15, pady=8)
+        else:
+            btn.configure(bg=BTN_DISABLED_BG, fg=BTN_DISABLED_FG,
+                          activebackground=BTN_DISABLED_BG,
+                          activeforeground=BTN_DISABLED_FG,
+                          relief="solid", bd=1, cursor="arrow",
+                          highlightthickness=1,
+                          highlightbackground=BTN_DISABLED_BORDER,
+                          highlightcolor=BTN_DISABLED_BORDER,
+                          padx=15, pady=8)
 
     def _build_menu(self):
         """顶部菜单栏：让「设置」等入口更符合 Windows 软件的使用习惯。"""
@@ -526,10 +587,11 @@ class App(tk.Tk):
         inner = tk.Frame(bar2, bg=CARD)
         inner.pack(padx=14, pady=12)
 
+        # width 锁死像素宽：启动/停止的过渡态要换文案（▶→··），不锁会抽一下。
         self.btn_start = self._accent_btn(inner, "▶  开始运行", self.start_live,
-                                          ACCENT, ACCENT_DARK)
+                                          ACCENT, ACCENT_DARK, width=112)
         self.btn_stop = self._accent_btn(inner, "■  停止", self.stop_live, RED,
-                                         "#c93a3f")
+                                         "#c93a3f", width=88)
         self.btn_check = ttk.Button(inner, text="自 检", command=self.run_check)
         self.btn_preview = ttk.Button(inner, text="钉钉预览",
                                       command=self.dingtalk_preview)
@@ -839,27 +901,53 @@ class App(tk.Tk):
             self.v_elapsed.configure(text=f"{secs // 60:02d}:{secs % 60:02d}")
 
     def _refresh_state(self):
+        """刷新按钮可用态与运行指示灯。
+
+        按钮的视觉规则（三态）：
+        - 已停止：开始=实心蓝（唯一强调色）、停止=灰色空心（不可用）
+        - 运行中：开始=灰色空心（不可用）、停止=实心红（唯一强调色）
+        - 启动/停止中：两个都灰（此时正在切换，都不该点）
+
+        即**同一时刻只有一个实心彩色按钮**，用户不用思考就知道现在该点哪个。
+
+        文字也跟着换符号（▶→··／■→··），否则两个灰按钮同屏、指示灯又小，
+        用户点完会觉得「没反应」。像素宽已锁死（见 `_build_ui`），换字不伸缩。
+        """
         running = self.state == "running"
         busy = self._busy
-        self.btn_start.configure(state="normal" if not running and not busy
-                                 else "disabled")
-        self.btn_stop.configure(state="normal" if running else "disabled")
+        # 「检测中 / 正在停止」也算过渡态：此时点「开始」等于在旧进程还没退干净时
+        # 再起一个，故一并禁掉。旧代码只判 running，切状态那几百毫秒里按钮仍可点。
+        transient = self.state in ("checking", "stopping")
+        can_start = not running and not busy and not transient
+        can_stop = running and not busy
+
+        self.btn_start.configure(state="normal" if can_start else "disabled")
+        self.btn_stop.configure(state="normal" if can_stop else "disabled")
         for b in (self.btn_check, self.btn_preview, self.btn_forward,
                   self.btn_settings, self.btn_records, self.btn_export):
             b.configure(state="disabled" if (running or busy) else "normal")
+
+        # 过渡态文案：让「按不动」有解释（正在启动/停止 vs 真的不能点）。
+        # ⚠ 换文案就会改字宽 → 按钮抽搐。试过若干同宽符号都不稳（实测
+        #   ▶ 109 / ⏳ 117 / ·· 110 / ■ 80 / ·· 84，字体度量不可控），
+        #   干脆在创建时用 width= 锁死像素宽（见 _build_ui），文案随便换。
+        self.btn_start.configure(
+            text="··  开始运行" if self.state == "checking" else "▶  开始运行")
+        self.btn_stop.configure(
+            text="··  停止" if self.state == "stopping" else "■  停止")
+
         color = {"idle": "#8b93a8", "running": "#4ade80",
                  "checking": "#fbbf24", "stopping": "#f87171"}[self.state]
         label = {"idle": "● 已停止", "running": "● 运行中", "checking": "● 检测中",
                  "stopping": "● 正在停止"}[self.state]
         self.run_dot.itemconfigure(1, fill=color)
         self.run_txt.configure(text=label)
-        # 主按钮的可用态用底色区分（tk.Button 的 disabled 样式不够直观）
-        can_start = not running and not busy
-        self.btn_start.configure(bg=ACCENT if can_start else "#9db8e8")
-        self.btn_stop.configure(bg=RED if running else "#eeb4b6")
+
+        # 实心 vs 空心，一眼分辨能不能点（见模块顶部 BTN_DISABLED_* 注释）
+        self._paint_btn(self.btn_start, can_start, ACCENT, ACCENT_DARK)
+        self._paint_btn(self.btn_stop, can_stop, RED, "#c93a3f")
         if not running:
             self.v_elapsed.configure(text="00:00")
-
     def _refresh_env_chips(self, src: tuple[bool, str] | None = None,
                            dst: tuple[bool, str] | None = None):
         if src is not None:
