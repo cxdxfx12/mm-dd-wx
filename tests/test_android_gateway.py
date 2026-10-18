@@ -14,6 +14,7 @@ import logging
 import os
 import shutil
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -28,10 +29,11 @@ from urllib.parse import quote
 from bridge.config import Config, DingTalkConfig, RouteConfig, StorageConfig, WeChatConfig
 from bridge.fingerprint import fp_of, norm_sender, unit_fp
 from bridge.service import BridgeService
+from bridge.sources import android_gateway
 from bridge.sources.android_gateway import (
     HEARTBEAT_GRACE, MAX_BATCH, MAX_SCREEN_BODY, OFFLINE_REMIND_EVERY,
-    AndroidGatewaySource, _Ctx, _find_apk, _online_now, _watchdog_step,
-    build_messages, lan_ips, set_apk_dirs,
+    AndroidGatewaySource, _Ctx, _apk_search_dirs, _find_apk, _online_now,
+    _watchdog_step, build_messages, lan_ips, set_apk_dirs,
 )
 from bridge.sources.base import Source
 from bridge.sources.factory import build_source
@@ -1599,6 +1601,42 @@ class TestFindApk(unittest.TestCase):
 
     def test_no_apk_returns_none(self):
         self.assertIsNone(_find_apk())
+
+
+class TestApkSearchDirs(unittest.TestCase):
+    """「去哪儿找 APK」不能靠 ``sys.executable``。
+
+    2026-10-18 真机事故：安装版 ``喵喵钉钉-微信消息转发桥.exe`` 只是个小启动器，
+    网关实际跑在它拉起的 **worker 子进程**里（``_env.json`` 指定的 Python）。
+    于是 ``sys.executable`` = ``.../envs/default/Scripts/python.exe``，
+    ``exe_dir`` 算成那个 Scripts 目录 —— 安装目录压根没进候选，
+    刚放进 ``app/`` 的 ``ddwx-collector-0.3.0.apk`` 从来没被扫到过，
+    页面稳定发 ``android/dist`` 里的老 0.2.0。用户看到的是「升级了还是老包」。
+    """
+
+    def test_program_dir_comes_from_module_not_executable(self):
+        """程序目录必须由模块路径上溯得到，跟解释器装在哪无关。"""
+        dirs = _apk_search_dirs()
+        self.assertTrue(dirs, "至少要有候选目录")
+        # 模块所在仓库/程序目录 = .../bridge/sources/android_gateway.py 上溯两级
+        root = Path(android_gateway.__file__).resolve().parents[2]
+        self.assertIn(root / "app", dirs,
+                      "程序目录下的 app/ 必须在候选里（安装版把当前包放这里）")
+        # 关键词：worker 进程跑时 sys.executable 是 Scripts/python.exe，
+        # 万一它成了**唯一**的基准，这条断言就会挂。
+        self.assertNotEqual(dirs[0], Path(sys.executable).resolve().parent,
+                            "候选首位不能是解释器目录")
+
+    def test_app_dir_is_preferred_over_android_dist(self):
+        """``<程序目录>/app`` 排在 ``<程序目录>/android/dist`` 前面。"""
+        dirs = _apk_search_dirs()
+        root = Path(android_gateway.__file__).resolve().parents[2]
+        self.assertLess(dirs.index(root / "app"),
+                        dirs.index(root / "android" / "dist"))
+
+    def test_no_duplicates(self):
+        low = [str(d).lower() for d in _apk_search_dirs()]
+        self.assertEqual(len(low), len(set(low)))
 
 
 class TestAppDownload(GatewayCase):

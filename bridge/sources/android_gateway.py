@@ -300,18 +300,29 @@ def set_apk_dirs(dirs) -> None:
 def _apk_search_dirs() -> list[Path]:
     """可能放着 APK 的目录，按「越可能是最新的」排前面。
 
-    三种运行形态都要覆盖：
-      · 源码跑（``python -m ...``）—— 仓库里的 ``android/dist``；
-      · 安装版（PyInstaller exe）—— exe 同级的 ``app/``（安装时把 APK 放这里）；
-      · 开发机上直接用安装版 —— 两者都在，取 mtime 最新的那个。
+    覆盖的形态：
+      · 源码跑（``python run.py`` / ``python -m ...``）—— 仓库里的 ``android/dist``；
+      · 安装版 —— 程序目录下的 ``app/``（安装时把 APK 放这里），以及程序目录本身。
 
-    ⚠ 不能用 ``__file__`` 推程序目录：打包后它指向临时解包目录，
-    用户往里放 APK 是白放。
+    ⚠ **不能用 ``sys.executable`` 推程序目录。** 2026-10-18 真机踩过：安装版的
+    ``喵喵钉钉-微信消息转发桥.exe`` 只是个小启动器，真正的网关跑在它拉起的
+    **worker 子进程**里（用 ``_env.json`` 里那个 Python 解释器），于是
+    ``sys.executable`` 指向 ``.../envs/default/Scripts/python.exe``，
+    ``exe_dir`` 算成那个 Scripts 目录 —— 安装目录**根本没进候选**，
+    ``app/ddwx-collector-0.3.0.apk`` 从来没被扫到过，页面一直发老版本。
+
+    ⚠ 也不能只用 ``__file__``：PyInstaller 打包后它指向临时解包目录，
+    用户往里放 APK 是白放。—— 但本程序**没有**用 PyInstaller 完整打包
+    （启动器形态，源码就在程序目录里），模块路径就是最终落盘路径，可行。
+    结论：以「模块文件 → 上溯两级 = 仓库根/程序目录」为主，``sys.executable``
+    仅作补充候选（真打了 PyInstaller 单文件包时还能兜一层）。
     """
     out: list[Path] = []
     here = Path(__file__).resolve()
-    # 源码：.../ddwx-bridge/bridge/sources/android_gateway.py → 上溯到仓库根
+    # .../程序目录/bridge/sources/android_gateway.py → 上溯到程序目录（= 源码里的仓库根）
     root = here.parents[2] if len(here.parents) > 2 else here.parent
+    # root/app 排最前：安装版把「当前该发的包」放在这里，语义最明确
+    out.append(root / "app")
     out.append(root / "android" / "dist")
     exe_dir = Path(sys.executable).resolve().parent
     out.append(exe_dir / "app")

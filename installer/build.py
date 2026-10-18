@@ -178,6 +178,17 @@ def build_payload(app_exe: Path) -> Path:
         shutil.copy2(latest, payload / "app" / latest.name)
         expected.add(f"app/{latest.name}")
         print(f"    手机端 APK：{latest.name}（{latest.stat().st_size // 1024} KB）")
+        # `android/` 段会被整目录带进 payload（第 147 行只排除了 dist/），但
+        # **升级时不清理老文件** —— 老版本装机时留下的 `android/dist/0.2.0.apk`
+        # 会一直躺在新装的机器里。而 `_apk_search_dirs()` 又恰好把
+        # `<程序目录>/android/dist` 列为候选，只要版本比较出了任何岔子，
+        # 页面就会发回老包（2026-10-18 真机事故）。
+        # 这里顺手写一份同版本的进去：同一个版本号出现两份，`_find_apk()` 取
+        # mtime 最新的，`copy2` 保留了源文件 mtime，两份等价，不会歧义。
+        adist = payload / "android" / "dist"
+        adist.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(latest, adist / latest.name)
+        expected.add(f"android/dist/{latest.name}")
     else:
         print("    ⚠ 没有找到 android/dist/*.apk —— 手机将无法用 /app 页面下载。"
               "先在 android 目录跑一次 python build.py")

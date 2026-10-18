@@ -442,6 +442,7 @@ class Wizard(tk.Tk):
                              f"正在解压程序文件… {i + 1}/{total}",
                              5 + 60 * (i + 1) / total)
         self._ui(self._log, f"程序文件已释放到 {target}（{total} 个文件）", "ok")
+        self._drop_stale_apks(target, names)
 
         # 复制一份自己作为卸载程序
         try:
@@ -451,6 +452,35 @@ class Wizard(tk.Tk):
         except Exception as exc:
             self._ui(self._log, f"卸载程序复制失败（不影响使用）：{exc}", "dim")
         self._ui(self._set_step, "程序文件已就绪", 65)
+
+    def _drop_stale_apks(self, target: Path, names: list[str]) -> None:
+        """删掉上一版留下、这一版不再需要的 APK。
+
+        升级是「解压覆盖」，**不会**删除旧版本才有、新版本没有的文件。
+        早先在真机上踩过：新装的机器里同时躺着
+        ``android/dist/ddwx-collector-0.2.0.apk``（老版装的）和
+        ``app/ddwx-collector-0.3.0.apk``（新版刚放的），网关的
+        ``_apk_search_dirs()`` 把这两个目录都当候选，任何一点版本比较的
+        岔子都会让 /app 页面发回老包 —— 用户看到「升级了还是老版本」。
+
+        APK 是整包替换的产物，没有「用户自己改过」的可能，删旧的没有风险；
+        其它文件一律不碰（用户可能在 ``data/`` 里放了东西）。
+        """
+        fresh = {n.replace("\\", "/") for n in names if n.lower().endswith(".apk")}
+        keep = {Path(n).name for n in fresh}
+        for sub in ("android/dist", "app"):
+            d = target / sub
+            if not d.is_dir():
+                continue
+            for p in d.glob("*.apk"):
+                rel = f"{sub}/{p.name}"
+                if rel in fresh or p.name in keep:
+                    continue
+                try:
+                    p.unlink()
+                    self._ui(self._log, f"已清理旧版安装包 {rel}", "dim")
+                except OSError as exc:
+                    self._ui(self._log, f"（保留）旧包删不掉 {rel}：{exc}", "dim")
 
     def _step_config(self):
         self._ui(self._set_step, "正在写入程序配置…", 68)
