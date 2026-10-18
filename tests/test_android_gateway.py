@@ -1181,6 +1181,73 @@ class TestScreenParse(GatewayCase):
         self.assertNotIn("hold", body)
         self.assertEqual(self.received[-1].content, "普通消息B")
 
+    def test_hold_survives_when_phone_reports_the_same_screen(self):
+        """扣住后手机按 hold 重报**同一屏**，这条必须投递出去。
+
+        2026-10-18 真机事故：用户报「拦截跟单日报」「按需派送履约风险提醒」
+        两条都没转发。日志里「扣住等渲染稳定（第 1 眼）」出现十几次，几乎
+        从没等到第 2 眼。
+
+        根因：扣住时故意不 commit（锚点留在旧位置），手机 hold-confirm 重报
+        同一屏时，``peek`` 拿锚点去比 —— 锚点本来就是这一屏，判「新增 0 条」。
+        扣住的那批就这么静默蒸发，不投递也不告警。
+
+        修法：扣住时把单元本身记进 ``hold_units``，重报帧先跟它对一遍。
+        """
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        xml = self.garbled(self.screen(self.row("旧消息A", 400),
+                                       self.row("拦截跟单日报 表格数据", 700)))
+        b1 = self.post_frame(xml)
+        self.assertEqual(b1["messages"], 0, "H5 首见不该直接发")
+        self.assertEqual(b1.get("hold"), 800, "没让手机等一下重报")
+
+        # 手机 800ms 后 hold-confirm 重报同一帧 —— 这才是真机发生的事
+        b2 = self.post_frame(xml)
+        self.assertEqual(b2["messages"], 1,
+                         "扣住的 H5 消息在重报帧里丢了 —— 真机上就是这条"
+                         "「拦截跟单日报」/「按需派送履约风险提醒」丢了")
+        self.assertEqual(len(self.received), 1, "不该重复投递")
+        self.assertEqual(self.received[0].content, "拦截跟单日报 表格数据")
+
+    def test_hold_units_dropped_when_gone_from_screen(self):
+        """扣住的那批滑出屏幕后，不能被拼到别的消息上投递出去。
+
+        判据是「新屏末尾那几条的发送者对不上」→ 判定真划走了，清掉扣住
+        记录。这里只锁这一点：**别把「H5卡片内容」当成新消息补发**。
+        """
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        xml = self.garbled(self.screen(self.row("旧消息A", 400),
+                                       self.row("H5卡片内容", 700)))
+        self.post_frame(xml)
+        # 用户划走了：屏上换成别的发送者的内容
+        self.post_frame(self.screen(self.row("后来的一条", 400, "另外一个人"),
+                                    self.row("又一条", 700, "另外一个人")))
+        # 再报一次同一屏（试探翻一屏之后正常回来的那帧）
+        body = self.post_frame(self.screen(self.row("后来的一条", 400, "另外一个人"),
+                                           self.row("又一条", 700, "另外一个人")))
+        sent = [m.content for m in self.received]
+        self.assertNotIn("H5卡片内容", sent,
+                         "扣住的 H5 内容不该在划走之后补发")
+        self.assertEqual(body["messages"] >= 0, True)
+
+    def test_system_notes_do_not_take_up_the_screen(self):
+        """本程序自己的【系统】通知不参与比对 —— 它们会挤掉真业务消息。
+
+        2026-10-18 实测：可视区 1753 px，两条系统通知（「转发桥已启动」
+        578 px +「已停止」227 px）吃掉 805 px，真正的业务消息被顶出屏幕，
+        采集端根本看不见。程序每重启一次就插两条，丢失会累积。
+        """
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        body = self.post_frame(self.screen(
+            self.row("旧消息A", 400),
+            self.row("【系统】转发桥已启动 模式：正式发送", 700),
+            self.row("【系统】转发桥已停止 运行统计：收到 2", 1000),
+            self.row("拦截跟单日报 正文", 1300)))
+        self.assertEqual(body["messages"], 1,
+                         "系统通知不该让业务消息跟着丢")
+        self.assertEqual(self.received[-1].content, "拦截跟单日报 正文")
+
+
     # ---- 同一条卡片换了渲染形态，不许发第二遍 --------------------------
     #
     # 用户原话：「我手机往上翻页，会发重复的」。

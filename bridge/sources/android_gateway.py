@@ -122,6 +122,16 @@ TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                 "%m-%d %H:%M", "%H:%M")
 
 
+def _is_system_note(content: str) -> bool:
+    """这条消息是不是本程序自己发到群里的运维通知。
+
+    与 ``notify.SYSTEM_PREFIX`` 保持同一个字符串 —— 那边负责「不投递」，
+    这边负责「不占画面」。两边判据必须一致，否则会出现「画面里剔掉了、
+    投递却放行了」这种自相矛盾（或者反过来：画面里留着、白白挤掉真消息）。
+    """
+    return (content or "").lstrip().startswith("【系统】")
+
+
 def _join_fragments(head: str, tail: str, *, u_first: int = 0) -> str | None:
     """把同一条长消息的两截拼起来。拼不上返回 ``None``。
 
@@ -645,6 +655,19 @@ class _Ctx:
     align_md5: str = ""
     align_tried: int = 0
     align_at: float = 0.0
+    # ── H5 卡片「扣住待稳」时**被扣住的那批单元** ─────────────────────
+    # 为什么必须单独记下来：扣住时故意不 commit（锚点留在旧位置），可是
+    # 「同一屏重报」那一帧里，peek 拿锚点去比 —— 锚点本来就是这一屏，
+    # 于是判出「新增 0 条」。扣住的那批就这么**静默蒸发**：既没投递，也
+    # 没告警，日志只留一行「扣住等渲染稳定」。
+    #
+    # 2026-10-18 实测事故（用户报「拦截跟单日报 / 按需派送履约风险提醒
+    # 没转发」）：日志里「扣住（第 1 眼）」出现十几次，几乎从没等到第 2 眼。
+    # 手机确实按 hold 重报了，但重报的帧被这里判成「没有新消息」。
+    #
+    # 所以扣住时把单元本身存进 hold_units，重报帧先跟它对一遍：
+    # 指纹没变 = 渲染稳定了 → 投递；变了 = 还在长 → 更新后再扣一轮。
+    hold_units: list = field(default_factory=list)
     # ── 长消息「攒齐再发」的状态（见 _hold_long / _ingest）─────────────
     # 一条超过一屏的消息，第一次出现时树里只有屏幕上那截。旧做法是「先发半截，
     # 再请手机翻一屏补全」—— 补全回来的前半截因为指纹不同（片段 ≠ 全文），
@@ -1118,6 +1141,25 @@ class _Handler(BaseHTTPRequestHandler):
 
         self.ctx.skip_streak = 0
         self.ctx.last_skip_note = ""
+
+        # ── 剔除本程序自己发到群里的运维通知 ──────────────────────────
+        # `【系统】…` 那些「转发桥已启动 / 已停止 / 采集波动」是**自己发到
+        # 钉钉群里的**，手机画面里当然也有它们。service 层早就拦住了不投递，
+        # 但**拦住投递不等于没代价**：它们在手机上照样占列表高度。
+        #
+        # 2026-10-18 实测事故：可视区 1753 px，两条系统通知（227 + 578）吃掉
+        # 805 px，真正的业务消息「拦截跟单日报」「按需派送履约风险提醒」被
+        # 直接顶出屏幕 —— 采集端根本没机会看见它们，日志还全绿。
+        # 程序每重启一次就往群里插两条通知，这类丢失会累积。
+        #
+        # 所以在**解析之后、进 diff 之前**就把它们剔掉：既不占锚点、不占
+        # 新消息名单，也不影响「锚点上方是否来了新卡片」的判断。剔除是纯
+        # 净化，不改任何状态，同一帧重报结果一致。
+        dropped = self._drop_system_notes(frame)
+        if dropped:
+            log.info("安卓画面解析：屏上有 %d 条本程序自己的运维通知，"
+                     "不参与比对（否则它们会把真业务消息顶出屏幕）", dropped)
+
         differ = self.ctx.differ
         if differ is None:
             differ = self.ctx.differ = FrameDiffer()
@@ -1237,6 +1279,36 @@ class _Handler(BaseHTTPRequestHandler):
             return [], "锚点丢失", False, 0
 
         new = list(diff.units)
+
+        # ── 这是「上次扣住」那批的重报帧吗？──────────────────────────
+        # 扣住时故意不 commit，所以同一屏重报时 peek 会判出「新增 0 条」
+        # —— 扣住的那批就再也看不到了。这里先拿 hold_units 跟本帧里的单元
+        # 对一遍，把「还在屏上、且内容没再变」的挑出来：
+        #   · 全部没变 → 渲染稳定了，投递；
+        #   · 有变化   → 还在长，更新 hold_units 再扣一轮（受 HOLD_MAX 约束）。
+        resumed = self._resume_hold(frame) if self.ctx.hold_units else None
+        if resumed is not None:
+            units, note, fresh = resumed
+            if units:
+                differ.commit(frame.units)
+                self._clear_hold()
+                log.info("安卓画面解析：H5 卡片内容已稳定（重报帧与扣住的一致），"
+                         "投递 %d 条", len(units))
+                return self._finish(units, frame, differ)
+            # 还在长：更新成新版批次，继续扣（受 HOLD_MAX 约束）。
+            self.ctx.hold_units = fresh
+            self.ctx.hold_total += 1
+            if self.ctx.hold_total < HOLD_MAX:
+                log.info("安卓画面解析：H5 卡片还在长，继续扣住（第 %d 眼）",
+                         self.ctx.hold_total)
+                return [], "H5 渲染中，扣住待稳", False, HOLD_MS
+            log.warning("安卓画面解析：H5 渲染等待超限（%d 眼还没稳下来），"
+                        "按现状投递 %d 条（可能不完整）",
+                        self.ctx.hold_total, len(fresh))
+            differ.commit(frame.units)
+            self._clear_hold()
+            return self._finish(fresh, frame, differ)
+
         # 这一帧正常判出了新内容 = 锚点是好的。清零试探计数，让下次真遇到
         # 「长消息挤掉锚点」时还有翻一屏的机会（不清零的话，一天里偶尔两次
         # 误试探就会把额度耗光，之后再丢消息就不再救了）。
@@ -1258,9 +1330,10 @@ class _Handler(BaseHTTPRequestHandler):
                 if seen < 2 and self.ctx.hold_total < HOLD_MAX:
                     log.info("安卓画面解析：新消息在 H5 卡片里，扣住等渲染稳定"
                              "（第 %d 眼，%d 条）", seen, len(new))
+                    self.ctx.hold_units = list(new)
                     return [], "H5 渲染中，扣住待稳", False, HOLD_MS
             differ.commit(frame.units)
-            self.ctx.hold_key, self.ctx.hold_seen, self.ctx.hold_total = "", 0, 0
+            self._clear_hold()
             return self._finish(new, frame, differ)
 
         if garbled and new:
@@ -1272,9 +1345,12 @@ class _Handler(BaseHTTPRequestHandler):
             if seen < 2 and self.ctx.hold_total < HOLD_MAX:
                 log.info("安卓画面解析：新消息在 H5 卡片里，扣住等渲染稳定"
                          "（第 %d 眼，%d 条）", seen, len(new))
+                # ⚠ 必须把单元本身存下来：扣住时不 commit，重报帧的 peek
+                #   会判「新增 0 条」，只有靠这份记录才认得出「还是那批」。
+                self.ctx.hold_units = list(new)
                 return [], "H5 渲染中，扣住待稳", False, HOLD_MS
             differ.commit(frame.units)
-            self.ctx.hold_key, self.ctx.hold_seen, self.ctx.hold_total = "", 0, 0
+            self._clear_hold()
             if seen >= 2:
                 log.info("安卓画面解析：H5 卡片内容已稳定（连续两帧一致），"
                          "投递 %d 条", len(new))
@@ -1285,7 +1361,7 @@ class _Handler(BaseHTTPRequestHandler):
             # 原生帧照常推进；garbled 但没有新内容（旧卡片停在屏上）也推进 ——
             # 锚点留在半成品上没有意义。
             differ.commit(frame.units)
-            self.ctx.hold_key, self.ctx.hold_seen, self.ctx.hold_total = "", 0, 0
+            self._clear_hold()
 
         # 一屏装不下的长消息：树里只有屏幕上那截，滚出去的部分根本不存在。
         return self._finish(new, frame, differ)
@@ -1451,7 +1527,82 @@ class _Handler(BaseHTTPRequestHandler):
         log.info("安卓画面解析：上翻补全到 %d 条此前没看到的内容", len(kept))
         return kept, "补全帧", False
 
+    # --- H5 卡片扣住 ---
+
+    def _resume_hold(self, frame) -> tuple[list, str, list] | None:
+        """这一帧是不是「上次扣住那批」的重报？是则返回 (要投递的, 说明, 新版批次)。
+
+        返回 ``None`` = 不是重报帧（或扣住的那批已经不在屏上了），照常走
+        diff 流程。
+
+        ── 为什么需要这个 ──────────────────────────────────────────
+        H5 卡片扣住时**故意不 commit**（锚点留在旧位置）。手机按 hold 指令
+        重报同一屏时，``peek`` 拿锚点去比 —— 锚点本来就是这一屏，于是判
+        「新增 0 条」。扣住的那批就这么静默蒸发：不投递、不告警，日志里只
+        留一行「扣住等渲染稳定」。2026-10-18 实测丢了两条真业务消息
+        （拦截跟单日报、按需派送履约风险提醒），就是这条路。
+
+        判据只看**指纹集合**：
+          · 本帧里能找全扣住的那批、且指纹一个没变 → 渲染稳定，投递；
+          · 指纹有变化、或只找得回一部分 → 还在长，返回空列表让它再扣一轮，
+            并把「新版批次」传给调用方更新记录。
+        两侧的单元都在 ``frame.units`` 里按指纹索引，不依赖坐标。
+
+        ⚠ 「新版批次」**只取扣住那批占的位置**，不能拿整帧：整帧里有更早的
+        旧消息，把它们当成新消息投递就是重复转发。
+        """
+        held = self.ctx.hold_units
+        if not held:
+            return None
+        by_fp = {u.fp for u in frame.units}
+        still = [u for u in held if u.fp in by_fp]
+        if not still:
+            # 一条都找不回来了：H5 卡片整块重绘换了指纹（还在长），或者
+            # 用户划走了/换了群。
+            # 判据用「本帧末尾那几条的发送者对不对得上」——卡片重绘时发送者
+            # 不变，划走时对不上。
+            want = {norm_sender(u.sender) for u in held}
+            tail = frame.units[-len(held):] if len(frame.units) >= len(held) \
+                else list(frame.units)
+            if tail and {norm_sender(u.sender) for u in tail} <= want:
+                return [], "H5 指纹全变（还在长）", tail
+            return None                      # 真划走了，交给调用方清掉
+        if len(still) == len(held):
+            return still, "H5 已稳定", still
+
+        # 只回来一部分：卡片重绘换了指纹，还在长。
+        # 新版批次 = 本帧**末尾 len(held) 条**（扣住的是最新那批，位置在帧尾）。
+        fresh = frame.units[-len(held):] if len(frame.units) >= len(held) \
+            else list(frame.units)
+        return [], "H5 还在长", fresh
+
+    def _clear_hold(self) -> None:
+        self.ctx.hold_key = ""
+        self.ctx.hold_seen = 0
+        self.ctx.hold_total = 0
+        self.ctx.hold_units = []
+
     # --- 长消息攒齐 ---
+
+    def _drop_system_notes(self, frame) -> int:
+        """把本程序自己发到群里的运维通知从画面里剔掉，返回剔了几条。
+
+        判据只认 ``【系统】`` 前缀（与 ``notify.SYSTEM_PREFIX`` 同一个字符串）。
+        这批文案是我们自己发的，service 层已经拦着不投递，让它们参与比对
+        有害无益：
+
+          · 它们在手机上**占列表高度** —— 可视区只有 1753 px，两条通知就能
+            吃掉 805 px，真业务消息被顶出屏幕（2026-10-18 实测丢消息）；
+          · 它们会让多出来的「新消息」把锚点往前推，其它消息因此被判旧。
+
+        ⚠ 只改 ``frame.units``，**不动 frame 的其它字段**（view / garbled /
+        page 都得留着）—— ``clipped_units``、``needs_scroll`` 都依赖它们。
+        """
+        keep = [u for u in frame.units if not _is_system_note(u.content)]
+        dropped = len(frame.units) - len(keep)
+        if dropped:
+            frame.units = keep
+        return dropped
 
     def _long_suspects(self, units: list, frame) -> tuple[list, list]:
         """把本帧新消息分成「疑似被切掉的长消息」和「其余」。
