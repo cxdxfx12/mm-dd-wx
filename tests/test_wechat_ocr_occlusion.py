@@ -18,6 +18,7 @@ ctypes DLL 对象，没有真实属性可还原，撤销时 0xC0000005 段错误
 普通方法，直接在实例上挂 lambda 顶替即可。
 """
 
+import ctypes
 import sys
 import unittest
 from pathlib import Path
@@ -107,8 +108,74 @@ class TestActivateVerifiesForeground(unittest.TestCase):
     def test_activate_is_checkable(self):
         """``_activate`` / ``_is_foreground`` / ``_check_visible`` 都在。"""
         for name in ("_activate", "_is_foreground", "_check_visible",
-                     "_occluded_points", "_ensure_unoccluded"):
+                     "_occluded_points", "_ensure_unoccluded",
+                     "_grab_foreground", "_topmost_pulse",
+                     "_focus_and_check"):
             self.assertTrue(hasattr(WeChatOcrTarget, name), name)
+
+
+class TestTopmostConstants(unittest.TestCase):
+    """窗口层级常量必须是**模块级**的，不能写成 ``wt.HWND_TOPMOST``。
+
+    真机 2026-10-18 21:03：投递直接失败，日志只有一句
+    「激活微信窗口失败：module 'ctypes.wintypes' has no attribute
+    'HWND_TOPMOST'」—— ``ctypes.wintypes`` 里根本没有这两个常量（它们是
+    winuser.h 的宏，不是 wintypes 的成员）。写成 ``wt.`` 前缀会抛
+    ``AttributeError``，被 ``_activate`` 的 except 吞掉后返回 False，
+    表现为「无法把微信窗口切到前台」。
+
+    这条用例就是那次事故的钉子：常量存在、类型是 c_void_p、值是 -1/-2。
+    """
+
+    def test_constants_exist_at_module_level(self):
+        from bridge.targets import wechat_ocr as W
+        self.assertTrue(hasattr(W, "HWND_TOPMOST"))
+        self.assertTrue(hasattr(W, "HWND_NOTOPMOST"))
+
+    def test_constant_values(self):
+        """HWND_TOPMOST=(HWND)-1、HWND_NOTOPMOST=(HWND)-2（c_void_p 补码）。
+
+        ⚠ ``c_void_p(-1).value`` 读出来是**无符号**的 ``2**64-1``，不是 -1
+        —— 别按 -1 断言，会误以为常量写错了。
+        """
+        from bridge.targets import wechat_ocr as W
+        self.assertEqual(W.HWND_TOPMOST.value, ctypes.c_void_p(-1).value)
+        self.assertEqual(W.HWND_NOTOPMOST.value, ctypes.c_void_p(-2).value)
+
+    def test_wintypes_has_no_such_attribute(self):
+        """锁住事实：``ctypes.wintypes`` 里没有 HWND_TOPMOST —— 别改回 ``wt.``。"""
+        import ctypes.wintypes as wt
+        self.assertFalse(hasattr(wt, "HWND_TOPMOST"))
+        self.assertFalse(hasattr(wt, "HWND_NOTOPMOST"))
+
+
+class TestGrabForeground(unittest.TestCase):
+    """``_grab_foreground``：抢不到要**如实返回 False**，不能假装成功。"""
+
+    def test_returns_true_when_first_round_works(self):
+        tgt = make_target()
+        tgt._topmost_pulse = lambda h: None                   # type: ignore
+        tgt._focus_and_check = lambda h, w: True              # type: ignore
+        self.assertTrue(tgt._grab_foreground(1234))
+
+    def test_returns_false_after_all_rounds_fail(self):
+        """三招全失灵 → False（由调用方决定是拒发还是硬着头皮上）。"""
+        tgt = make_target()
+        tgt._topmost_pulse = lambda h: None                   # type: ignore
+        tgt._focus_and_check = lambda h, w: False             # type: ignore
+        self.assertFalse(tgt._grab_foreground(1234, rounds=1))
+
+    def test_retries_up_to_rounds(self):
+        tgt = make_target()
+        calls = {"n": 0}
+
+        def pulse(h):
+            calls["n"] += 1
+
+        tgt._topmost_pulse = pulse                            # type: ignore
+        tgt._focus_and_check = lambda h, w: False             # type: ignore
+        tgt._grab_foreground(1234, rounds=3)
+        self.assertEqual(calls["n"], 3, "每一轮都要试一次置顶")
 
 
 if __name__ == "__main__":

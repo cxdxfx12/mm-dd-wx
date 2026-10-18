@@ -91,6 +91,13 @@ user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                 ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                 ctypes.c_int, wt.UINT]
 user32.SetWindowPos.restype = wt.BOOL
+# 硬抢前台用（_grab_foreground）：挂到前台线程的输入队列上，前台锁就不拦了
+user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p,
+                                            ctypes.POINTER(wt.DWORD)]
+user32.GetWindowThreadProcessId.restype = wt.DWORD
+user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
+user32.AttachThreadInput.restype = wt.BOOL
+kernel32.GetCurrentThreadId.restype = wt.DWORD
 
 kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
 kernel32.GlobalAlloc.restype = ctypes.c_void_p
@@ -129,6 +136,7 @@ BI_RGB = 0
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 VK_CONTROL = 0x11
+VK_MENU = 0x12          # ALT：单独按一下不上屏，用来破前台锁
 VK_V = 0x56
 VK_RETURN = 0x0D
 VK_A = 0x41
@@ -588,32 +596,106 @@ class WeChatOcrTarget(Target):
             if self._is_foreground(hwnd):
                 return self._check_visible(hwnd)
 
-            # ── 兜底：前台锁拒了，或者被置顶窗口压着 ──────────────
-            # BringWindowToTop 对 belonging-to-same-thread 的窗口有效，
-            # 跨进程常被无视；真正管用的是 SetWindowPos(SWP_NOACTIVATE)。
-            # 用 NOACTIVATE 是刻意的：不抢焦点也能把它提到最前，
-            # 少干扰用户正在敲的东西。
-            log.info("微信没能切到前台（前台是 hwnd=%s），改用置顶兜底",
-                     user32.GetForegroundWindow())
-            user32.BringWindowToTop(wt.HWND(hwnd))
-            user32.SetWindowPos(
-                wt.HWND(hwnd), wt.HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
-            # 立刻摘掉 topmost，否则微信会一直压着用户的窗口 ——
-            # 这个程序是长期后台跑的，绝不能把用户的桌面搞成「微信永远在最前」。
-            user32.SetWindowPos(
-                wt.HWND(hwnd), wt.HWND_NOTOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-            user32.SetForegroundWindow(wt.HWND(hwnd))
-            time.sleep(self.focus_delay)
-            if not self._is_foreground(hwnd):
-                log.warning("微信仍不是前台窗口（当前 hwnd=%s）—— 抓帧可能抓到"
-                            "其它窗口的画面，交给画面自检判断",
-                            user32.GetForegroundWindow())
+            # ── 前台锁拒了（或被子窗口/置顶窗口挡着）：自己想办法抢 ────
+            if self._grab_foreground(hwnd):
+                return self._check_visible(hwnd)
+            log.warning("微信仍不是前台窗口（当前 hwnd=%s）—— 抓帧可能抓到"
+                        "其它窗口的画面，交给遮挡检测兜底",
+                        user32.GetForegroundWindow())
             return self._check_visible(hwnd)
         except Exception as exc:
-            log.warning("激活微信窗口失败：%s", exc)
+            # ⚠ 必须打堆栈。2026-10-18 真机：这里原本只 warning 一句
+            # 「激活微信窗口失败：module 'ctypes.wintypes' has no attribute
+            # 'HWND_TOPMOST'」—— 完全看不出是哪一行（是兜底分支里把常量写成了
+            # `wt.HWND_TOPMOST`），排查时白试了三次单点调用才定位。堆栈一行就够。
+            log.exception("激活微信窗口失败：%s", exc)
             return False
+
+    def _grab_foreground(self, hwnd: int, rounds: int = 3) -> bool:
+        """硬抢前台，抢到为止（最多 ``rounds`` 轮）。返回是否真的到了前台。
+
+        用户 2026-10-18 的要求：「要能自己找到焦点」。``SetForegroundWindow``
+        被系统前台锁拒掉以后，光 `SetWindowPos` 不一定够（置顶窗口还在上面）。
+        Windows 的前台锁有一条明文豁免：**发起调用的进程最近收到过用户的键盘
+        输入**时自动放行。所以这里按「从轻到重」逐级升级，每轮都**回读校验**：
+
+          ① ``SetWindowPos(TOPMOST→NOTOPMOST, NOACTIVATE)``：不抢焦点也提到
+             最前，够用就走，对用户打扰最小；
+          ② ``AttachThreadInput`` 挂到当前前台线程再 ``SetForegroundWindow``
+             —— 跨线程输入队列共享后，前台锁形同虚设（老牌做法，Win10/11
+             仍有效）；
+          ③ 注入一次 ``ALT`` 空击（``keybd_event``）伪造「用户刚有输入」，
+             再 ``SetForegroundWindow``。这是最后的办法，会有一次极短的真实
+             按键，但用户感知不到内容（单独 ALT 不上屏）。
+
+        ⚠ TOPMOST **必定立刻摘掉**（哪怕中间某步抛异常），这个程序长期后台跑，
+        不能让微信永远压着用户的窗口。
+        """
+        hwnd_w = wt.HWND(hwnd)
+        for i in range(max(1, rounds)):
+            # ① 不抢焦点地提到最前
+            self._topmost_pulse(hwnd_w)
+            if self._focus_and_check(hwnd, hwnd_w):
+                log.info("已把微信顶回前台（第 %d 轮，置顶法）", i + 1)
+                return True
+
+            # ② 挂到前台线程再抢
+            try:
+                fg = user32.GetForegroundWindow()
+                tid_fg = user32.GetWindowThreadProcessId(wt.HWND(fg), None)
+                tid_me = kernel32.GetCurrentThreadId()
+                if tid_fg and tid_fg != tid_me:
+                    user32.AttachThreadInput(tid_me, tid_fg, True)
+                    try:
+                        self._focus_and_check(hwnd, hwnd_w)
+                    finally:
+                        user32.AttachThreadInput(tid_me, tid_fg, False)
+                    if self._is_foreground(hwnd):
+                        log.info("已把微信顶回前台（第 %d 轮，AttachThreadInput）",
+                                 i + 1)
+                        return True
+            except Exception:                   # noqa: BLE001
+                log.debug("AttachThreadInput 抢前台失败（忽略，继续下一招）",
+                          exc_info=True)
+
+            # ③ 伪造用户输入后硬抢
+            try:
+                user32.keybd_event(VK_MENU, 0, 0, 0)
+                user32.keybd_event(VK_MENU, 0, 2, 0)        # 2 = KEYUP
+            except Exception:                   # noqa: BLE001
+                pass
+            if self._focus_and_check(hwnd, hwnd_w):
+                log.info("已把微信顶回前台（第 %d 轮，模拟用户输入）", i + 1)
+                return True
+        return False
+
+    def _focus_and_check(self, hwnd: int, hwnd_w) -> bool:
+        """SetForegroundWindow 一次并回读校验。"""
+        try:
+            user32.SetForegroundWindow(hwnd_w)
+        except Exception:                       # noqa: BLE001
+            return False
+        time.sleep(max(self.focus_delay, 0.12))
+        return self._is_foreground(hwnd)
+
+    @staticmethod
+    def _topmost_pulse(hwnd_w) -> None:
+        """把窗口临时提到 TOPMOST 再立刻摘掉（不抢焦点）。
+
+        ⚠ 摘除必须写在 ``finally`` 里：中间抛异常也不能让微信留在 topmost，
+        那会让用户的窗口永远被它压着 —— 比投递失败更糟。
+        """
+        try:
+            user32.SetWindowPos(hwnd_w, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                                | SWP_SHOWWINDOW)
+            time.sleep(0.05)
+        finally:
+            try:
+                user32.SetWindowPos(hwnd_w, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            except Exception:                   # noqa: BLE001
+                log.warning("摘掉 TOPMOST 失败 —— 微信可能一直压在其它窗口上")
 
     @staticmethod
     def _is_foreground(hwnd: int) -> bool:
