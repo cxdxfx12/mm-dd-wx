@@ -481,6 +481,65 @@ class TestVisibilityRecovery(unittest.TestCase):
         self.assertEqual(WeChat4Target(wxauto_path=".").show_hotkey, "{Ctrl}{Alt}w")
 
 
+class TestSelfDrawnShell(unittest.TestCase):
+    """自绘空壳 vs 收进托盘 —— 必须分开判，否则排障方向全错。
+
+    实测（2026-10-18 现场）：微信某次启动后主窗口 ``Qt51514QWindowIcon`` 下只有
+    ``Weixin`` 与 ``MMUIRenderSubWindowHW`` 两个 Pane，整棵桌面树 ``mmui::`` 命中 0。
+    窗口明明可见、程序却报「多半收进了托盘」，用户按热键、点托盘折腾 20 秒才看到
+    真正原因（要完全退出微信重开）。
+    """
+
+    def test_visible_window_without_mmui_is_self_drawn(self):
+        tgt = make_target()
+        tgt._hwnd_by_class = lambda: 0x1234               # type: ignore[assignment]
+        tgt._qt_has_mmui = lambda h: False                # type: ignore[assignment]
+        tgt._is_window_visible = lambda h: True           # type: ignore[assignment]
+        self.assertEqual(tgt._shell_handle(), 0x1234)
+
+    def test_hidden_window_is_not_self_drawn(self):
+        """收进托盘的窗口**句柄和标题都在**，不能当成自绘空壳。"""
+        tgt = make_target()
+        tgt._hwnd_by_class = lambda: 0x1234               # type: ignore[assignment]
+        tgt._qt_has_mmui = lambda h: False                # type: ignore[assignment]
+        tgt._is_window_visible = lambda h: False          # type: ignore[assignment]
+        self.assertEqual(tgt._shell_handle(), 0)
+
+    def test_visible_window_with_mmui_is_healthy(self):
+        tgt = make_target()
+        tgt._hwnd_by_class = lambda: 0x1234               # type: ignore[assignment]
+        tgt._qt_has_mmui = lambda h: True                 # type: ignore[assignment]
+        tgt._is_window_visible = lambda h: True           # type: ignore[assignment]
+        self.assertEqual(tgt._shell_handle(), 0)
+
+    def test_ensure_visible_fails_fast_without_hotkey(self):
+        """自绘空壳下**不该再去按热键**（热键是开关，可能把窗口收起来）。"""
+        tgt = make_target()
+        tgt._wnd_present = lambda: False                  # type: ignore[assignment]
+        tgt._qt_has_mmui = lambda h: False                # type: ignore[assignment]
+        tgt._is_window_visible = lambda h: True           # type: ignore[assignment]
+        tgt._hwnd_by_class = lambda: 0x1234               # type: ignore[assignment]
+        with mock.patch("bridge.targets.wechat4.time.sleep"):
+            ok, why = tgt.ensure_visible()
+        self.assertFalse(ok)
+        self.assertIn("自绘空壳", why)
+        self.assertEqual(tgt._fake_uia.sent, [], "自绘空壳不该发热键")
+        self.assertNotIn("唤回", why, "自绘空壳不该让用户去按热键唤窗口")
+        self.assertIn("完全退出微信", why)
+
+    def test_health_check_reports_hidden_not_self_drawn(self):
+        """托盘里的时候要提示「点开窗口」，不是「退出微信重开」。"""
+        tgt = make_target()
+        tgt._wnd_present = lambda: False                  # type: ignore[assignment]
+        tgt._qt_has_mmui = lambda h: False                # type: ignore[assignment]
+        tgt._is_window_visible = lambda h: False          # type: ignore[assignment]
+        tgt._hwnd_by_class = lambda: 0x1234               # type: ignore[assignment]
+        ok, why = tgt.health_check()
+        self.assertFalse(ok)
+        self.assertIn("隐藏", why)
+        self.assertNotIn("自绘空壳", why)
+
+
 class TestConfigPlumbing(unittest.TestCase):
     """`wechat.show_hotkey` 要能从配置文件一路传到投递端。"""
 

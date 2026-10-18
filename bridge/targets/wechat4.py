@@ -163,6 +163,76 @@ class WeChat4Target(Target):
         _user32.EnumWindows(cb, 0)
         return bool(found)
 
+    def _shell_handle(self) -> int:
+        """可**精确**判定「这次就是自绘空壳」的窗口句柄，0 = 没有这种证据。
+
+        和 ``_qt_shell_present()`` 的区别很关键：那个只看「屏幕上有没有一个
+        标题带微信的 Qt 窗口」，**窗口收进托盘时同样成立**（隐藏窗口也有句柄和
+        标题）。拿它当前置判据会把「在托盘里」误诊成「自绘空壳」，用户照着提示
+        完全退出微信也无济于事 —— 真正该做的是点开窗口。
+
+        这里改成看**可见性 + UIA 子树**：主窗口可见却读不到里面的 ``mmui::*``
+        控件，才是自绘形态。实测（2026-10-18）：微信某次启动后主窗口
+        ``Qt51514QWindowIcon`` 下只有 ``Weixin`` 与 ``MMUIRenderSubWindowHW``
+        两个 Pane，整棵桌面树里 ``mmui::`` 命中 0 个，微信自己的渲染全在 Qt
+        内部完成、完全跳过 UI 自动化提供者。这种形态只能重启微信恢复。
+
+        只在 ``_find_window()`` 已经失败之后才调用（否则没意义）。
+        """
+        if _user32 is None:
+            return 0
+        hwnd = self._hwnd_by_class()
+        if not hwnd:
+            return 0
+        if not self._is_window_visible(hwnd):
+            return 0                          # 隐藏/托盘：没有自绘证据，按常规唤回走
+        # 可见但读不到控件才算。`_qt_has_mmui` 不做递归遍历：自绘形态下子树
+        # 只有 2 个节点，而正常形态第一层就是 mmui::MainWindow。
+        return 0 if self._qt_has_mmui(hwnd) else hwnd
+
+    @staticmethod
+    def _is_window_visible(hwnd: int) -> bool:
+        """窗口是否真的显示在桌面上（隐藏/托盘里返回 False）。
+
+        单独成一个方法是为了可测：直接 ``mock.patch`` 模块级的 ``_user32``
+        （ctypes DLL 对象）会让解释器在撤销 patch 时段错误 —— 那是个没有真实
+        属性的 C 对象，``delattr`` 直接崩，表现为「跑测试卡死然后 0xC0000005」。
+        """
+        if _user32 is None or not hwnd:
+            return False
+        try:
+            return bool(_user32.IsWindowVisible(wintypes.HWND(hwnd)))
+        except Exception:
+            return False
+
+    def _qt_has_mmui(self, hwnd: int) -> bool:
+        """拿句柄直读第一层子控件，看有没有暴露 mmui 控件树。
+
+        不用 ``WindowControl(ClassName=...)`` 全局搜：那条路在窗口刚被唤回、
+        UIA 还没就绪时会假阴性，导致把正常窗口误判成空壳。按句柄取是无损的。
+        """
+        try:
+            uia = self._load_uia()
+        except Exception:
+            return True                       # 环境问题另有报错，别在这里误诊
+        try:
+            wnd = uia.ControlFromHandle(hwnd)
+            if wnd is None:
+                return False
+            for child in wnd.GetChildren():
+                if str(getattr(child, "ClassName", "") or "").startswith("mmui::"):
+                    return True
+        except Exception as exc:
+            # 读不到就当作「没有暴露」——上层给的是重启微信的建议，不会误导人。
+            log.debug("读取微信窗口子控件失败：%s", exc)
+        return False
+
+    def _self_drawn_message(self) -> str:
+        return ("微信窗口在屏幕上，但**自动化读不到里面的控件** —— 这次的主窗口是"
+                "个自绘空壳（已知故障态）。请**完全退出微信**（托盘图标右键 → "
+                "退出；任务管理器里确认 Weixin.exe 全部消失）再重新打开，程序会"
+                "自动恢复，不用改任何配置")
+
     def _window(self):
         """定位微信 4.x 主窗口，带缓存与重连。"""
         if self._wnd is not None:
@@ -175,11 +245,18 @@ class WeChat4Target(Target):
 
         wnd = self._find_window()
         if wnd is None:
+            # 注意判定顺序：自绘空壳只看「可见 + 子树为空」，收进托盘只看隐藏。
+            # 用 `_qt_shell_present()`（只认标题）会把它俩混成一句「自绘空壳」，
+            # 窗口明明在托盘里却让人去重启微信。
+            if self._shell_handle():
+                raise RuntimeError(self._self_drawn_message())
             if self._qt_shell_present():
                 raise RuntimeError(
-                    "微信窗口在屏幕上，但**自动化读不到里面的控件** —— 微信这次的"
-                    "主窗口是个自绘空壳（已知故障态）。请**完全退出微信**（托盘图标"
-                    "右键 → 退出）再重新打开，程序会自动恢复，不用改任何配置")
+                    "微信主窗口现在是**隐藏**状态（收进了托盘），不是自绘故障。"
+                    f"已尝试按窗口句柄唤出与热键 {self.show_hotkey} 均未生效 —— "
+                    "请点任务栏/系统托盘的微信图标把窗口打开，"
+                    "或在微信「设置 → 快捷键」里确认「显示/隐藏主窗口」没被改过"
+                )
             raise RuntimeError(
                 f"未找到微信 4.x 主窗口（{self.WINDOW_CLASS}）。请确认微信已启动并登录，"
                 "且**主窗口没有被收进托盘**（按 Esc 或点最小化都会这样，窗口在系统里会"
@@ -354,8 +431,15 @@ class WeChat4Target(Target):
         这是所有投递动作的前置条件。返回 (是否可用, 说明)，说明会直接写进
         投递失败的 detail 里，方便用户在日志里看到「到底卡在哪一步」。
         """
-        # 情形 A：UIA 里看不到窗口 —— 收进托盘（隐藏）或已退出
+        # 情形 A：UIA 里看不到窗口 —— 收进托盘（隐藏）、已退出，或自绘空壳
         if not self._wnd_present():
+            # A0：先排除「自绘空壳」。它和「在托盘里」在 Win32 层几乎一样（都有
+            # 句柄、都有标题），区别是**窗口可见但里面读不到控件**。不先分开，
+            # 用户会收到「请从托盘唤回」的提示，然后按热键、点托盘折腾一通 ——
+            # 2026-10-18 现场就是这样白等了 20 秒才报出真正原因。
+            if self._shell_handle():
+                return False, self._self_drawn_message()
+
             # A1：按窗口类名拿句柄直接亮出来。隐藏的窗口句柄还在，这一步最可靠。
             hwnd = self._hwnd_by_class()
             if hwnd:
@@ -374,12 +458,18 @@ class WeChat4Target(Target):
                 except Exception as exc:
                     return False, f"唤回微信窗口失败：{exc}"
                 if not self._wait_present(6.0):
+                    # 唤不出来再判一次：热键是**开关**，窗口本来是可见的自绘壳时
+                    # 发它等于把窗口收起来，这里必须重新按「可见性 + 子树」判定，
+                    # 否则会报一句「微信可能已经退出」把排障带偏。
+                    if self._shell_handle():
+                        return False, self._self_drawn_message()
                     return False, (
                         f"微信主窗口找不到，热键 {self.show_hotkey} 也没能唤回 —— "
                         "微信可能已经退出，或「显示/隐藏主窗口」的快捷键被改过。"
                         "请在微信「设置 → 快捷键」里确认该快捷键，"
                         "或手动打开微信主窗口")
                 log.info("微信主窗口已唤回")
+
 
         # 情形 B：窗口在，但被点了最小化
         wnd = self._window()
@@ -953,14 +1043,14 @@ class WeChat4Target(Target):
         # 再区分「窗口根本不在/被最小化」——这两种状态下坐标和标题都是陈旧的，
         # 报一句「控件结构可能已变更」会把用户带偏。
         if not self._wnd_present():
+            if self._shell_handle():
+                return False, self._self_drawn_message()
             if self._qt_shell_present():
-                return False, ("微信窗口在屏幕上，但**自动化读不到里面的控件** —— "
-                               "这次的主窗口是个自绘空壳（已知故障态）。请完全退出"
-                               "微信（托盘图标右键 → 退出）再重新打开，程序会自动"
-                               "恢复，不用改任何配置")
-            return False, ("读不到微信主窗口 —— 多半是被收进了托盘（按 Esc 或点了"
-                           "最小化都会这样）。请点开微信主窗口，或用「显示/隐藏"
-                           "主窗口」快捷键唤回后重试")
+                return False, ("微信主窗口现在是**隐藏**状态（收进了托盘，不是自绘故障）—— "
+                               "点任务栏/托盘的微信图标把它打开，或按「显示/隐藏主窗口」"
+                               f"快捷键（当前配置 {self.show_hotkey}）唤回后重试")
+            return False, ("读不到微信主窗口 —— 微信可能没启动，或主窗口被收进了托盘。"
+                           "请确认微信在运行并点开主窗口后重试")
 
         wnd = self._window()
         if self._is_minimized(wnd):
