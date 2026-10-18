@@ -421,6 +421,87 @@ class TestRealDeviceLayout(unittest.TestCase):
         # 时间条照留（它只是排障信息，本身就可能只有 40px 高）
         self.assertIn("今天 08:42", f.separators)
 
+    # --- H5 卡片展开后的「收起」按钮 ---
+    #
+    # 真机 2026-10-18 17:40 那帧（《履约-客户声音晚报》1200 字）：钉钉把消息
+    # 包成了「时间条 + chatting_content_view_container」，卡片展开后容器里
+    # 多了一个 ``LinearLayout(content-desc="收起")`` 按钮，挂在卡片**底部**
+    # （bounds 1880~1968，而气泡从 265 起）。当时的发送者就是这么变成「收起」的
+    # —— 库里那条记录的 sender_name 至今是「收起」，转发到微信群也显示成它。
+
+    def expanded_card_item(self, sender: str, lines: list[str]) -> str:
+        """复刻真机形状：时间条 + 内容容器（头像/昵称/气泡/收起按钮）。"""
+        top, h = 265, 1400
+        body = "".join(
+            f'<node index="{30 + i}" text="{t}" class="android.widget.TextView" '
+            f'package="{PKG}" bounds="[212,{top + 200 + 70 * i}]'
+            f'[964,{top + 260 + 70 * i}]"></node>'
+            for i, t in enumerate(lines))
+        return (
+            f'<node index="20" text="" class="android.widget.LinearLayout" package="{PKG}" '
+            f'bounds="[0,{top}][1176,{top + h}]">'
+            # ① 时间条（真机上它和消息在同一层，且 bounds 会塌）
+            f'<node index="21" text="" class="android.widget.LinearLayout" package="{PKG}" '
+            f'bounds="[0,{top}][1176,{top + h}]">'
+            f'<node index="22" text="" class="android.widget.LinearLayout" package="{PKG}" '
+            f'resource-id="{PKG}:id/layout_chatting_split" bounds="[0,{top}][1176,-1322]">'
+            f'<node index="23" text="今天 17:33" class="android.widget.TextView" '
+            f'resource-id="{PKG}:id/chatting_time_tv" package="{PKG}" '
+            f'bounds="[473,{top}][702,-1325]"></node></node>'
+            # ② 内容容器 —— 真机上它从列表顶部一直到底部
+            f'<node index="24" text="" class="android.widget.RelativeLayout" package="{PKG}" '
+            f'resource-id="{PKG}:id/chatting_content_view_container" '
+            f'bounds="[0,{top}][1176,{top + h}]">'
+            # 「收起」按钮：排在头像**前面**，但位置在卡片底部
+            f'<node index="25" text="" class="android.widget.LinearLayout" package="{PKG}" '
+            f'content-desc="收起" clickable="true" bounds="[481,{top + 1155}]'
+            f'[694,{top + 1243}]">'
+            f'<node index="26" text="收起" class="android.widget.TextView" package="{PKG}" '
+            f'bounds="[519,{top + 1167}][605,{top + 1230}]"></node>'
+            f'<node index="27" text="&#xf3c3;" class="android.widget.TextView" package="{PKG}" '
+            f'bounds="[618,{top + 1177}][662,{top + 1221}]"></node></node>'
+            # 头像
+            f'<node index="28" text="" class="android.widget.FrameLayout" package="{PKG}" '
+            f'resource-id="{PKG}:id/avatar_signal_group" bounds="[9,{top}][153,-700]">'
+            f'<node index="29" text="" class="android.widget.ImageView" package="{PKG}" '
+            f'content-desc="{sender}" bounds="[24,{top}][137,-700]"></node></node>'
+            # 昵称 + 机器人
+            f'<node index="30" text="" class="android.view.ViewGroup" package="{PKG}" '
+            f'resource-id="{PKG}:id/rl_title" bounds="[178,{top}][1006,-800]">'
+            f'<node index="31" text="{sender}" class="android.widget.TextView" package="{PKG}" '
+            f'resource-id="{PKG}:id/chatting_title" bounds="[178,{top}][406,-800]"></node>'
+            f'<node index="32" text="机器人" class="android.widget.TextView" package="{PKG}" '
+            f'bounds="[419,{top}][536,-800]"></node></node>'
+            # 气泡
+            f'<node index="33" text="" class="android.widget.FrameLayout" package="{PKG}" '
+            f'resource-id="{PKG}:id/chat_bubble_container" bounds="[174,{top}]'
+            f'[1002,{top + h}]">{body}</node>'
+            f'</node></node></node>')
+
+    def test_collapse_button_is_not_the_sender(self):
+        """卡片里的「收起」按钮在气泡下方，不能顶替发送者。
+
+        2026-10-18 实测事故：这条记录入库时 sender_name 就是「收起」。
+        """
+        f = parse_frame(dt_frame(self.expanded_card_item(
+            "履约跟单专员", ["@所有人", "履约-客户声音晚报 · 10月18日"])))
+        self.assertEqual(len(f.units), 1)
+        unit = f.units[0]
+        self.assertEqual(unit.sender, "履约跟单专员",
+                         "发送者变成了「收起」—— 卡片底部那个按钮被当成昵称了")
+        self.assertNotIn("收起", unit.content)
+        self.assertEqual(unit.content, "@所有人\n履约-客户声音晚报 · 10月18日")
+
+    def test_expanded_card_still_splits_after_time_strip(self):
+        """「时间条 + 内容容器」这一层要穿过去，否则气泡会被认成整屏容器。"""
+        f = parse_frame(dt_frame(
+            self.expanded_card_item("履约跟单专员", ["正文一"]),
+            dt_item("今天 17:40",
+                    dt_message("拦截跟单专员", ["下一条正文"], 1900))))
+        self.assertEqual([u.sender for u in f.units],
+                         ["履约跟单专员", "拦截跟单专员"])
+        self.assertEqual([u.content for u in f.units], ["正文一", "下一条正文"])
+
     def test_bubble_found_by_id_when_bounds_collapsed(self):
         """气泡按 resource-id 认，不看面积。
 

@@ -629,6 +629,61 @@ def _strip_robot_tag(name: str) -> str:
     return ROBOT_TAG_RE.sub("", name or "").strip()
 
 
+def _skip_time_strip(node: Node) -> Node:
+    """穿过「时间分隔条 + 真正的消息容器」这一层，落到消息容器上。
+
+    真机上 ListView 的一个子节点常常是「先一条时间条、再一条消息」：
+    ``LinearLayout`` › ``[layout_chatting_split(今天 17:33), LinearLayout ›
+    chatting_content_view_container(头像/昵称/气泡)]``。
+
+    直接在这一层找气泡会挑中 ``chatting_content_view_container`` —— 它从列表
+    顶部一直到底部（bounds 塌陷，真机 (0,265,1176,2018)），把整条消息连同
+    外面的「收起」按钮全包进来了。再往里下钻一层才拿得到真正的
+    ``chat_bubble_container`` 与 ``chatting_title``。
+
+    判据：**去掉时间条之后只剩一个带标签的子节点**才下钻。多于一个说明这一层
+    已经装着好几块内容，再钻就钻过头了。
+    """
+    for _ in range(2):
+        kids = _labeled_children(node)
+        rest = [k for k in kids if not _is_time_strip(k)]
+        if len(rest) != 1 or not _labeled_children(rest[0]):
+            break
+        node = rest[0]
+    return node
+
+
+def _sender_candidate(k: Node) -> str:
+    """把一个候选块读成昵称字符串；**明显不是昵称的块返回空串**。
+
+    两处反直觉的地方，都是真机事故换来的：
+
+    ① **「整块只有一个叶子、且那个叶子的文本和块的 content-desc 一样」的块，
+       多半是按钮**而不是昵称。真机上 H5 卡片展开后，气泡外面会多出一个
+       ``LinearLayout(content-desc="收起")`` 按钮（里面还套个 ``TextView``
+       写着「收起」）。它排在气泡**之前**，于是被 `_bubble_and_sender` 当成
+       「气泡之前第一个像名字的块」——库里那条 1200 字晚报的发送者就这么变成
+       了「收起」（2026-10-18 实测）。昵称块不会是这个形态：``rl_title`` 里有
+       `chatting_title` + `机器人` 两个叶子，头像块里是 ``content-desc`` 而
+       **没有**文本叶子。
+
+    ② 读容器时**取第一个叶子**这条老逻辑要保留：``rl_title`` 的第一个叶子就是
+       `chatting_title`（「机器人」标签在后），头像块的第一个叶子也是昵称。
+       只有「容器自带 content-desc」时才用 desc —— 那是头像块的名字。
+    """
+    label = (k.label or "").strip()
+    leaves = _clean_leaves(k)
+    if not leaves:
+        return label
+    if (len(leaves) == 1 and k.desc and not k.text
+            and leaves[0].label == k.desc):
+        # 形态对上了「按钮」：desc 和唯一的文本叶子是同一句话。
+        return ""
+    if k.desc and not k.text:
+        return k.desc                       # 头像块：名字在 content-desc 上
+    return leaves[0].label
+
+
 def _bubble_and_sender(node: Node) -> tuple[Node | None, str]:
     """在一条消息行里分出「气泡（正文）」与「昵称」。
 
@@ -636,7 +691,13 @@ def _bubble_and_sender(node: Node) -> tuple[Node | None, str]:
     ``CheckBox``, ``ViewGroup[昵称, 机器人]``, ``气泡FrameLayout``, ``零宽时间]``。
     昵称取气泡**之前**第一个像名字的块，正文取气泡里的全部文本 —— 这样头像的
     content-desc 与「机器人」标签都不会混进正文。
+
+    ⚠ 找昵称时**只认气泡之前、且与气泡纵向重叠的块**。H5 卡片展开后，气泡
+    外面会冒出一个「收起」按钮（真机坐标在气泡下方，见 `_sender_candidate`），
+    它在文档顺序里可能排在气泡前面 —— 不按纵向位置挡掉，《履约-客户声音晚报》
+    那条的发送者就成了「收起」。
     """
+    node = _skip_time_strip(node)
     kids = _labeled_children(node)
     bubble: Node | None = None
 
@@ -663,16 +724,25 @@ def _bubble_and_sender(node: Node) -> tuple[Node | None, str]:
     if bubble is None:
         return None, ""
 
+    bt, bb = bubble.bounds[1], bubble.bounds[3]
     sender = ""
     for k in kids:
         if k is bubble:
             break
-        if _labeled_children(k):
-            leaves = _clean_leaves(k)
-            cand = leaves[0].label if leaves else ""
-        else:
-            cand = k.label
-        cand = _strip_robot_tag(cand)
+        # ── 昵称必须**贴着气泡上沿** ───────────────────────────────
+        # 真机上昵称块（``rl_title`` / 头像 ``avatar_signal_group``）的 top 与
+        # 气泡 top **完全相等**（真机都是 265），而「收起」按钮挂在卡片**底部**
+        # （top=1718，气泡 top=265）。
+        #
+        # 不能拿「与气泡纵向重叠」当判据：气泡被算成整屏 (265~2018) 时谁都能
+        # 重叠，发送者就变成「收起」。
+        #
+        # 也不能看 bottom：这条消息行被判定为满屏长消息时，行内各块的 bottom
+        # 会塌成负数（rl_title bottom=-1247），拿它比大小会把真昵称排除掉。
+        kt = k.bounds[1]
+        if kt > bt + SENDER_GAP_TOL:
+            continue
+        cand = _strip_robot_tag(_sender_candidate(k))
         if (cand and len(cand) <= SENDER_MAX_LEN
                 and not PLACEHOLDER_RE.match(cand) and cand not in NOISE_LABELS
                 and not TIME_ONLY_RE.match(cand)):
