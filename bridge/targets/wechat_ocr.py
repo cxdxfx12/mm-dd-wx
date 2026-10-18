@@ -102,8 +102,12 @@ MAIN_TITLES = ("微信", "WeChat")
 _LAYOUT = {
     # 会话列表：左侧栏。微信 4.x 的列表宽度约占窗口 34%
     "list": (0.092, 0.037, 0.430, 1.000),
-    # 搜索框（列表顶部「🔍 搜索」）—— 实测 720 宽时框体 x∈[95,300]、y≈74
-    "search": (0.27, 0.068),
+    # 搜索框（左上角「🔍 搜索」）—— 1:1 截图实测框体 x∈[85,260]、y∈[45,72]，
+    # 中心 (172,58) → 比例 (0.24, 0.053)。
+    # ⚠ 历史坑：旧值 (0.27, 0.068) 的点击点 (194,74) 落在框**下沿外 2 像素**
+    # 的缝隙里，永远点不中且无任何报错；后来试的 (0.119,0.026) 又落在标题栏。
+    # 改这个值前必须先 1:1 截图量准，别用放大图估。
+    "search": (0.24, 0.053),
     # 右侧聊天区标题栏（回读校验「当前打开的是哪个群」）：
     # 720 宽实测标题在 y∈[38,72]，避开 y<32 的系统按钮行
     "title": (0.45, 0.034, 0.90, 0.068),
@@ -320,7 +324,17 @@ class WeChatOcrTarget(Target):
         return bool(t) and (t in s or s[:len(t)] in t)
 
     def _search_chat(self, hwnd: int, target: str) -> tuple[bool, str]:
-        """点搜索框 → 输入群名 → 点第一条结果。"""
+        """点搜索框 → 输入群名 → 回车选第一条 → 标题栏确认。
+
+        ⚠ 两个坑（都在 2026-10-18 实测踩过）：
+        1. 搜索框坐标必须 1:1 截图量准，偏 2 像素就是永远无响应；
+        2. 搜索页里**搜索框自己**和「搜索框回显+网络结果」的混合行
+           OCR 出来和目标一模一样（score 1.0），直接 OCR 匹配会点错
+           （点回搜索框 → 假成功）。
+           所以首选**粘贴后按回车**（微信会打开第一条精确匹配），
+           回车失败才回落到 OCR 定位结果项，且匹配时排除搜索框区域
+           （cy > 0.075H），最后必须标题栏确认才算成功。
+        """
         if not self._click(hwnd, *_LAYOUT["search"]):
             return False, "点击搜索框失败"
         time.sleep(0.45)
@@ -329,14 +343,29 @@ class WeChatOcrTarget(Target):
             return False, "搜索词粘贴失败"
         time.sleep(0.9)                      # 等搜索结果返回
 
+        # ---- 首选：回车选第一条结果 ----
+        self._press(VK_RETURN)
+        time.sleep(1.2)
+        opened, title = self._current_chat_title(hwnd)
+        if opened and self._title_matches(target, title):
+            self._current = target
+            return True, f"已通过搜索（回车）切到目标（标题栏：{title[:24]}）"
+
+        log.info("回车未切到目标（标题栏 %r），回落到 OCR 点结果项", title)
+
+        # ---- 回落：OCR 定位结果项（排除搜索框区域） ----
         img, items = self._snapshot(hwnd)
         if img is None:
             return False, "搜索结果页抓帧失败"
 
-        hit, score = self._best_match(target, items)
-        if hit is None:
-            # 再宽一档：搜索结果里群名可能带「（xx）」后缀等
-            hit, score = self._best_match(target, items)
+        img_h = img.size[1]
+        below_box = [it for it in items
+                     if it.get("cy", 0) > img_h * 0.075]
+        if not below_box:
+            self._press(VK_ESCAPE)
+            return False, "搜索结果里没有可点的条目（只看到搜索框）"
+
+        hit, score = self._best_match(target, below_box)
         if hit is None:
             self._press(VK_ESCAPE)
             return False, f"搜索结果里没认出目标群（最高 {score:.2f}）"
@@ -344,15 +373,19 @@ class WeChatOcrTarget(Target):
         if not self._click_abs(hwnd, hit["cx"], hit["cy"]):
             self._press(VK_ESCAPE)
             return False, f"点击搜索结果「{hit['text']}」失败"
-        time.sleep(0.8)
         self._current = hit["text"]
 
-        # 核对：点开后右侧标题栏应能识别到群名
-        title_ok, title_txt = self._current_chat_title(hwnd)
-        if title_ok:
-            return True, f"已通过搜索切到「{hit['text']}」（标题栏：{title_txt}）"
-        log.info("搜索切会话后未能回读标题栏（%s），继续发送", title_txt)
-        return True, f"已通过搜索切到「{hit['text']}」（相似度 {score:.2f}，标题未核对）"
+        # 核对：结果页切换有延迟，重试读标题栏
+        title_txt = ""
+        for _ in range(3):
+            time.sleep(0.6)
+            ok, title_txt = self._current_chat_title(hwnd)
+            if ok and self._title_matches(target, title_txt):
+                return True, (
+                    f"已通过搜索（OCR 定位）切到目标（标题栏：{title_txt[:24]}）")
+        return False, (
+            f"点击搜索结果「{hit['text']}」后标题栏未确认到目标"
+            f"（读到：{title_txt or '空'}）")
 
     def _current_chat_title(self, hwnd: int) -> tuple[bool, str]:
         """OCR 右侧聊天区标题栏，确认当前打开的会话。"""
