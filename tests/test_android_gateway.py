@@ -1301,6 +1301,49 @@ class TestScreenParse(GatewayCase):
         self.assertEqual(len(self.received), 1, "到头来只发一条")
         self.assertEqual(self.received[0].content, prev, "应当发攒到的最全版本")
 
+    # ---- 锚点丢失 → 基线重建前必须先投递攒着的长消息 -------------------
+    #
+    # 真机 2026-10-18 19:54，用户原话「翻了也不行」：
+    #   为补齐那条 1231 字的卡片，手机按电脑的指示往上翻了一屏；翻完锚点
+    #   找不回，试探额度用完 → 走「认输」分支 commit 重建基线。旧实现
+    #   在这个分支上**直接把 long_head 扔了** —— 刚补全的全文跟着作废，
+    #   用户看到的还是翻页之前那半截。补全的成果不该因为「锚点对不上」
+    #   这个跟它无关的理由被丢掉。
+
+    def test_anchor_lost_still_delivers_the_collected_long_message(self):
+        """锚点丢失、试探失败 → 重建基线之前，先把已攒到的长消息投出去。"""
+        s1, s2, s3, first_text = self._three_screens()
+        self.post_frame(self.screen(self.row("旧消息A", 200, "签收跟单专员")))
+        self.post_frame(self.screen(
+            self.row("旧消息A", 200, "签收跟单专员"),
+            self.one_long("履约跟单专员", 250, 3200, first_text)))
+        r1 = self.post_fill(self.screen(
+            self.one_long("履约跟单专员", -100, 3200, s2)))
+        self.assertTrue(r1.get("scroll"), "这一轮应当还要继续翻")
+
+        # 手机又翻了一屏，但这一屏跟之前完全对不上（锚点彻底丢了）。
+        # 连报两帧，把「翻一屏试探」的额度用光，逼它走重建分支。
+        lost = self.screen(
+            self.row("完全不认识的内容1", 400, "路人甲"),
+            self.row("完全不认识的内容2", 700, "路人乙"))
+        first_lost = self.post_frame(lost)
+        self.assertTrue(first_lost.get("scroll"), "第一次丢锚点应当先试探")
+        second_lost = self.post_frame(lost)
+
+        self.settle()
+        self.assertEqual(len(self.received), 1,
+                         f"重建基线把补全成果丢了（note={second_lost.get('note')!r}）")
+        got = self.received[0].content
+        # 这一轮还没翻到第一屏（s1），所以发出去的应当是「已攒到的最全版本」
+        # = 第 2 + 第 3 屏。这里**不能**断言含 A015 —— 那是下一轮才露出来的。
+        # 要钉住的是「已攒到的绝不能丢」，不是「必须已经齐了」。
+        self.assertIn("B010", got, "第 2 屏补上来的内容丢了")
+        self.assertIn("C020", got, "第 3 屏的内容丢了")
+        # 长度也要对上「已攒到的那一版」而不是退回到最初那半截。
+        # 这个场景里已攒的 = s2（第 2 屏 + 第 3 屏），252 字左右。
+        self.assertGreater(len(got), 200,
+                           f"发出去的退回成最初那半截了：{len(got)} 字")
+
     def test_plain_frame_between_rounds_does_not_drop_the_long_message(self):
         """补全中间夹一帧「没有截断也没有新消息」，不能把攒着的长消息清掉。
 

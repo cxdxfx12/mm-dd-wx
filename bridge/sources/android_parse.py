@@ -63,6 +63,10 @@ TIME_ONLY_RE = re.compile(
 
 # 非文本消息的占位描述（图片/文件这类只有 content-desc，没有正文）。
 # 用半角方括号 —— 机器人正文里的【】是全角，不会被误伤。
+# 纯图标字体的「名字」：钉钉卡片的按钮/图标用 Unicode 私有区（U+E000–U+F8FF）
+# 字符渲染，无障碍读出来的就是一个这样的字符。不能当昵称。
+ICON_ONLY_RE = re.compile(r"^[\ue000-\uf8ff\s]+$")
+
 PLACEHOLDER_RE = re.compile(
     r"^\[(图片|视频|文件|语音|表情|动画表情|链接|位置|红包|转账)\]$"
 )
@@ -79,6 +83,13 @@ NOISE_LABELS = frozenset({
     "复制", "复制链接", "转发", "转发给", "撤回", "回复", "引用", "多选", "删除",
     "编辑", "收藏", "翻译", "提醒", "更多", "举报", "保存图片", "查看大图",
     "全屏", "下载", "识别图中二维码",
+    # 卡片类消息（数字质控、月报、拦截单…）在正文底部挂的操作按钮。
+    # 它们**贴着气泡上沿**（真机 2026-10-18 19:57：`查看全部` top=256，
+    # 气泡 top=265，差 9px 小于 SENDER_GAP_TOL），于是被当成昵称 ——
+    # 实测转发出去的发送者名字就叫「查看全部」。归进噪声表最省事：
+    # 认不出昵称时宁可为空，也不能拿按钮名冒充发送者。
+    "查看全部", "收起", "展开", "查看详情", "查看完整明细", "点击查看",
+    "查看完整履约失败明细",
 })
 
 # 逐层往下的最大深度：防病态布局（自嵌套包装）把递归拖爆。
@@ -228,6 +239,11 @@ class Unit:
     kind: str = "text"                  # text | image | file | voice | …
     y0: int = 0
     y1: int = 0
+    # 被屏幕下沿夹掉的高度（px），0 = 没被夹。
+    # 钉钉裁 bounds 时不是「把 bottom 夹到可视区」，而是**把 top 换到真实位置、
+    # bottom 留在可视区** —— 于是 top > bottom。这个差值就是没露出来的高度。
+    # 详见 ``clipped_units`` 的 ③。
+    clipped_below: int = 0
 
     @property
     def fp(self) -> str:
@@ -745,7 +761,11 @@ def _bubble_and_sender(node: Node) -> tuple[Node | None, str]:
         cand = _strip_robot_tag(_sender_candidate(k))
         if (cand and len(cand) <= SENDER_MAX_LEN
                 and not PLACEHOLDER_RE.match(cand) and cand not in NOISE_LABELS
-                and not TIME_ONLY_RE.match(cand)):
+                and not TIME_ONLY_RE.match(cand)
+                # 图标字体（ 之类）不是名字。钉钉的卡片按钮用私有区
+                # 字符画图标，无障碍把它读成一个字母 —— 比「查看全部」更隐蔽，
+                # 因为它在噪声表里查不到。
+                and not ICON_ONLY_RE.match(cand)):
             sender = cand
             break
     return bubble, sender
@@ -912,6 +932,48 @@ def _inline_table(body_nodes: list[Node]) -> tuple[str, list[Node], int]:
     return _render_table(grid), rest, min(b[1] for b in grid[0])
 
 
+def _clamp_depth(body_nodes: list[Node], view: tuple[int, int, int, int],
+                 *, tol: int = 0) -> int:
+    """气泡内文本被屏幕下沿夹掉了多少 px（0 = 没被夹）。
+
+    真机形状（2026-10-18 19:57，那条「标签履约月累计达成」卡片）::
+
+        '1人未读'  bounds = (842, 5015, 977, 2013)
+
+    ``top=5015`` 是真实位置，``bottom=2013`` 是可视区下沿 —— 两者一颠倒，
+    就说明这个节点本来在屏幕下方，被裁上来了，被裁掉 ``5015-2013 = 3002`` px。
+
+    ⚠ **倒挂 ≠ 被夹。** 钉钉还有另一种倒挂形态，见真机存档
+    ``screen-20261017_121851.xml``（一条完整消息，以 🙌 收尾）::
+
+        '小件员名称'  bounds = (250, 265, 470, -158)
+        '拦截跟单专员' bounds = (24, 265, 137, -1045)
+
+    整行被滚到列表顶端，行内所有叶子的 ``top`` 被压成**可视区上沿 265**、
+    ``bottom`` 变成负数 —— 这是「滚到顶了」，内容一条不少。第一版判据只看
+    ``top > bottom`` 就把这条完整消息误报成截断（``test_every_real_frame_is_clean``
+    当场抓到）。
+
+    区分点：**被夹断的节点，``top`` 会越过可视区下沿**（真实位置在屏幕下方），
+    而「滚到顶」的节点 ``top`` 正好落在可视区上沿、绝不会超过下沿。
+    所以判据是 ``top > bottom`` **且** ``top > view_bottom``。
+
+    ⚠ 只扫气泡**内部/整行**的叶子。屏幕底部输入栏那些按钮
+    （``Group Check in`` / ``More``）的坐标是真实位置、不是夹断，
+    混进来会导致每帧都判「有长消息」、手机空转。
+    """
+    view_bottom = view[3]
+    deepest = 0
+    for n in body_nodes:
+        b = n.bounds
+        if not b:
+            continue
+        t, bt = b[1], b[3]
+        if t > bt and t > view_bottom + tol:   # 倒挂 **且** 起点在可视区下方
+            deepest = max(deepest, t - bt)
+    return deepest
+
+
 def split_row(row: Node) -> Unit:
     """一个「消息行」→ 一个 :class:`Unit`（时间分隔条也会返回，kind="time"）。
 
@@ -1018,8 +1080,35 @@ def parse_frame(text: str) -> Frame:
     # （行级 bounds 在真机上是准的；只有深层子节点的 bounds 会失真，见
     # `_is_time_strip` 的说明。）
     units.sort(key=lambda u: u.y0)
+    _fill_clamp_depth(units, container, frame.view)
     frame.units = units
     return frame
+
+
+def _fill_clamp_depth(units: list[Unit], container: Node,
+                      view: tuple[int, int, int, int]) -> None:
+    """给每个 Unit 记上「被屏幕下沿夹掉多少 px」。
+
+    放在这里（而不是 `split_row` 里）是因为**夹断要靠可视区下沿判断**，
+    而可视区要等 `find_message_list()` 找到容器才知道 —— `split_row` 只拿到
+    一行节点，手里没有 view。
+
+    一个 Unit 对应哪一行？按 ``y0`` 反查：``_one()`` 是从一行切出一个 Unit，
+    所以拿 ``u.y0`` 去容器子节点里找 top 相同的那行即可。找不到（时间条被
+    合并、坐标失真）就留 0，宁可少判一次截断，也不能瞎归因。
+
+    ⚠ 用**整行**的叶子算，不能用气泡内部的节点：气泡识别会挑一棵子树，
+    「1人未读」那种挂在气泡外侧的小标签就漏在外面 —— 而真机上恰恰是它带着
+    被夹的真实坐标（top=5015 / bottom=2013），漏掉就等于没判。
+    """
+    rows: dict[int, Node] = {}
+    for row in container.children:
+        rows.setdefault(min(row.bounds[1], row.bounds[3]), row)
+    for u in units:
+        row = rows.get(u.y0)
+        if row is None:
+            continue
+        u.clipped_below = _clamp_depth(_leaves(row), view)
 
 
 # ------------------------------------------------------------------ 截断检测
@@ -1079,6 +1168,29 @@ def clipped_units(frame: Frame, *, tol: int = 24) -> list[Unit]:
     边都贴在可视区边界上，①② 都因「没有越界」而放过，只能靠这条认出来。
     （真机存档 screen-20261017_191838 的 814 字那条：h=1753 正好等于可视高度。）
 
+    ── ③「被夹断的坐标」：贴边仍可能被切（2026-10-18 补）────────
+    ⚠ ①②③ 之外还有一种形状会漏：钉钉裁 bounds 时**不是**把超出的边夹到
+    可视区边界，而是**交换了 top/bottom**。真机 19:57 那一帧：
+
+        '1人未读'  bounds = (842, 5015, 977, 2013)   ← top 5015 > bottom 2013
+
+    这条卡片真实高度一直延伸到 y=5015，可视区只到 2013 —— 下面还有
+    3002px 没露出来。可它**外层气泡**的 bounds 被规规矩矩夹成
+    ``y1 == bottom``，①②③ 全判「完整」，于是：
+
+      · 不补全（``needs_scroll`` 返回空）；
+      · 静默 3 秒一到就按这半截投递 —— 用户看到的是
+        「…查看完整月报明细（Exce」，`"l）"` 永远等不到；
+      · 手动翻一屏后内容补齐，但那一次翻页又弄丢了锚点，走「本帧不转发，
+        基线重建」—— 于是「翻了也不行」（19:54 真机，用户原话）。
+
+    判据：气泡内**任意文本节点**的 ``top`` 明显大于 ``bottom``（倒挂），
+    说明它原本在可视区下方、被夹了上来。倒挂量就是被切掉的高度。
+
+    ⚠ 只在**气泡内部**找，不能扫整棵树：屏幕底部那些输入栏按钮
+    （``Group Check in`` / ``Watermark Camera`` / ``More``）本身就在可视区
+    下方 y=2013~2262，它们的坐标是真实位置，不是夹断，扫进来会天天误报。
+
     ``tol`` 只用来吃掉气泡圆角、滚动惯性带来的几像素浮动。
 
     返回空列表 = 这一屏的消息都是完整的，不需要滚动补全。
@@ -1095,7 +1207,11 @@ def clipped_units(frame: Frame, *, tol: int = 24) -> list[Unit]:
         tall = (y1 - y0) >= view_h * FULL_SCREEN_RATIO
         below = y1 > bottom + tol         # ① 下面还有
         above = y0 < top - tol            # ② 上面还有（**严格小于**，不含贴边）
-        if tall or below or above:
+        # ③ 气泡内的文本被「夹上来」了（top>bottom 倒挂）。这是唯一能认出
+        #    「底边贴着可视区下沿、但其实还有大截没露出来」的判据 —— 真机
+        #    19:57 那张卡片就这么漏掉的，用户手动翻页后才补上。
+        squeezed = u.clipped_below > tol
+        if tall or below or above or squeezed:
             out.append(u)
     return out
 
