@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -222,11 +223,37 @@ def build_payload(app_exe: Path) -> Path:
     return zip_path
 
 
+def app_version() -> str:
+    """从 ``bridge/__init__.py`` 读版本号 —— 全项目唯一来源。
+
+    不能 import bridge 来读：本脚本跑在构建解释器里，不一定装了项目依赖，
+    而 bridge/__init__.py 一旦将来 import 了别的东西就会把打包卡死。
+    """
+    text = (ROOT / "bridge" / "__init__.py").read_text(encoding="utf-8")
+    m = re.search(r'^__version__\s*=\s*"([^"]+)"', text, re.M)
+    if not m:
+        raise SystemExit("bridge/__init__.py 里找不到 __version__")
+    return m.group(1)
+
+
 def build_setup(payload_zip: Path) -> Path:
     print("\n>>> 第 3 步：打包安装向导 Setup …", flush=True)
+    # 安装向导里的 VERSION 是硬编码的常量（它被单独打成 Setup.exe，运行时
+    # 拿不到项目源码）。这里在打包前把那一行替换成同一个版本号 ——
+    # 否则会出现「界面写着 0.31、控制面板写着 1.0.0」的错位，
+    # 用户报版本时会报错，排查方向跟着跑偏。
+    ver = app_version()
+    src = (HERE / "setup_gui.py").read_text(encoding="utf-8")
+    patched, n = re.subn(r'^VERSION = "[^"]*"', f'VERSION = "{ver}"',
+                         src, count=1, flags=re.M)
+    if n != 1:
+        raise SystemExit("setup_gui.py 里找不到 VERSION = \"...\" 这一行")
+    staged = BUILD / "setup_gui.py"
+    staged.write_text(patched, encoding="utf-8")
+    print(f"    安装向导版本：{ver}（来自 bridge/__init__.py）", flush=True)
     pyi("--onefile", "--windowed", "--icon", str(ROOT / "app" / "app.ico"),
         "--name", f"{APP_NAME}-Setup",
-        "--add-data", f"{payload_zip};.", str(HERE / "setup_gui.py"))
+        "--add-data", f"{payload_zip};.", str(staged))
     out = ROOT / "dist" / f"{APP_NAME}-Setup.exe"
     if not out.is_file():
         raise SystemExit("Setup 没有生成")
@@ -235,6 +262,7 @@ def build_setup(payload_zip: Path) -> Path:
 
 def main() -> int:
     print(WELCOME.format(name=APP_NAME))
+    print(f"    版本：{app_version()}")
     BUILD.mkdir(exist_ok=True)
     DIST.mkdir(exist_ok=True)
 

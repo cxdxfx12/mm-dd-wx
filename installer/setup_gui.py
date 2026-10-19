@@ -35,7 +35,11 @@ import tkinter as tk
 # ---------------------------------------------------------------- 品牌信息
 
 APP_NAME = "喵喵钉钉-微信消息转发桥"
-VERSION = "1.0.0"
+# ⚠ 这一行只是**兜底值**：installer/build.py 打包时会把整行替换成
+#   bridge/__init__.py 里的 __version__。手工单独跑 setup_gui.py 调试时
+#   才会用到这里的值 —— 改了记得跟 bridge/__init__.py 对齐。
+#   格式必须是「0.xx」，与主程序底部的版本号一致。
+VERSION = "0.31"
 PUBLISHER = "杭州喵喵至家网络有限公司"
 WEBSITE = "www.hbdxm.com"
 COPYRIGHT = f"杭州喵喵至家网络有限公司　{WEBSITE}"

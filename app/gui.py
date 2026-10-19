@@ -36,6 +36,10 @@ for _p in (str(APP_DIR), str(BASE_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+# 版本号**只有一个来源**：bridge/__init__.py。
+# 安装包里的版本也由 installer/build.py 从同一处注入，别在这个文件里写死。
+from bridge import __version__ as APP_VERSION          # noqa: E402
+
 
 def _notify_robots(n: dict) -> list[str]:
     """配置段 -> 已填地址的机器人清单（只用于界面上的「配了没」判断）。
@@ -376,7 +380,7 @@ class App(tk.Tk):
     def _about(self):
         messagebox.showinfo(
             "关于",
-            "喵喵钉钉-微信消息转发桥\n\n"
+            f"喵喵钉钉-微信消息转发桥　版本 {APP_VERSION}\n\n"
             "采集：钉钉窗口截屏 + 离线 OCR（不依赖开放平台权限）\n"
             "投递：微信 4.x 控件自动化\n\n"
             f"配置文件：{CONFIG_PATH}\n"
@@ -611,7 +615,10 @@ class App(tk.Tk):
                   self.btn_folder):
             b.pack(side="left", padx=(0, 6))
 
-        # 底部信息条：左边是运行状态，右边是版权与官网
+        # 底部信息条：左边是运行状态，右边是版本号与版权。
+        #
+        # ⚠ pack(side="right") 的先后顺序决定左右：先 pack 的贴最右。所以
+        #   先把版权打上去，版本号自然落在它左边、离状态文字更近。
         foot = tk.Frame(self, bg=BG)
         foot.pack(fill="x", side="bottom", before=self.main_frame)
         self.statusbar = tk.Label(foot, text="就绪", bg=BG, fg=MUTED,
@@ -619,6 +626,12 @@ class App(tk.Tk):
         self.statusbar.pack(side="left")
         tk.Label(foot, text=COPYRIGHT, bg=BG, fg="#9aa3b8", font=F_COPY,
                  anchor="e", padx=16, pady=4).pack(side="right")
+        # 版本号要看得到、但不抢眼：比版权深一档的灰，字重正常。
+        # 用户 2026-10-19：「每次更新或者修复以后知道是哪个版本」。
+        self.ver_label = tk.Label(foot, text=f"版本 {APP_VERSION}", bg=BG,
+                                  fg=MUTED, font=F_COPY, anchor="e",
+                                  pady=4, padx=0)
+        self.ver_label.pack(side="right", padx=(0, 12))
         self._refresh_state()
 
     # ================================================== 配置
