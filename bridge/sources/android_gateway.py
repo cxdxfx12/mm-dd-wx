@@ -91,13 +91,25 @@ UNKNOWN_PAGE_ALERT_AFTER = 3
 # 机器人日报每天格式相同、数字不同，content_key 会保留全部数字，不会撞。
 NEAR_DUP_WINDOW = 600.0
 # 锚点对不上时「请手机翻一屏试着找回」的节流参数。
-#   · PROBE_COOLDOWN：上一次试探到这一次的最短间隔（秒）。手机翻上去再翻回来
-#     约 700ms（Scroller 里 SWIPE_MS + SETTLE_MS），期间上报的都是中间态帧，
-#     冷却期就是为了等它安定下来，别把指令发成连环翻。
-#   · PROBE_MAX：连续这么多次没找回锚点就认输（多半是在翻历史/换了群）。
-#     对上一次就清零，所以偶发的「长消息挤掉锚点」永远有试探机会。
-PROBE_COOLDOWN = 3.0
-PROBE_MAX = 2
+#   · PROBE_COOLDOWN：发完翻页指令后，至少等这么久才算「屏幕安定」。手机翻上去
+#     再翻回来约 700ms（Scroller 里 SWIPE_MS + SETTLE_MS），期间上报的都是中间
+#     态帧。
+#   · PROBE_MAX：一轮里最多请手机翻几次。
+#   · PROBE_SETTLE_MAX：从第一次「等」算起，最多等这么久（秒）还没找回锚点就
+#     真认输。手机没手势权限、页面卡死时全靠它兜底，否则会永远等下去。
+#
+# ⚠ 2026-10-19 修（真机漏转「拦截单退单打印提醒」）：
+#   旧值是 COOLDOWN=3.0 / MAX=2，且**冷却期内命中直接判认输**。14:11:55 发出
+#   翻页指令，14:11:57 手机翻完把新帧送回来 —— 只隔 2 秒，落在冷却期里 →
+#   `_should_probe` 返回 False → 直接 commit 重建基线。那张长卡片（把上一帧
+#   锚点整条挤出屏幕的那条）就这样被登记成「已知历史」，**既没转发也没入库**，
+#   连 forward_recent.py 都补不回来。
+#   根因不是数值太小，是**状态不够**：冷却期内来的新帧意味着「手机正在翻」，
+#   应该继续等，而不是认输。现在拆成 probe / wait / give_up 三态，
+#   冷却期只表示 wait，不再表示 give_up。
+PROBE_COOLDOWN = 1.2
+PROBE_MAX = 6
+PROBE_SETTLE_MAX = 20.0
 # 长消息「攒齐再发」最多等多久（秒）。等不到补全帧就发手头那半截 ——
 # 手机没手势权限、用户在操作别的界面、群消息太快把前半截顶掉，都可能让
 # 补全永远不来。宁可发一条不完整的，也不能永远不发。
@@ -835,6 +847,9 @@ class _Ctx:
     align_md5: str = ""
     align_tried: int = 0
     align_at: float = 0.0
+    # 第一次「等手机翻页安定」的时刻；0 = 当前不在等待中。
+    # 有了它，一边翻一边来的中间态帧只会消耗「等待时间」而不会消耗试探次数。
+    align_wait_since: float = 0.0
     # ── 「先攒后发」缓冲 ───────────────────────────────────────────
     # 钉钉机器人的 H5 卡片是分批渲染的，这一帧看到的往往只是半成品。
     # 早期用「扣住等重报帧指纹一致」，但 H5 卡片每重绘一次整批指纹都变，
@@ -1472,7 +1487,12 @@ class _Handler(BaseHTTPRequestHandler):
                 # H5 帧的锚点丢失同样先试探一次（理由同下面原生帧那处）。
                 # **必须在 commit 之前**：commit 会把锚点覆盖成当前这屏，
                 # 覆盖之后就再也对不上了，试探也就白翻了。
-                if self._should_probe(frame_md5):
+                verdict = self._probe_decision(frame_md5)
+                if verdict == "wait":
+                    # ⚠ 绝不能落到下面的 commit：commit 会把锚点覆盖成当前
+                    #   这屏，之后翻回去也对不上了。
+                    return [], "锚点丢失，等手机翻页安定", False
+                if verdict == "probe":
                     self.ctx.align_md5 = frame_md5
                     log.warning("安卓画面解析：H5 卡片的锚点对不上 —— "
                                 "已请手机翻一屏试着找回（第 %d 次）",
@@ -1533,7 +1553,12 @@ class _Handler(BaseHTTPRequestHandler):
             # 翻历史或者换了群，那就重建基线、不再纠缠 —— 否则手机会在
             # 「翻上去、翻回来」之间无限来回。
             md5 = frame_md5
-            if self._should_probe(md5):
+            verdict = self._probe_decision(md5)
+            if verdict == "wait":
+                # 手机正在翻（或屏幕还没安定）：什么都不动，等下一帧。
+                # 不 commit 是关键 —— 锚点留着，翻回去才可能对上。
+                return [], "锚点丢失，等手机翻页安定", False
+            if verdict == "probe":
                 # 试探时不 commit —— 锚点必须留着，否则翻回来也对不上
                 self.ctx.align_md5 = md5
                 log.warning("安卓画面解析：上一帧的锚点在本帧里找不到 —— "
@@ -1543,6 +1568,15 @@ class _Handler(BaseHTTPRequestHandler):
             differ.commit(frame.units)          # 认输了，基线重建到当前画面
             log.warning("安卓画面解析：上一帧的锚点在本帧里找不到（翻历史／换群／"
                         "一屏全换）—— 本帧不转发，基线已重建到当前画面")
+            # ⚠ 重建基线 = 把屏上一切登记为「已知历史」，**这一屏里真正的新
+            #   消息会连同基线一起被吞掉，且不入库**（forward_recent.py 也补
+            #   不回来）。所以至少把屏上最新几条打进日志，事后有人问「XX 为
+            #   什么没转」时有据可查 —— 之前这里是完全静默的。
+            for u in (frame.units[-3:] if frame.units else []):
+                log.warning("  基线重建前屏上最新一条（可能被吞）：%s：%s",
+                            getattr(u, "sender", "") or "（未知）",
+                            (getattr(u, "content", "") or "")
+                            .replace("\n", " ")[:60])
             # ⚠ **重置基线之前，先把攒着的长消息投出去。**
             #   真机 2026-10-18 19:54（用户原话「翻了也不行」）：
             #   为补齐那条 1231 字的卡片，手机按指示往上翻了一屏；翻完锚点
@@ -1559,7 +1593,7 @@ class _Handler(BaseHTTPRequestHandler):
         # 这一帧正常判出了新内容 = 锚点是好的。清零试探计数，让下次真遇到
         # 「长消息挤掉锚点」时还有翻一屏的机会（不清零的话，一天里偶尔两次
         # 误试探就会把额度耗光，之后再丢消息就不再救了）。
-        self.ctx.align_tried = 0
+        self._reset_probe()                 # 锚点回来了，这一轮结束
 
         if diff.scrambled:
             # 锚点上方夹进了新内容（新卡片从屏幕顶挤进来，见 android_parse
@@ -1652,33 +1686,63 @@ class _Handler(BaseHTTPRequestHandler):
             return rest, "长消息待补全", True
         return [], "长消息待补全", True
 
-    def _should_probe(self, frame_md5: str) -> bool:
-        """锚点对不上时，该不该先请手机翻一屏试试？
+    def _probe_decision(self, frame_md5: str) -> str:
+        """锚点对不上时怎么处置：``probe`` / ``wait`` / ``give_up``。
 
-        三种情况不试探（直接认输、重建基线）：
-          · 同一帧已经试探过（md5 相同）—— 手机原地没动，再翻也是同一屏；
-          · 刚刚才为别的一帧翻过（``PROBE_COOLDOWN`` 秒内）—— 手机翻上去
-            再翻回来本身要 700ms 左右，期间上报的帧全是中间态，此时再发
-            指令会变成「翻、翻、翻」来回抖；
-          · 连续试探次数到顶 —— 说明屏上确实没有上一帧的锚点（翻历史 /
-            换群 / 一屏全换），再翻就是白折腾。
+        - ``probe``   请手机翻一屏（调用方要还原样把指令带出去）；
+        - ``wait``    **什么都不做**：既不 commit、也不发指令，等下一帧；
+        - ``give_up`` 认输，调用方 commit 重建基线。
 
-        对上了（``_locate`` 成功或正常发出了消息）会把 ``align_tried`` 清零，
-        所以偶发的「一条长消息挤掉锚点」永远有试探机会。
+        ⚠ 「等」必须是独立状态。旧实现只有「翻」和「认输」两态，冷却期内
+          来的新帧（手机刚翻完送回的第一帧，恰好落在冷却期里）被直接判成
+          认输 —— 长卡片挤掉锚点的那种漏转就是这么来的。屏幕变了 ≠ 手机
+          没在翻，恰恰相反，它说明手机正在翻。
+
+        判据顺序：
+          · 冷却期内 → wait（翻页还没安定，中间态帧没有判断价值）；
+          · md5 跟上一次试探帧一样 → wait（屏幕一动没动，再发指令也是同一屏）；
+          · 一轮翻到 ``PROBE_MAX`` → give_up；
+          · 等待累计超过 ``PROBE_SETTLE_MAX`` → give_up（手机没响应/卡死兜底）；
+          · 其余 → probe。
         """
-        if not frame_md5 or frame_md5 == self.ctx.align_md5:
-            return False
         now = time.monotonic()
-        if now - self.ctx.align_at < PROBE_COOLDOWN:
-            return False
+        settled = (now - self.ctx.align_at) >= PROBE_COOLDOWN
+        moved = bool(frame_md5) and frame_md5 != self.ctx.align_md5
+
+        if not settled or not moved:
+            return self._wait_or_give_up(now, "翻页还没安定" if not settled
+                                         else "屏幕没有再变化")
+
         if self.ctx.align_tried >= PROBE_MAX:
-            log.warning("安卓画面解析：连续 %d 次翻一屏都没找回锚点 —— "
+            log.warning("安卓画面解析：一轮翻了 %d 次都没找回锚点 —— "
                         "多半是在翻历史或换了群，不再试探，重建基线",
                         self.ctx.align_tried)
-            return False
+            self._reset_probe()             # 一轮结束：额度留到下一轮
+            return "give_up"
+
         self.ctx.align_tried += 1
         self.ctx.align_at = now
-        return True
+        self.ctx.align_wait_since = 0.0     # 新一轮翻页，等待重新计时
+        return "probe"
+
+    def _wait_or_give_up(self, now: float, why: str) -> str:
+        """进入/继续「等」，等超时就认输。"""
+        if not self.ctx.align_wait_since:
+            self.ctx.align_wait_since = now
+            log.info("安卓画面解析：%s —— 先等手机翻完再判（最多 %.0f 秒）",
+                     why, PROBE_SETTLE_MAX)
+        waited = now - self.ctx.align_wait_since
+        if waited >= PROBE_SETTLE_MAX:
+            log.warning("安卓画面解析：等了 %.0f 秒锚点仍未找回（%s）—— "
+                        "不再等，重建基线", waited, why)
+            self._reset_probe()
+            return "give_up"
+        return "wait"
+
+    def _reset_probe(self) -> None:
+        """一轮结束：等待起点与翻页额度一起归零。"""
+        self.ctx.align_wait_since = 0.0
+        self.ctx.align_tried = 0
 
     def _ingest_fill(self, frame) -> tuple[list, str, bool]:
         """上翻补全帧：把「锚点上方、此前没见过」的内容挑出来。

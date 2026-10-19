@@ -32,6 +32,7 @@ from bridge.service import BridgeService
 from bridge.sources import android_gateway
 from bridge.sources.android_gateway import (
     HEARTBEAT_GRACE, MAX_BATCH, MAX_SCREEN_BODY, OFFLINE_REMIND_EVERY,
+    PROBE_COOLDOWN, PROBE_MAX,
     AndroidGatewaySource, _Ctx, _apk_search_dirs, _find_apk, _online_now,
     _watchdog_step, build_messages, lan_ips, set_apk_dirs,
 )
@@ -987,18 +988,22 @@ class TestScreenParse(GatewayCase):
         self.assertEqual(self.received[-1].content, "新消息C")
 
     def test_second_miss_gives_up_and_rebuilds_baseline(self):
-        """翻一屏还对不上（真在翻历史）→ 认输重建，别让手机来回翻。
+        """翻满一轮还对不上（真在翻历史）→ 认输重建，别让手机来回翻。
 
         不认输的后果是手机在「翻上去、翻回来」之间无限循环，一条都不转发，
         表现和「锚点永久卡死」一模一样。
+
+        ⚠ 2026-10-19：冷却期现在只表示「等手机翻完」，不再表示「认输」，
+          所以不能再靠「同一屏连报两次」逼出认输（第二次会被判 wait）。
+          这里直接把翻页额度置满，模拟「手机已经连着翻了几屏都没找回锚点」。
         """
         self.post_frame(self.screen(self.row("旧消息A", 400)))
         b1 = self.post_frame(self.screen(self.row("历史1", 300),
                                          self.row("历史2", 600)))
         self.assertTrue(b1.get("scroll"))
-        # 手机翻过了头，还是对不上；冷却期内不再发指令，直接重建基线
-        b2 = self.post_fill(self.screen(self.row("更早的历史1", 300)))
-        self.assertIn("对不上锚点", b2["note"])
+        # 额度用光 + 冷却期已过 → 再对不上就是真的找不回来了
+        self.source._ctx.align_tried = PROBE_MAX
+        self.source._ctx.align_at = time.monotonic() - (PROBE_COOLDOWN + 0.1)
         b3 = self.post_frame(self.screen(self.row("更早的历史1", 300),
                                          self.row("更早的历史2", 600)))
         self.assertNotIn("scroll", b3)
@@ -1388,13 +1393,18 @@ class TestScreenParse(GatewayCase):
         self.assertTrue(r1.get("scroll"), "这一轮应当还要继续翻")
 
         # 手机又翻了一屏，但这一屏跟之前完全对不上（锚点彻底丢了）。
-        # 连报两帧，把「翻一屏试探」的额度用光，逼它走重建分支。
         lost = self.screen(
             self.row("完全不认识的内容1", 400, "路人甲"),
             self.row("完全不认识的内容2", 700, "路人乙"))
         first_lost = self.post_frame(lost)
         self.assertTrue(first_lost.get("scroll"), "第一次丢锚点应当先试探")
-        second_lost = self.post_frame(lost)
+        # 把这一轮的翻页额度用光（真机上就是连着翻了几屏都没找回锚点），
+        # 再喂一帧新的、仍对不上的画面，才会走到「认输重建」分支。
+        # ⚠ 不能靠「同一帧连报两次」逼认输 —— 同帧现在判「等」，不认输。
+        self.source._ctx.align_tried = PROBE_MAX
+        self.source._ctx.align_at = time.monotonic() - (PROBE_COOLDOWN + 0.1)
+        second_lost = self.post_frame(self.screen(
+            self.row("完全不认识的内容3", 400, "路人丙")))
 
         self.settle()
         self.assertEqual(len(self.received), 1,
