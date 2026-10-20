@@ -369,6 +369,9 @@ public class CollectorService extends AccessibilityService {
             sentMd5 = "";
             captureAndSend(r.ok ? "self-heal" : "self-heal-failed");
         }
+        // 巡检结果搭心跳的车送到电脑侧。等下一个 60 秒太慢：失败时用户多半
+        // 正盯着日志找原因，让他多等一分钟纯属折磨。
+        heartbeatOnce();
     }
 
     // ------------------------------------------------------------------ 心跳
@@ -415,7 +418,7 @@ public class CollectorService extends AccessibilityService {
             return;
         }
         Uploader.Result r = Uploader.heartbeat(Prefs.host(this), Prefs.port(this), token,
-                Prefs.appVersion(this));
+                Prefs.appVersion(this), lastWatch, watchRuns);
         heartbeatOk = r.ok;
         heartbeats++;
         lastHeartbeat = stamp() + " · " + (r.ok ? "正常" : r.detail);

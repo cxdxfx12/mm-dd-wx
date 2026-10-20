@@ -60,7 +60,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from ..config import Config
 from ..fingerprint import fp_of, is_same_message, norm_sender
@@ -145,6 +145,24 @@ HEARTBEAT_GRACE = 120.0
 # 分钟的消息是在外面发的、不会被补回来），可选项多了用户反而不会算。
 # 0 = 关闭，且是默认值 —— 巡检会抢前台，必须由用户明确打开。
 WATCH_CHOICES = (0, 5, 10, 15, 30)
+
+
+def _unquote_header(raw) -> str:
+    """解手机端塞进 HTTP 头里的中文（URL 编码），失败就原样返回。
+
+    HTTP 头只允许 ISO-8859-1，中文群名没法直接放进去。手机端用
+    URLEncoder 编码成纯 ASCII，这里解回来。
+
+    为什么要 try：这个值纯粹是给人看的诊断信息。解析失败就当没有，
+    绝不能让一次「读不懂的告警文案」把心跳打成 500 —— 那会把「巡检失败」
+    升级成「手机失联」，从一个假故障变成两个。
+    """
+    if not raw:
+        return ""
+    try:
+        return unquote(raw.strip())
+    except Exception:
+        return raw.strip()
 
 
 def _watch_minutes(value, choices: tuple[int, ...] = WATCH_CHOICES) -> int:
@@ -969,6 +987,12 @@ class _Ctx:
     # 存在的理由很具体：同一个机型的 device 名永远不变，分不出 0.3.0 和 0.4.0，
     # 而「到底装上没装上带新功能的那版」是每次排查的第一个问题。
     last_ver: str = ""
+    # 手机端自动巡检的最近一条结果与累计轮数（X-Ddwx-Watch / X-Ddwx-Watch-Runs）。
+    # 存在的理由和 last_ver 一样：这几个值原来只活在手机内存里，电脑侧完全
+    # 看不到 —— 「巡检到底跑没跑、结果是什么」只能靠人拿手机看设置页。
+    # watch_runs 尤其关键：它不涨 = 定时器没在转（APK 没装对/服务没连上）。
+    last_watch: str = ""
+    last_watch_runs: int = 0
     # 是否收到过**心跳**。判定失联必须有它：手机端只在画面变化时上报，
     # 群里半天没人说话时它本来就不发东西 —— 按「多久没收到上报」判会天天误报。
     heard_heartbeat: bool = False
@@ -986,7 +1010,7 @@ class _Ctx:
     seen_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def touch(self, device: str = "", heartbeat: bool = False,
-              ver: str = "") -> None:
+              ver: str = "", watch: str = None, watch_runs: int = -1) -> None:
         """记一次「手机还活着」。心跳与业务上报都算。
 
         这里**只更新时间戳、不改状态**：状态机和它的日志全交给看门狗一处做，
@@ -1003,6 +1027,12 @@ class _Ctx:
                 self.last_ver = ver
             if heartbeat:
                 self.heard_heartbeat = True
+            # 巡检状态用 None 作「本次没带」的哨兵：空串是**有意义**的
+            # （手机刚启动、还没巡检过），不能拿它当「没带」把旧值擦掉。
+            if watch is not None:
+                self.last_watch = watch
+            if watch_runs >= 0:
+                self.last_watch_runs = watch_runs
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1105,6 +1135,10 @@ class _Handler(BaseHTTPRequestHandler):
                           "device": self.ctx.last_device,
                           "app_ver": self.ctx.last_ver or "(旧版未上报)",
                           "heartbeat": self.ctx.heard_heartbeat,
+                          # 巡检状态。runs 不涨 = 定时器根本没在转，
+                          # 这是「装了新包却没生效」最直接的证据。
+                          "watch": self.ctx.last_watch or "(还没巡检过)",
+                          "watch_runs": self.ctx.last_watch_runs,
                           "offline_after": self.ctx.offline_after,
                           "screen": _screen_meta(self.ctx.screen),
                           "stats": dict(self.ctx.count)})
@@ -1203,7 +1237,15 @@ class _Handler(BaseHTTPRequestHandler):
             # /screen 只在画面变化时才来。漏了这里 = 手机明明装了新版，
             # /ping 却永远答「旧版未上报」（2026-10-20 就这么白查了一轮）。
             ver = (self.headers.get("X-Ddwx-Ver") or "").strip()
-            self.ctx.touch(device=device, heartbeat=True, ver=ver)
+            # 巡检状态。手机端按 URL 编码塞进来（HTTP 头不能直接放中文），
+            # 这里解回来。解不开就当没有 —— 诊断信息不该让心跳失败。
+            watch = _unquote_header(self.headers.get("X-Ddwx-Watch"))
+            try:
+                runs = int((self.headers.get("X-Ddwx-Watch-Runs") or "0").strip() or 0)
+            except ValueError:
+                runs = 0
+            self.ctx.touch(device=device, heartbeat=True, ver=ver,
+                           watch=watch, watch_runs=runs)
             self._reply(200, {"ok": True, "source": "android",
                               "chat_name": self.ctx.chat_name,
                               "last_seen": self.ctx.last_seen_wall,

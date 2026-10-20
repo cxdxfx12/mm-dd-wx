@@ -126,6 +126,27 @@ final class Uploader {
      * 但空串会让某些代理/防火墙当成畸形请求而丢掉。
      */
     static Result heartbeat(String host, int port, String token, String ver) {
+        return heartbeat(host, port, token, ver, "", 0);
+    }
+
+    /**
+     * POST /ping —— 心跳，顺带捎上巡检状态。
+     *
+     * <p>为什么巡检结果要挂在心跳上而不是单独开个端点：巡检是**定期**的
+     * （10 分钟一次），心跳也是定期的（60 秒一次），搭车不会多一个连接；
+     * 而且巡检状态本来就是「最近一次怎么样」，天然适合随心跳刷新。
+     *
+     * <p>为什么要报这个东西：这几个字段原来只是手机内存里的
+     * {@code public static volatile}，**电脑侧完全看不到**。
+     * 于是「巡检到底跑没跑、结果是什么」只能靠人拿手机看设置页
+     * （2026-10-20：用户装完新包，钉钉停在内置浏览器里没被切回去，
+     * 而电脑侧连"巡检跑过"都看不出来）。失败必须留痕。
+     *
+     * @param watch 最近一轮巡检的一句话结果；空串表示还没巡检过
+     * @param runs  累计跑了多少轮（电脑侧靠它判断「定时器真的在转吗」）
+     */
+    static Result heartbeat(String host, int port, String token, String ver,
+                            String watch, long runs) {
         HttpURLConnection conn = null;
         try {
             byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
@@ -136,6 +157,10 @@ final class Uploader {
             conn.setRequestProperty("X-Ddwx-Device",
                     Build.MODEL == null ? "" : Build.MODEL);
             conn.setRequestProperty("X-Ddwx-Ver", ver == null ? "" : ver);
+            // 巡检状态。HTTP 头只能是 ISO-8859-1，中文群名/结果必须先编码，
+            // 否则 HttpURLConnection 会直接抛 IllegalArgumentException（真机验证过）。
+            conn.setRequestProperty("X-Ddwx-Watch", encodeHeader(watch));
+            conn.setRequestProperty("X-Ddwx-Watch-Runs", String.valueOf(runs));
 
             OutputStream os = conn.getOutputStream();
             try {
@@ -268,6 +293,27 @@ final class Uploader {
     }
 
     // ------------------------------------------------------------------ 工具
+
+    /**
+     * 把任意文本塞进 HTTP 头。
+     *
+     * <p>HTTP 头只能是 ISO-8859-1（且不允许换行）。巡检结果里带中文群名，
+     * 直接 {@code setRequestProperty} 会抛 {@code IllegalArgumentException}
+     * —— 整个心跳都发不出去，那就比没有这个字段更糟。
+     *
+     * <p>所以按 URL 编码成纯 ASCII。电脑侧解码回来即可。
+     * 空值原样返回空串，让电脑侧能区分「没值」和「空值」。
+     */
+    static String encodeHeader(String s) {
+        if (s == null || s.isEmpty()) {
+            return "";
+        }
+        try {
+            return URLEncoder.encode(s, "UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            return "";                    // UTF-8 一定存在，这里只是兜底
+        }
+    }
 
     private static HttpURLConnection open(String spec, String method) throws IOException {
         HttpURLConnection conn = (HttpURLConnection) new java.net.URL(spec).openConnection();

@@ -89,7 +89,7 @@ python android/build.py --clean    # 先清干净
 
 产物约 **40 KB**。
 
-**版本号必须同改两处**（当前 0.4.2 / versionCode 5）：
+**版本号必须同改两处**（当前 0.4.3 / versionCode 6）：
 
 1. `AndroidManifest.xml` 的 `android:versionCode` / `android:versionName`
    —— **这才是真正进包的值**；
