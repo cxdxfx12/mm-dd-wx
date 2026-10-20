@@ -52,6 +52,13 @@ public class CollectorService extends AccessibilityService {
      */
     private static final long HEARTBEAT_MS = 60000L;
 
+    /**
+     * 巡检首轮的延迟（秒）。见 {@link #startWatch()} 里的说明。
+     * 5 秒是留给无障碍服务稳定拿到窗口根节点的时间 —— 更早调用
+     * {@code getRootInActiveWindow()} 经常返回 null，那一轮就白跑了。
+     */
+    private static final long FIRST_WATCH_DELAY_S = 5L;
+
     private static volatile CollectorService instance;
 
     // ---- 给设置页读的运行时状态。都是 volatile，探测/展示用不追求事务性。 ----
@@ -106,6 +113,11 @@ public class CollectorService extends AccessibilityService {
 
     /** 上一次成功上报的 md5。只有它变了才发，避免网络白跑。 */
     private volatile String sentMd5 = "";
+
+    /** 「瞎了」诊断帧的节流：同一原因 2 分钟内只报一次（见 reportBlind）。 */
+    private static final long BLIND_REPORT_MS = 120000L;
+    private volatile String lastBlindWhy = "";
+    private volatile long lastBlindAt = 0L;
     private long lastEventAt = 0L;
 
     public static CollectorService get() {
@@ -250,9 +262,13 @@ public class CollectorService extends AccessibilityService {
      * 立刻拉会和用户抢前台 —— 回个消息、看别的群，程序就跳出来。定时的行为
      * 可预期，代价是**最多有一个间隔的盲区**，这段时间的消息不会补回来。
      *
-     * <p><b>为什么首轮要延后一个间隔而不是立刻跑</b>：服务刚连上时用户可能
-     * 正在设置页填参数，这时候跳去钉钉会把人搞懵；而且首帧已经抓过了，
-     * 不差这几分钟。
+     * <p><b>首轮为什么是 5 秒而不是一个间隔</b>（用户 2026-10-20 改定）：
+     * 这台手机是专用采集机，服务重开时钉钉往往并不在目标群 —— 若首轮也等满
+     * 一个间隔（10 分钟），这 10 分钟里一帧都抓不到（实测现象：
+     * ``screen.received=false``，网关只看到心跳）。用户的原话是「我就是要程序
+     * 自动定位钉钉并切换到相应群聊」，所以连上就接管。
+     * 5 秒是留给 AccessibilityService 稳定拿到窗口的时间，
+     * 早于这个点 {@link #safeRoot()} 常常返回 null。
      */
     private void startWatch() {
         stopWatch();
@@ -268,9 +284,9 @@ public class CollectorService extends AccessibilityService {
             public void run() {
                 runWatchNow("定时");
             }
-        }, minutes * 60L, minutes * 60L, TimeUnit.SECONDS);
-        Log.i(TAG, "自动巡检已启动：每 " + minutes + " 分钟检查一次，目标群「"
-                + watchGroup + "」");
+        }, FIRST_WATCH_DELAY_S, minutes * 60L, TimeUnit.SECONDS);
+        Log.i(TAG, "自动巡检已启动：连接后 " + FIRST_WATCH_DELAY_S + " 秒先跑一轮，"
+                + "之后每 " + minutes + " 分钟检查一次，目标群「" + watchGroup + "」");
     }
 
     private void stopWatch() {
@@ -438,10 +454,48 @@ public class CollectorService extends AccessibilityService {
         });
     }
 
+    /**
+     * 上报一次「为什么这一屏没东西可报」。
+     *
+     * <p>正常业务帧走 {@link #captureAndSend}，只发钉钉群里读到的节点树。
+     * 但「读不到」这件事本身也必须让电脑侧知道 —— 否则网关只会显示
+     * ``screen.received=false（还没收到任何画面）``，而这个状态同时对应
+     * 「钉钉不在前台」「无障碍没开」「App 被杀了」「网络断了」四种完全不同的
+     * 情况，排查时只能靠人猜（2026-10-20 为此白查两轮）。
+     *
+     * <p><b>不会污染业务数据</b>：正文是一棵刻意写的最小 XML，包名是
+     * ``com.hbdxm.ddwx.diag``（不是钉钉的包名），网关侧的前台校验会把这个包名
+     * 认成「不是钉钉」，于是不会进解析、不会进基线，只在 ``/ping`` 的
+     * ``screen.reason`` 里留下一句原因。
+     *
+     * <p>节流：同一种原因 2 分钟内只报一次。抓取是每几百毫秒一次的，
+     * 不节流会把电脑侧刷满。
+     */
+    private void reportBlind(String why) {
+        long now = System.currentTimeMillis();
+        if (why.equals(lastBlindWhy) && now - lastBlindAt < BLIND_REPORT_MS) {
+            return;
+        }
+        lastBlindWhy = why;
+        lastBlindAt = now;
+
+        String token = Prefs.token(this);
+        if (TextUtils.isEmpty(token)) {
+            return;                       // 没填 token 连业务帧都发不出去，诊断帧更没意义
+        }
+        String xml = "<diag package=\"com.hbdxm.ddwx.diag\" why=\"" + why
+                + "\" ver=\"" + Prefs.appVersion(this) + "\"/>";
+        // 故意不走 sentMd5：诊断帧不代表「看到了新的业务画面」，
+        // 记进去会让用户切回钉钉后第一帧被当成「未变化」跳过。
+        Uploader.postScreen(Prefs.host(this), Prefs.port(this), token,
+                xml, md5(xml), 0, "blind:" + why, Prefs.appVersion(this));
+    }
+
     private void doCapture(String reason) {
         AccessibilityNodeInfo root = safeRoot();
         if (root == null) {
             lastResult = "拿不到窗口根节点";
+            reportBlind("no-root");
             return;
         }
 
@@ -456,14 +510,19 @@ public class CollectorService extends AccessibilityService {
         String target = Prefs.target(this);
         if (!TextUtils.isEmpty(target) && !target.equals(tree.rootPackage)) {
             // 前台不是钉钉（用户在设置页、桌面、别的应用）。这时候读到的树跟业务无关，
-            // 发上去只会污染电脑侧的画面序列。
+            // 发上去只会污染电脑侧的画面序列 —— 所以正文照旧不发。
+            // 但要**报一次「瞎了」的原因**：否则电脑侧只看到「还没收到任何画面」，
+            // 分不清是「钉钉不在前台」「App 死了」还是「网络断了」
+            //（2026-10-20 就为此白查了两轮）。
             skips++;
             lastResult = "前台是 " + tree.rootPackage + "，不是钉钉，跳过";
+            reportBlind("not-dingtalk:" + tree.rootPackage);
             return;
         }
         if (tree.texts.isEmpty()) {
             skips++;
             lastResult = "钉钉在前台但读到 0 条文本 —— 请确认停在具体群聊页（不是会话列表）";
+            reportBlind("empty-texts");
             return;
         }
 
