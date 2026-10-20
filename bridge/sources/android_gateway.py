@@ -1199,7 +1199,11 @@ class _Handler(BaseHTTPRequestHandler):
                 hb_len = 0
             self._drain(hb_len)
             device = (self.headers.get("X-Ddwx-Device") or "").strip()
-            self.ctx.touch(device=device, heartbeat=True)
+            # ⚠ 必须带上 ver：心跳是手机端**唯一规律发送**的请求（60 秒一次），
+            # /screen 只在画面变化时才来。漏了这里 = 手机明明装了新版，
+            # /ping 却永远答「旧版未上报」（2026-10-20 就这么白查了一轮）。
+            ver = (self.headers.get("X-Ddwx-Ver") or "").strip()
+            self.ctx.touch(device=device, heartbeat=True, ver=ver)
             self._reply(200, {"ok": True, "source": "android",
                               "chat_name": self.ctx.chat_name,
                               "last_seen": self.ctx.last_seen_wall,
