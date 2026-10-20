@@ -163,7 +163,15 @@ _LAYOUT = {
     #   切掉半截 OCR 就返回空，表现为「标题栏无文字」（一天 17 次，每次
     #   白等一轮重试）。改成 (0.030, 0.075)：上沿多让出避按钮行的余量、
     #   下沿多含一行缓冲，文字落在裁剪区中间，抖动也切不到。
-    "title": (0.45, 0.030, 0.90, 0.075),
+    # ⚠ x0 不能再往右收：微信 4.x 的会话列表是**固定像素宽**（~310px，不随
+    #   窗口等比缩放），标题紧跟在列表右侧。0.45 这个比例是在 720 宽标定的
+    #   （0.45×720=324，刚好在标题起点后面）；窗口一旦是 799 宽，
+    #   0.45×799=360 就把「文件传输助手」的「文件传」切进裁剪线左边，
+    #   OCR 稳定读成「专输助手」→ _title_matches 永远不中 → 开会话确认
+    #   永远失败（2026-10-20 真机抓裁剪图实锤）。0.40 在 720~900 宽都
+    #   盖得住标题起点；左边多扫进来的列表时间戳杂字靠 _title_matches
+    #   的「目标 ⊆ 标题」包含判据兜住。
+    "title": (0.40, 0.030, 0.92, 0.078),
     # 输入框点击点（相对比例）
     "input": (0.70, 0.90),
     # 发送按钮（相对比例，点不到时回落到回车）
@@ -246,16 +254,20 @@ class WeChatOcrTarget(Target):
             return False, f"查找微信窗口失败：{type(exc).__name__}: {exc}"
         if not hwnd:
             return False, (
-                "未找到微信主窗口（标题「微信」/「WeChat」）—— 请确认微信已启动并登录，"
-                "且主窗口没有被收进托盘（点任务栏图标打开）")
+                "未找到微信主窗口（标题「微信」/「WeChat」）—— 请确认微信已启动并登录")
+        # ⚠ 找到句柄 ≠ 能抓图：_find_window 现在**故意**连最小化/托盘态的
+        #   窗口一起返回（否则投递会误报「未找到微信主窗口」，2026-10-20 事故）。
+        #   探活要真去抓画面，所以这里得自己把窗口唤到可见 —— 不然自检会在
+        #   微信好好在托盘里的时候报「抓不到画面」。
+        self._activate(hwnd)
         try:
             img = self._grab(hwnd)
         except Exception as exc:
             return False, f"抓取微信窗口失败：{type(exc).__name__}: {exc}"
         if img is None:
             return False, (
-                "抓不到微信窗口画面（PrintWindow 返回空）—— 窗口可能被最小化了，"
-                "请还原窗口后重试")
+                "抓不到微信窗口画面（PrintWindow 返回空）—— 窗口可能被最小化或"
+                "退化成自绘空壳，请手动还原窗口后重试")
         try:
             items = self._ocr_sessions(img)
         except Exception as exc:
@@ -643,9 +655,31 @@ class WeChatOcrTarget(Target):
     # ---------- 窗口 ----------
 
     def _find_window(self) -> int:
-        """按标题找微信主窗口（含最小化，不含隐藏）。"""
+        """按标题找微信主窗口：最小化、收进托盘（隐藏）都算。
+
+        ── 为什么「隐藏」必须算（2026-10-20 真机事故）──────────────────
+        用户报「21:51:01 投递失败 | 未找到微信主窗口，请确认微信已登录且在
+        桌面上」，可当时微信**根本没退出**：句柄 67596 还在，标题「微信」，
+        类名 ``Qt51514QWindowIcon``，只是 `IsIconic=1`（最小化）。真机量了
+        最小化窗口的矩形是 ``(-32000,-32000,-31840,-31972)`` —— **宽 160**，
+        被下面那句「宽度 > 400 排除登录小窗」直接判掉，而枚举回调里那句
+        `if not IsWindowVisible: return True` 又会把托盘态（隐藏）整个跳过。
+        两条路一起堵死，于是「窗口在、微信在、就是找不到」。
+
+        ⚠ 这个函数**只负责给出句柄**，不要求窗口此刻可用：
+        `_activate()` 本来就会处理三种形态（最小化→RESTORE、托盘→SHOW、
+        正常→补前台），`_ensure_layout_safe()` 也会把尺寸拉回 720×1088。
+        在这里提前用「可见性 + 尺寸」筛掉窗口，等于把 _activate 的活抢了，
+        还抢错了。
+        ⚠ 「排除登录小窗」的 400 像素阈值只对**可见**窗口成立：登录窗是
+        176×199 可见小窗；最小化窗口的矩形是假的，不能再拿尺寸筛。
+        """
         if self._hwnd and user32.IsWindow(wt.HWND(self._hwnd)):
+            # ⚠ 缓存短路不能只判宽度：最小化的缓存句柄 IsWindow 仍是 1、
+            #   矩形宽度只有 160，这条 if 一旦按宽度卡，等于每次都要重新枚举。
             r = self._rect(self._hwnd)
+            if user32.IsIconic(wt.HWND(self._hwnd)):
+                return self._hwnd
             if r and r[2] - r[0] > 200:
                 return self._hwnd
 
@@ -660,11 +694,20 @@ class WeChatOcrTarget(Target):
             user32.GetWindowTextW(h, buf, n + 1)
             if buf.value not in MAIN_TITLES:
                 return True
-            if not user32.IsWindowVisible(h):
-                return True
+            # ⚠ 这里**不能**再 `if not IsWindowVisible: return True`：
+            #   收进托盘的微信就是 IsWindowVisible=0，句柄和标题都在，
+            #   _activate() 一句 SW_SHOW 就能唤回。见方法注释。
+            iconic = bool(user32.IsIconic(h))
             r = self._rect(h)
+            if iconic:
+                # 最小化时矩形是 (-32000,...) 这种假值，不能拿来量尺寸
+                found.append(h)
+            elif not user32.IsWindowVisible(h):
+                # 收进托盘的微信：句柄和标题都在，_activate 一句 SW_SHOW
+                # 就能唤回。不能在这里丢掉，见方法注释。
+                found.append(h)
             # 排除登录小窗（176×199）和其他挂件
-            if r and (r[2] - r[0]) > 400 and (r[3] - r[1]) > 400:
+            elif r and (r[2] - r[0]) > 400 and (r[3] - r[1]) > 400:
                 found.append(h)
             return True
 
