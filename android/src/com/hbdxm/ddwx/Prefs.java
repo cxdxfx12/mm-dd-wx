@@ -21,6 +21,8 @@ final class Prefs {
     private static final String K_INTERVAL = "interval_ms";
     private static final String K_TARGET = "target_pkg";
     private static final String K_SNAPSHOT = "snapshot";
+    private static final String K_WATCH_INTERVAL = "watch_interval_min";
+    private static final String K_WATCH_GROUP = "watch_group";
 
     /** 钉钉安卓包名。 */
     static final String DINGTALK_PKG = "com.alibaba.android.rimet";
@@ -28,6 +30,8 @@ final class Prefs {
     private static final String DEF_HOST = "192.168.1.209";
     private static final int DEF_PORT = 8765;
     private static final int DEF_INTERVAL = 2000;
+    /** 默认不巡检：装完 App 的人不该被程序突然抢前台，等他明确打开这一项。 */
+    private static final int DEF_WATCH_INTERVAL = 0;
 
     private Prefs() {
     }
@@ -67,6 +71,47 @@ final class Prefs {
 
     static boolean snapshot(Context c) {
         return of(c).getBoolean(K_SNAPSHOT, true);
+    }
+
+    // ------------------------------------------------------------ 自动巡检
+    //
+    // 下面两项是**手机端的兜底值**，真正生效的以电脑端下发的为准（见
+    // CollectorService.applyWatch）。放在本地是因为：换了一台电脑、网关还没
+    // 连上时，手机不该因为「没收到指令」就完全不巡检 —— 那正好是最需要它
+    // 自己站起来的时候。用户在设置页改过就一直记着。
+
+    static int watchInterval(Context c) {
+        int v = of(c).getInt(K_WATCH_INTERVAL, DEF_WATCH_INTERVAL);
+        return clampWatch(v);
+    }
+
+    static String watchGroup(Context c) {
+        String v = of(c).getString(K_WATCH_GROUP, "");
+        return v == null ? "" : v.trim();
+    }
+
+    static void saveWatch(Context c, int interval, String group) {
+        of(c).edit()
+                .putInt(K_WATCH_INTERVAL, clampWatch(interval))
+                .putString(K_WATCH_GROUP, group == null ? "" : group.trim())
+                .apply();
+    }
+
+    /** 巡检间隔只允许用户给的几档：0（关）/ 5 / 10 / 15 / 30 分钟。 */
+    static int clampWatch(int minutes) {
+        if (minutes <= 0) {
+            return 0;
+        }
+        if (minutes <= 5) {
+            return 5;
+        }
+        if (minutes <= 10) {
+            return 10;
+        }
+        if (minutes <= 15) {
+            return 15;
+        }
+        return 30;
     }
 
     static void save(Context c, String host, int port, String token, int interval,

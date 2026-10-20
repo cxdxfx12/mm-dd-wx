@@ -36,6 +36,11 @@ class DingTalkConfig:
     # 判据是**心跳**（手机端每 60 秒 POST /ping），不是「多久没收到画面」——
     # 群里半天没人说话时画面本来就不变、手机也不上报，按画面判会天天误报。
     android_offline_after: float = 300.0
+    # android 模式：手机自动巡检间隔（分钟，0 = 关闭）。手机端会把钉钉拉回
+    # 目标群（dingtalk.chat_names 的第一个），好让采集链路自己恢复。
+    # 用户 2026-10-20 定为「定时巡检，可选 5 / 10 / 15 分钟」，默认关 ——
+    # 开着就意味手机会被程序抢前台，这个决定必须由用户明确做。
+    android_watch_min: int = 0
     ui_poll_interval: float = 5.0           # ui / ocr 模式的轮询间隔（秒）
     title_check: bool = True                # OCR 模式：每帧校验窗口标题，防转发错群
     title_ratio: float = 0.55               # 标题模糊匹配阈值（OCR 对标题有误识，需容错）

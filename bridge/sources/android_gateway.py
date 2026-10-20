@@ -138,6 +138,38 @@ OFFLINE_REMIND_EVERY = 1800.0
 # 「多半是旧版 APK」，把人往「装错包」的方向带。取 2 倍心跳间隔，稳妥。
 HEARTBEAT_GRACE = 120.0
 
+# 手机自动巡检的可用间隔（分钟）。用户 2026-10-20 定：不设「掉了立刻拉」，
+# 只给几个固定档，避免「实时抢占前台」。
+#
+# 档位不多是刻意的：这个数字直接决定**最长盲区**（手机被切走后最多这么多
+# 分钟的消息是在外面发的、不会被补回来），可选项多了用户反而不会算。
+# 0 = 关闭，且是默认值 —— 巡检会抢前台，必须由用户明确打开。
+WATCH_CHOICES = (0, 5, 10, 15, 30)
+
+
+def _watch_minutes(value, choices: tuple[int, ...] = WATCH_CHOICES) -> int:
+    """把配置里的巡检间隔夹到允许的档位上。
+
+    取「不超过给定值的最大档」而不是四舍五入：用户填 7 想要的大概是「别太
+    频繁」，给 10 比给 5 更容易让盲区超出他的预期。填 1 这种明显想开得很勤的，
+    给最小非零档（5）—— 比它更勤就该用别的机制了，不是这个功能的职责。
+    """
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return 0
+    if v <= 0:
+        return 0
+    picked = 0
+    for c in choices:
+        if 0 < c <= v:
+            picked = c
+    if not picked:
+        # v 比最小档还小（比如填 1、2）：按最小档处理，并让调用方在日志里说清楚
+        picked = min(c for c in choices if c > 0)
+    return picked
+
+
 TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                 "%m-%d %H:%M", "%H:%M")
 
@@ -917,6 +949,12 @@ class _Ctx:
     differ: FrameDiffer | None = None
     # 失联判定阈值（秒），0 = 不检测。只用于 /ping 的回包与看门狗。
     offline_after: float = 300.0
+    # 手机自动巡检：盯哪个群、几十分钟查一次（0 = 关）。
+    # 每一帧的响应都带上，手机端拿它重排自己的巡检定时器。
+    # 为什么由电脑端下发：目标群就是 dingtalk.chat_names 的第一个，
+    # 手机再单独填一遍必然出现「两边不一致」，而不一致的后果是每轮都点错群。
+    watch_group: str = ""
+    watch_min: int = 0
     # 上一次「不是聊天页，本帧跳过」的说明。用户点开 @ 面板会连着报好几帧，
     # 内容一样就没必要重复写日志（日志是滚动文件，刷满了会盖掉真问题）。
     last_skip_note: str = ""
@@ -1297,6 +1335,17 @@ class _Handler(BaseHTTPRequestHandler):
 
         body = {"ok": True, "bytes": length, "count": count,
                 "md5": screen["md5"]}
+        # 自动巡检指令：每一帧都带，手机端见 applyWatch（幂等，值没变不动调度器）。
+        # 放在 parse 判断**外面** —— 它和「解析不解析消息」无关，只收不转的模式
+        # 下手机同样会跑偏，同样需要它自己走回来。
+        if self.ctx.watch_min > 0 and self.ctx.watch_group:
+            body["watch_group"] = self.ctx.watch_group
+            body["watch_min"] = self.ctx.watch_min
+        else:
+            # 明确下发 0：手机端据此停掉巡检。不能「不发」—— 不发的话手机
+            # 会一直沿用本地记住的旧值，用户在电脑上关掉了却停不下来。
+            body["watch_group"] = self.ctx.watch_group or ""
+            body["watch_min"] = 0
         if self.ctx.parse:
             # 手机端日志里直接能看到「这一帧有没有产生转发」，省得两头对时间。
             # ⚠ 这里的数字是**收进缓冲**的条数，不一定是「已投递」的条数 ——
@@ -2137,6 +2186,10 @@ class AndroidGatewaySource(Source):
             self.offline_after = 0.0          # 负数按「关闭」处理，别让它变成「秒级误报」
         self.chat_name = (dt.chat_names or [""])[0] if dt.chat_names else ""
         self.companies = list(dt.companies or [])
+        # 自动巡检：盯的就是路由里的第一个群（chat_names[0]），不另开一个配置项 ——
+        # 两处群名一旦不一致，手机每轮巡检都会点错群，而且从日志上很难看出来。
+        self.watch_group = self.chat_name
+        self.watch_min = _watch_minutes(getattr(dt, "android_watch_min", 0))
 
         self.count = {"requests": 0, "accepted": 0, "rejected": 0}
         self._server: ThreadingHTTPServer | None = None
@@ -2175,6 +2228,7 @@ class AndroidGatewaySource(Source):
                    port=self.port,
                    companies=self.companies, on_message=on_message,
                    parse=self.parse, offline_after=self.offline_after,
+                   watch_group=self.watch_group, watch_min=self.watch_min,
                    differ=FrameDiffer() if self.parse else None)
         # 「先攒后发」缓冲 + 把它定期排空的线程。
         # 关掉 parse 时不建（那种模式只收不转，没有消息要投）。
@@ -2236,9 +2290,20 @@ class AndroidGatewaySource(Source):
             log.info("  消息缓冲已开启：同一张卡片分批渲染的内容会先攒起来"
                      "（静默 %.0f 秒），只发最全的那一版", ctx.pending.quiet)
 
+        # ---- 自动巡检指令（下发给手机，手机自己跑定时）----
+        if self.watch_min > 0 and self.watch_group:
+            log.info("  手机自动巡检已开启：每 %d 分钟检查一次「%s」，不在这个群里就"
+                     "自动点回去（期间手机会被抢前台，消息最多有这么久的盲区）",
+                     self.watch_min, self.watch_group)
+        else:
+            log.info("  手机自动巡检未开启（dingtalk.android_watch_min = 0）："
+                     "手机被切走或钉钉崩溃后不会自己恢复，只能靠人发现"
+                     "（失联告警是唯一的提示）")
+
         # ---- 失联看门狗 ----
         self._watchdog_stop = threading.Event()
         if self.offline_after > 0:
+
             self._watchdog_stop.clear()
             threading.Thread(target=_watchdog,
                              args=(ctx, self.offline_after, self._watchdog_stop),

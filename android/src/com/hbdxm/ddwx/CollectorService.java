@@ -70,6 +70,15 @@ public class CollectorService extends AccessibilityService {
     public static volatile boolean heartbeatOk = false;
     public static volatile String lastHeartbeat = "尚未发送";
     public static volatile long heartbeats = 0L;
+    /** 自动巡检：当前盯的群名（空 = 没开）。设置页直接显示，避免「以为开着」。 */
+    public static volatile String watchGroup = "";
+    /** 自动巡检：间隔（分钟，0 = 关）。由电脑端下发，本地也留一份兜底。 */
+    public static volatile int watchMinutes = 0;
+    /** 自动巡检：上一轮的结果与时间。 */
+    public static volatile String lastWatch = "尚未巡检";
+    public static volatile String lastWatchAt = "";
+    public static volatile long watchRuns = 0L;
+    public static volatile long watchHeals = 0L;
 
     private ScheduledExecutorService scheduler;
     private ScheduledFuture<?> timer;
@@ -85,6 +94,15 @@ public class CollectorService extends AccessibilityService {
      */
     private ExecutorService pool;
     private final AtomicBoolean busy = new AtomicBoolean(false);
+
+    /**
+     * 自动巡检用的独立调度器。**不能和抓取共用**：一轮巡检最长要 8 秒
+     * （拉起 2.6s + 搜索 1.4s + 打开 1.2s + 读标题 1.2s），共用的话这段时间
+     * 的抓取 tick 全被排在后面，而巡检做完正好需要立刻抓一帧回报结果。
+     */
+    private ScheduledExecutorService watchScheduler;
+    private ScheduledFuture<?> watchTimer;
+    private final AtomicBoolean watching = new AtomicBoolean(false);
 
     /** 上一次成功上报的 md5。只有它变了才发，避免网络白跑。 */
     private volatile String sentMd5 = "";
@@ -115,7 +133,12 @@ public class CollectorService extends AccessibilityService {
         // 「喊话口」（常驻通知会把状态改成警示）。放在这里而不是只放在设置页，
         // 是因为用户很少主动打开设置页 —— 手机重启后更是根本不会打开。
         KeepAliveService.start(this);
+        // 巡检的兜底值从本地读：换电脑、网关还没连上时，手机也得能自己站起来。
+        // 真正的间隔与群名等电脑端第一次下发再覆盖（见 applyWatch）。
+        watchMinutes = Prefs.watchInterval(this);
+        watchGroup = Prefs.watchGroup(this);
         startTimer();
+        startWatch();
         captureAndSend("service-connected");
     }
 
@@ -141,6 +164,7 @@ public class CollectorService extends AccessibilityService {
     @Override
     public void onDestroy() {
         stopTimer();
+        stopWatch();
         instance = null;
         connected = false;
         super.onDestroy();
@@ -151,6 +175,7 @@ public class CollectorService extends AccessibilityService {
     /** 设置页改了参数后调用：按新间隔重排定时器。 */
     public void restart() {
         startTimer();
+        startWatch();
         sentMd5 = "";
         captureAndSend("settings-changed");
     }
@@ -159,6 +184,16 @@ public class CollectorService extends AccessibilityService {
     public void captureNow() {
         sentMd5 = "";
         captureAndSend("manual");
+    }
+
+    /** 立即巡检一轮（设置页按钮，用来当场验证群名填得对不对）。 */
+    public void watchNow() {
+        runWatchNow("手动");
+    }
+
+    /** 给 {@link SelfHeal} 用：它需要根节点，但不该去碰私有方法。 */
+    AccessibilityNodeInfo safeRootPublic() {
+        return safeRoot();
     }
 
     /** 只落快照，不上报（排障用）。返回可读路径或 null。 */
@@ -203,6 +238,120 @@ public class CollectorService extends AccessibilityService {
         if (pool != null) {
             pool.shutdownNow();
             pool = null;
+        }
+    }
+
+    // ------------------------------------------------------------------ 自动巡检
+
+    /**
+     * 按间隔把钉钉拉回目标群。间隔 0 = 不巡检。
+     *
+     * <p><b>为什么是定时而不是「发现掉了就立刻拉」</b>（用户 2026-10-20 定）：
+     * 立刻拉会和用户抢前台 —— 回个消息、看别的群，程序就跳出来。定时的行为
+     * 可预期，代价是**最多有一个间隔的盲区**，这段时间的消息不会补回来。
+     *
+     * <p><b>为什么首轮要延后一个间隔而不是立刻跑</b>：服务刚连上时用户可能
+     * 正在设置页填参数，这时候跳去钉钉会把人搞懵；而且首帧已经抓过了，
+     * 不差这几分钟。
+     */
+    private void startWatch() {
+        stopWatch();
+        final int minutes = watchMinutes;
+        if (minutes <= 0) {
+            Log.i(TAG, "自动巡检未开启");
+            return;
+        }
+        watchScheduler = Executors.newSingleThreadScheduledExecutor();
+        // 固定延迟而不是固定频率：一轮巡检本身要几秒，固定频率会在慢的时候堆积。
+        watchTimer = watchScheduler.scheduleWithFixedDelay(new Runnable() {
+            @Override
+            public void run() {
+                runWatchNow("定时");
+            }
+        }, minutes * 60L, minutes * 60L, TimeUnit.SECONDS);
+        Log.i(TAG, "自动巡检已启动：每 " + minutes + " 分钟检查一次，目标群「"
+                + watchGroup + "」");
+    }
+
+    private void stopWatch() {
+        if (watchTimer != null) {
+            watchTimer.cancel(false);
+            watchTimer = null;
+        }
+        if (watchScheduler != null) {
+            watchScheduler.shutdownNow();
+            watchScheduler = null;
+        }
+    }
+
+    /**
+     * 电脑端下发「盯哪个群、多久查一次」。
+     *
+     * <p>幂等：值没变就什么都不做 —— 手机每帧上报都会带这个字段，
+     * 每次都重建调度器会让巡检永远等不到第一次触发。
+     */
+    private void applyWatch(final String group, final int minutes) {
+        final int fixed = Prefs.clampWatch(minutes);
+        if (fixed == watchMinutes && TextUtils.equals(group, watchGroup)) {
+            return;
+        }
+        watchGroup = group == null ? "" : group;
+        watchMinutes = fixed;
+        Prefs.saveWatch(this, fixed, watchGroup);
+        lastWatch = fixed <= 0 ? "自动巡检已关闭"
+                : ("自动巡检已设为每 " + fixed + " 分钟一次，目标群「" + watchGroup + "」");
+        Log.i(TAG, lastWatch);
+        // restart() 会顺带重排抓取定时器，这里不需要 —— 只动巡检。
+        startWatch();
+    }
+
+    private void runWatchNow(final String why) {
+        if (TextUtils.isEmpty(watchGroup)) {
+            // 没配置群名就绝不会去动界面：认错群比不动作危险得多。
+            lastWatch = "没配置目标群，不巡检";
+            return;
+        }
+        if (!watching.compareAndSet(false, true)) {
+            return;                       // 上一轮还没跑完
+        }
+        ScheduledExecutorService w = watchScheduler;
+        if (w == null || w.isShutdown()) {
+            w = Executors.newSingleThreadScheduledExecutor();
+        }
+        w.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    doWatch(why);
+                } catch (Throwable t) {
+                    lastWatch = "巡检内部错误：" + t;
+                    Log.w(TAG, "巡检出错", t);
+                } finally {
+                    watching.set(false);
+                }
+            }
+        });
+    }
+
+    private void doWatch(String why) {
+        String group = watchGroup;
+        watchRuns++;
+        lastWatchAt = stamp();
+        SelfHeal.Result r = SelfHeal.ensureGroup(this, group);
+        lastWatch = lastWatchAt + " · " + why + " · " + r;
+        if (r.ok) {
+            Log.i(TAG, "巡检（" + why + "）" + r);
+        } else {
+            // WARNING 会给用户造成「要不要处理」的压力，所以只在真的失败了才打。
+            // ⚠ 但别升级成弹通知：一次读不到标题栏很常见，下一轮自己就好了。
+            Log.w(TAG, "巡检（" + why + "）" + r);
+        }
+        if (r.acted) {
+            watchHeals++;
+            // 界面被动过 → 立刻抓一帧。不这样做的话，电脑侧要等到下次画面变化
+            // 才知道手机回来了，中间这段会因为「锚点丢失」把新消息丢掉。
+            sentMd5 = "";
+            captureAndSend(r.ok ? "self-heal" : "self-heal-failed");
         }
     }
 
@@ -346,12 +495,122 @@ public class CollectorService extends AccessibilityService {
             Log.i(TAG, "上报成功 #" + posts + " 文本 " + tree.texts.size()
                     + " 字节 " + xml.length());
             maybeFillTruncated(r.body, token);
+            maybeApplyWatch(r.body);
             // 2026-10-18：不再调 maybeHoldConfirm —— 电脑侧改成「先攒后发」，
             // 不再下发 hold 指令（理由见该方法的注释）。
         } else {
             failures++;
             lastResult = "上报失败：" + r.detail;
             Log.w(TAG, "上报失败：" + r.detail);
+        }
+    }
+
+    // -------------------------------------------------------------- 自动巡检指令
+
+    /**
+     * 电脑侧在每一帧的响应里带 {@code watch_group} / {@code watch_min}，
+     * 告诉手机「盯哪个群、多久查一次」。
+     *
+     * <p>为什么由电脑端下发而不是在手机上填：目标群是 <b>config.yaml 里的
+     * dingtalk.chat_names</b>，改群名要在电脑上改，手机上再填一遍必然出现
+     * 「两边不一致」—— 而这里不一致的后果是每轮巡检都点错，或者永远点不回来。
+     *
+     * <p>解析刻意手写而不是上 JSON 库：整个 App 没有依赖，为两个字段引
+     * org.json 不划算（Android 自带的那份行为还不一致，旧 ROM 上会抛）。
+     */
+    private void maybeApplyWatch(String resp) {
+        if (TextUtils.isEmpty(resp)) {
+            return;
+        }
+        String grp = jsonString(resp, "watch_group");
+        int min = jsonInt(resp, "watch_min", Integer.MIN_VALUE);
+        if (grp == null && min == Integer.MIN_VALUE) {
+            return;                       // 旧版电脑端不下发，保持本地设置不动
+        }
+        applyWatch(grp == null ? watchGroup : grp,
+                min == Integer.MIN_VALUE ? watchMinutes : min);
+    }
+
+    /** 取顶层字符串字段；没有就返回 null（不是空串 —— 空串是「明确要求关掉」）。 */
+    static String jsonString(String json, String key) {
+        if (json == null || key == null) {
+            return null;
+        }
+        String pat = "\"" + key + "\"";
+        int i = json.indexOf(pat);
+        if (i < 0) {
+            return null;
+        }
+        int c = json.indexOf(':', i + pat.length());
+        if (c < 0) {
+            return null;
+        }
+        int q = json.indexOf('"', c + 1);
+        if (q < 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int k = q + 1; k < json.length(); k++) {
+            char ch = json.charAt(k);
+            if (ch == '\\' && k + 1 < json.length()) {
+                char nx = json.charAt(k + 1);
+                if (nx == 'n') {
+                    sb.append('\n');
+                } else if (nx == 't') {
+                    sb.append('\t');
+                } else if (nx == 'u' && k + 5 < json.length()) {
+                    try {
+                        sb.append((char) Integer.parseInt(
+                                json.substring(k + 2, k + 6), 16));
+                        k += 4;
+                    } catch (NumberFormatException ignore) {
+                        // 坏转义就当没转义，总比整段丢掉强
+                    }
+                } else {
+                    sb.append(nx);
+                }
+                k++;
+            } else if (ch == '"') {
+                break;
+            } else {
+                sb.append(ch);
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 取顶层整数字段；没有就用 {@code def}。 */
+    static int jsonInt(String json, String key, int def) {
+        if (json == null || key == null) {
+            return def;
+        }
+        String pat = "\"" + key + "\"";
+        int i = json.indexOf(pat);
+        if (i < 0) {
+            return def;
+        }
+        int c = json.indexOf(':', i + pat.length());
+        if (c < 0) {
+            return def;
+        }
+        int k = c + 1;
+        while (k < json.length() && Character.isWhitespace(json.charAt(k))) {
+            k++;
+        }
+        int start = k;
+        if (k < json.length() && (json.charAt(k) == '-' || json.charAt(k) == '+')) {
+            k++;
+        }
+        while (k < json.length() && Character.isDigit(json.charAt(k))) {
+            k++;
+        }
+        if (k == start) {
+            return def;
+        }
+        try {
+            return Integer.parseInt(json.substring(start, k));
+        } catch (NumberFormatException e) {
+            return def;
         }
     }
 

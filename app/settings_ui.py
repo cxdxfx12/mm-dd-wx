@@ -138,6 +138,34 @@ def _tip(parent, text: str, bg: str = CARD, fg: str = MUTED,
     return lab
 
 
+# ---------------------------------------------------------------- 自动巡检档位
+#
+# 档位与 bridge/sources/android_gateway.WATCH_CHOICES 必须一致（那边夹值、
+# 这边给选项）。界面上用字符串 label 存、保存时再换回分钟数 ——
+# ttk.Combobox 直接绑 int 会出现「5」和 5 不相等、选中态丢掉的怪事。
+
+WATCH_CHOICES = (0, 5, 10, 15, 30)
+WATCH_LABELS = {0: "关闭（不巡检）", 5: "每 5 分钟", 10: "每 10 分钟",
+                15: "每 15 分钟", 30: "每 30 分钟"}
+
+
+def _watch_label(minutes) -> str:
+    """配置里的分钟数 → 下拉框显示的文字。认不出的值一律按「关闭」显示。"""
+    try:
+        v = int(minutes)
+    except (TypeError, ValueError):
+        return WATCH_LABELS[0]
+    return WATCH_LABELS.get(v, WATCH_LABELS[0])
+
+
+def watch_minutes(label: str) -> int:
+    """下拉框文字 → 分钟数。"""
+    for k, v in WATCH_LABELS.items():
+        if v == label:
+            return k
+    return 0
+
+
 def _scroll_area(parent, bg: str = BG) -> tk.Frame:
     """返回一个可垂直滚动的内层 Frame；内容装得下时自动收起滚动条。
 
@@ -384,6 +412,10 @@ class SettingsDialog:
         self.st["gw_parse"] = tk.BooleanVar(value=bool(d.get("android_parse")))
         self.st["gw_offline"] = tk.StringVar(
             value=str(d.get("android_offline_after", 300)))
+        # 自动巡检（2026-10-20）：下拉选档，不给自由填 —— 这个数字决定
+        # 「手机被切走后最多丢多久的群消息」，可选项多了用户反而不会算。
+        self.st["gw_watch"] = tk.StringVar(value=_watch_label(
+            d.get("android_watch_min", 0)))
 
         srcbox = _card(page, "数据来源：消息从哪儿读")
         srcbox.pack(fill="x", padx=12, pady=(12, 8))
@@ -430,7 +462,27 @@ class SettingsDialog:
                    "旧版 APK 没有心跳，此项对它不生效。")
         _tip(srcbox, "关掉失联告警的后果：手机端挂了以后不会有任何提示，"
                      "只能靠「群里怎么没消息了」自己察觉 —— 而那通常很久之后才会被注意到。"
-             ).pack(fill="x", padx=30, pady=(0, 12))
+             ).pack(fill="x", padx=30)
+
+        # ---- 自动巡检 ----
+        watch_row = tk.Frame(srcbox, bg=CARD)
+        watch_row.pack(fill="x", padx=14, pady=(8, 0))
+        tk.Label(watch_row, text="自动巡检", bg=CARD, fg=TEXT,
+                 font=F_UI).pack(side="left")
+        wb = ttk.Combobox(watch_row, textvariable=self.st["gw_watch"],
+                          state="readonly", width=14, font=F_UI,
+                          values=[WATCH_LABELS[k] for k in WATCH_CHOICES])
+        wb.pack(side="left", padx=8)
+        _tip(watch_row, "到点检查一次：钉钉不在目标群就自动点回去。",
+             bg=CARD).pack(side="left")
+        _tip(srcbox, "「关闭」时手机被切走不会自己恢复，只能靠人在手机上看一眼。"
+                     "打开后手机会按选定的间隔把钉钉拉回目标群。"
+             ).pack(fill="x", padx=30)
+        _tip(srcbox, "⚠ 两个代价，开之前想清楚：① 到点会抢前台 —— 手机上不管在干什么"
+                     "都会被切到钉钉，选 5 分钟就基本干不了别的；"
+                     "② 有盲区 —— 手机被切走那段时间的群消息根本没读到，补不回来，"
+                     "间隔越大盲区越大。",
+             bg=WARN_BG, fg=WARN_FG).pack(fill="x", padx=30, pady=(0, 12))
 
         box = _card(page, "投递")
         box.pack(fill="x", padx=12, pady=(12, 8))
@@ -1077,6 +1129,11 @@ class SettingsDialog:
         S("dingtalk", "gateway_token", gw_token, after="gateway_port")
         S("dingtalk", "android_parse", gw_parse, after="gateway_token")
         S("dingtalk", "android_offline_after", gw_offline, after="android_parse")
+        # 自动巡检。老配置里没有这个键，走「改或插」；插入点排在
+        # android_offline_after 之后，保持这一组安卓参数挨在一起。
+        S("dingtalk", "android_watch_min",
+          watch_minutes(str(self.st["gw_watch"].get())),
+          after="android_offline_after")
         S("wechat", "dry_run", bool(self.st["dry_run"].get()), after="interval")
         S("wechat", "interval", interval, after="dry_run")
         S("wechat", "show_hotkey", hotkey, after="wxauto_path")

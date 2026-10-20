@@ -773,6 +773,14 @@ class App(tk.Tk):
             tok = str(d.get("gateway_token") or "").strip()
             body += ("\n\n手机端要一直停在目标群、屏幕不能黑，"
                      "并在 App 里填本机地址与 token。")
+            watch = int(d.get("android_watch_min") or 0)
+            if watch > 0:
+                body += (f"\n\n自动巡检已开启（每 {watch} 分钟）：钉钉被切走会自动"
+                         "点回目标群；这段时间的用户操作会被打断。")
+            else:
+                body += ("\n\n自动巡检是关的 —— 手机被切到别的群或钉钉崩溃后"
+                         "不会自己恢复，只能靠人发现。需要的话到"
+                         "「设置 → 采集与投递」打开（可选 5/10/15 分钟）。")
             if not tok:
                 body += "\n\n⚠ 网关 token 还是空的，手机连不上 —— " \
                         "先到「设置 → 采集与投递」填一个。"
