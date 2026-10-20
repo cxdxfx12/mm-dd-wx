@@ -87,7 +87,24 @@ python android/build.py            # 产物在 android/dist/ddwx-collector-<版�
 python android/build.py --clean    # 先清干净
 ```
 
-产物约 **40 KB**。版本号在 `build.py` 里改（当前 0.4.0）。
+产物约 **40 KB**。
+
+**版本号必须同改两处**（当前 0.4.1 / versionCode 4）：
+
+1. `AndroidManifest.xml` 的 `android:versionCode` / `android:versionName`
+   —— **这才是真正进包的值**；
+2. `build.py` 顶部 `VERSION_CODE` / `VERSION_NAME`
+   —— 只用来拼产物文件名。
+
+⚠ **别以为传给 aapt2 的 `--version-code` / `--version-name` 生效了 —— 它们不生效。**
+清单里写了具体值时 aapt2 直接忽略这两个参数；清单里留空则打出 `versionCode=''`
+的畸形包。2026-10-20 就是这么翻的车：0.4.0、0.4.1 两轮改动文件名都新，
+包内却一直是 `0.3.0 / 3`，手机上显示、`PackageManager` 读到、上报给网关的
+全是旧值；更糟的是 versionCode 一直是 3，**同版本号 Android 拒绝覆盖安装**，
+用户「装了新包」其实根本没装上。
+
+现在 `build.py` 打完包会 `aapt2 dump badging` 回读校验，与常量对不上直接构建失败
+（`tests/test_apk_version.py` 钉住这条，并锁住两处不许漂移）。
 重编之后**不用手动拷 APK**：安装包构建会挑最新的那个放进 payload，
 源码形态下 `/app` 页面也直接读 `android/dist`。`android/debug.keystore` 是自签名证书，**必须留在仓库里**：
 换一份证书签出来的包，Android 会以「签名不一致」拒绝覆盖安装。

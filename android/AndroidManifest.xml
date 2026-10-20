@@ -23,9 +23,18 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.hbdxm.ddwx"
-    android:versionCode="3"
-    android:versionName="0.3.0">
-
+    android:versionCode="4"
+    android:versionName="0.4.1">
+    <!-- ⚠ 这两个值是**真正进包**的（aapt2 以清单为准，build.py 里的
+         version-code / version-name 参数对它不起作用 —— 2026-10-20 实测确认）。
+         所以改版本号时必须**同时**改三处，少一处就会出现「文件名 0.4.1、
+         装到手机上显示 0.3.0」这种查半天的问题：
+             1) 本文件 android:versionCode / android:versionName
+             2) build.py 顶部 VERSION_CODE / VERSION_NAME（决定产物文件名）
+             3) bridge/__init__.py 的 __version__（电脑端版本，另一套编号）
+         build.py 打完包会用 aapt2 dump badging 回读比对 1 与 2，对不上就构建失败，
+         所以漏改不会悄悄上线。
+    -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- 前台保活服务（常驻通知）。没有它，华为/小米会在内存紧张时把整个应用

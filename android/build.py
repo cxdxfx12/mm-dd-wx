@@ -112,6 +112,12 @@ class Runner:
             for line in text.strip().splitlines()[:20]:
                 print("    " + line)
 
+    def capture(self, args: list[str]) -> str:
+        """跑命令并**只要输出**（不打到屏幕）。给「回读产物做断言」这类用途。"""
+        out = subprocess.run(args, env=self.env, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, cwd=str(ROOT))
+        return out.stdout.decode("utf-8", "replace")
+
     def which(self, name: str) -> str:
         for d in (self.jdk / "bin",):
             for ext in (".exe", ".bat", ""):
@@ -142,6 +148,13 @@ def link_res(r: Runner, bt: Path, android_jar: Path, res_zip: Path, build: Path)
     gen = build / "gen"
     gen.mkdir(parents=True, exist_ok=True)
     apk = build / "base.apk"
+    # ⚠ 版本号**以 AndroidManifest.xml 为准**。下面这两个参数 aapt2 实际不认
+    # （2026-10-20 实测：清单里写了具体值时参数被完全忽略；清单留空时
+    # versionCode 直接变空、versionName 变 "0"）。留在这里只是因为无害、
+    # 且换 build-tools 后行为可能变回来。
+    # 真正防漂移的是 sign() 里的 verify_version()：打完包回读 APK 与这里的
+    # 常量比对，对不上就构建失败 —— 光靠「记得改两处」已经漂移过一次。
+    #
     # 注意 res.zip 必须作为**位置参数**传，不能用 -R。
     # aapt2 里 -R 是「覆盖层(overlay)资源」的语义：用 -R 时它会去比对「被覆盖的
     # 那份资源」，找不到就报 "resource string/xxx does not override an existing
@@ -154,9 +167,6 @@ def link_res(r: Runner, bt: Path, android_jar: Path, res_zip: Path, build: Path)
            "-o", str(apk),
            "-I", str(android_jar),
            "--manifest", str(PROJECT / "AndroidManifest.xml"),
-           # 版本号以这里为准。清单里也写了一份（方便单看清单时能读懂），
-           # 但真正进包的是这两个参数 —— 两处漂移过一次：文件名已经是 0.2.0，
-           # 装到手机上却显示 0.1.0，覆盖安装时很容易误判成「装的是旧包」。
            "--version-code", VERSION_CODE,
            "--version-name", VERSION_NAME,
            str(res_zip),
@@ -256,6 +266,32 @@ def ensure_keystore(r: Runner) -> Path:
     return KS_FILE
 
 
+def verify_version(r: Runner, bt: Path, apk: Path) -> None:
+    """回读 APK 里**真正**的 versionCode / versionName，与常量对不上就构建失败。
+
+    为什么非查不可：文件名是按常量拼的，看起来一切都对；但 aapt2 link 有个坑 ——
+    清单里若写了具体的 versionCode/versionName，它会**忽略** --version-code /
+    --version-name 两个参数，以清单为准。2026-10-20 就是这么翻的车：
+    0.4.0、0.4.1 两轮产物文件名都新，包内却一直是 0.3.0 / 3，
+    手机上显示的、PackageManager 读到的、上报给网关的全是旧值。
+
+    只靠「改清单记得同步」不牢 —— 两处漂移正是这么来的。所以留一条断言。
+    """
+    out = r.capture([str(bt / "aapt2.exe"), "dump", "badging", str(apk)])
+    head = next((ln for ln in out.splitlines() if ln.startswith("package:")), "")
+    got_code = re.search(r"versionCode='([^']*)'", head)
+    got_name = re.search(r"versionName='([^']*)'", head)
+    code = got_code.group(1) if got_code else "(读不到)"
+    name = got_name.group(1) if got_name else "(读不到)"
+    if code != VERSION_CODE or name != VERSION_NAME:
+        die(f"版本号没进包：常量是 {VERSION_NAME}/{VERSION_CODE}，"
+            f"APK 里却是 {name}/{code}。\n"
+            f"  多半是 AndroidManifest.xml 里写死了 versionCode/versionName —— "
+            f"aapt2 会以清单为准、忽略 --version-* 参数。\n"
+            f"  清单里那两个属性要留成占位（0），改版本只改本文件顶部常量。")
+    print(f"  版本校验：{name}（versionCode {code}）")
+
+
 def sign(r: Runner, bt: Path, unsigned: Path, build: Path) -> Path:
     dist = PROJECT / "dist"
     dist.mkdir(parents=True, exist_ok=True)
@@ -274,6 +310,7 @@ def sign(r: Runner, bt: Path, unsigned: Path, build: Path) -> Path:
            "--out", str(signed),
            str(aligned)], quiet=True)
     r.run([str(bt / "apksigner.bat"), "verify", "--print-certs", str(signed)], quiet=True)
+    verify_version(r, bt, signed)
     return signed
 
 
