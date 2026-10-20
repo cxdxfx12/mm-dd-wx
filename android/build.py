@@ -40,8 +40,8 @@ APP_ID = "com.hbdxm.ddwx"
 BUILD_TOOLS = "33.0.2"
 PLATFORM = "android-33"
 
-VERSION_CODE = "3"
-VERSION_NAME = "0.4.0"
+VERSION_CODE = "4"
+VERSION_NAME = "0.4.1"
 
 # 自签名用的口令。这是**演示/自用**签名，不是发布凭据 —— 仓库里放口令是可接受的，
 # 因为它唯一的作用是让 Android 愿意装这个包，不保护任何机密。

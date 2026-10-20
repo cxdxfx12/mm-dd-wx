@@ -398,7 +398,8 @@ public class CollectorService extends AccessibilityService {
             lastHeartbeat = "没填 token，心跳发不出去";
             return;
         }
-        Uploader.Result r = Uploader.heartbeat(Prefs.host(this), Prefs.port(this), token);
+        Uploader.Result r = Uploader.heartbeat(Prefs.host(this), Prefs.port(this), token,
+                Prefs.appVersion(this));
         heartbeatOk = r.ok;
         heartbeats++;
         lastHeartbeat = stamp() + " · " + (r.ok ? "正常" : r.detail);
@@ -486,7 +487,7 @@ public class CollectorService extends AccessibilityService {
         }
 
         Uploader.Result r = Uploader.postScreen(Prefs.host(this), Prefs.port(this), token,
-                xml, md5, tree.texts.size(), reason);
+                xml, md5, tree.texts.size(), reason, Prefs.appVersion(this));
         if (r.ok) {
             // 只有成功才记住指纹，否则一次网络抖动会把这一屏永久跳过
             sentMd5 = md5;
@@ -789,7 +790,7 @@ public class CollectorService extends AccessibilityService {
         }
         String xml = tree.xml.toString();
         Uploader.postScreen(Prefs.host(this), Prefs.port(this), token,
-                xml, md5(xml), tree.texts.size(), reason);
+                xml, md5(xml), tree.texts.size(), reason, Prefs.appVersion(this));
     }
 
     /** 找到消息列表那一层的可滚动节点（滚动要落在它身上才有效）。 */

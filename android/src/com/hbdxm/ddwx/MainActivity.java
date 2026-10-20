@@ -303,7 +303,8 @@ public class MainActivity extends Activity {
             return;
         }
         StringBuilder sb = new StringBuilder(400);
-        sb.append("无障碍服务：已开启\n")
+        sb.append("版本 ").append(Prefs.appVersion(this)).append('\n')
+                .append("无障碍服务：已开启\n")
                 .append("抓取 ").append(CollectorService.captures)
                 .append(" · 上报 ").append(CollectorService.posts)
                 .append(" · 跳过 ").append(CollectorService.skips)
@@ -312,6 +313,15 @@ public class MainActivity extends Activity {
                 .append("心跳 ").append(CollectorService.heartbeatOk ? "✔ 正常" : "✘ 异常")
                 .append("（共 ").append(CollectorService.heartbeats).append(" 次）\n")
                 .append("　").append(CollectorService.lastHeartbeat).append('\n')
+                // 巡检状态单独一行且**总是显示**：这一项开着会抢前台、关着会让
+                // 采集链路断了不自愈，两种都有后果，不能让用户猜。
+                .append("自动巡检 ")
+                .append(CollectorService.watchMinutes > 0
+                        ? ("每 " + CollectorService.watchMinutes + " 分钟 → "
+                           + CollectorService.watchGroup)
+                        : "关闭")
+                .append('\n')
+                .append("　").append(CollectorService.lastWatch).append('\n')
                 .append("读到文本 ").append(CollectorService.lastTexts)
                 .append(" 条 · ").append(CollectorService.lastBytes).append(" 字节\n\n")
                 .append("最后动作（").append(CollectorService.lastAt).append("）：\n")

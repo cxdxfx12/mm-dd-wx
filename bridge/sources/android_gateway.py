@@ -965,6 +965,10 @@ class _Ctx:
     last_seen: float = 0.0
     last_seen_wall: str = ""              # 同一时刻的人话版本，写进告警文案
     last_device: str = ""                 # 手机型号，告警时好认出是哪台
+    # 手机上报的 App 版本（X-Ddwx-Ver，APK 0.4.1 起带）。空 = 旧版没这个头。
+    # 存在的理由很具体：同一个机型的 device 名永远不变，分不出 0.3.0 和 0.4.0，
+    # 而「到底装上没装上带新功能的那版」是每次排查的第一个问题。
+    last_ver: str = ""
     # 是否收到过**心跳**。判定失联必须有它：手机端只在画面变化时上报，
     # 群里半天没人说话时它本来就不发东西 —— 按「多久没收到上报」判会天天误报。
     heard_heartbeat: bool = False
@@ -981,7 +985,8 @@ class _Ctx:
     # 网关整个卡住，手机上报超时」，而日志里什么都没有。
     seen_lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def touch(self, device: str = "", heartbeat: bool = False) -> None:
+    def touch(self, device: str = "", heartbeat: bool = False,
+              ver: str = "") -> None:
         """记一次「手机还活着」。心跳与业务上报都算。
 
         这里**只更新时间戳、不改状态**：状态机和它的日志全交给看门狗一处做，
@@ -993,6 +998,9 @@ class _Ctx:
             self.last_seen_wall = time.strftime("%H:%M:%S")
             if device:
                 self.last_device = device
+            ver = (ver or "").strip()
+            if ver:
+                self.last_ver = ver
             if heartbeat:
                 self.heard_heartbeat = True
 
@@ -1095,6 +1103,7 @@ class _Handler(BaseHTTPRequestHandler):
                           "state": self.ctx.state,
                           "last_seen": self.ctx.last_seen_wall,
                           "device": self.ctx.last_device,
+                          "app_ver": self.ctx.last_ver or "(旧版未上报)",
                           "heartbeat": self.ctx.heard_heartbeat,
                           "offline_after": self.ctx.offline_after,
                           "screen": _screen_meta(self.ctx.screen),
@@ -1242,7 +1251,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         # 能在 /messages 里报消息，本身就说明手机还活着（老版 APK 没有心跳，
         # 靠这一条也能让「启动后一次都没收到」的告警不再误报）。
-        self.ctx.touch(device=(self.headers.get("X-Ddwx-Device") or "").strip())
+        self.ctx.touch(device=(self.headers.get("X-Ddwx-Device") or "").strip(),
+                       ver=(self.headers.get("X-Ddwx-Ver") or "").strip())
 
         for msg in msgs:
             try:
@@ -1296,6 +1306,7 @@ class _Handler(BaseHTTPRequestHandler):
                        or hashlib.md5(raw).hexdigest(),
                 "texts": texts,
                 "device": (self.headers.get("X-Ddwx-Device") or "").strip(),
+                "ver": (self.headers.get("X-Ddwx-Ver") or "").strip(),
                 "reason": (self.headers.get("X-Ddwx-Reason") or "").strip(),
                 "ts": time.time(),
                 "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1317,7 +1328,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         # 记「手机还活着」。必须在锁外调：touch 走的是另一把锁，
         # 但把它放在这里能让 hold 锁的时间只包含解析。
-        self.ctx.touch(device=screen["device"])
+        self.ctx.touch(device=screen["device"], ver=screen.get("ver", ""))
 
         if count == 1:
             log.info("收到第一帧手机画面：%d 字节，%d 条文本（来自 %s）",
@@ -2295,8 +2306,19 @@ class AndroidGatewaySource(Source):
             log.info("  手机自动巡检已开启：每 %d 分钟检查一次「%s」，不在这个群里就"
                      "自动点回去（期间手机会被抢前台，消息最多有这么久的盲区）",
                      self.watch_min, self.watch_group)
+        elif not self.watch_group:
+            # 群名空 = 巡检开了也没用（手机端见空群名会直接不动作）。
+            # 单独说一句，避免用户把 watch_min 设成 10 却发现手机不动，
+            # 然后花时间怀疑是 APK 版本或权限问题。
+            log.warning("  手机自动巡检不生效：没配 dingtalk.chat_names，"
+                        "手机不知道该回到哪个群 —— 填上目标群名即可")
         else:
-            log.info("  手机自动巡检未开启（dingtalk.android_watch_min = 0）："
+            # ⚠ 不要写死「= 0」：原文案会误导两类人 ——
+            #   ① 配置里压根没这个键（老配置/第一次用），日志却说「你设成了 0」，
+            #      用户去翻配置找不到这一行，以为程序读错了配置；
+            #   ② 手填了非档位值（如 7），被夹到 5 或按关闭处理，日志显示的
+            #      也不是用户填的那个数。
+            log.info("  手机自动巡检未开启（dingtalk.android_watch_min 未设置或为 0）："
                      "手机被切走或钉钉崩溃后不会自己恢复，只能靠人发现"
                      "（失联告警是唯一的提示）")
 

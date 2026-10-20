@@ -73,7 +73,7 @@ final class Uploader {
 
     /** POST /screen —— 正文就是 XML 本身，元信息全放在 HTTP 头里（保持 XML 格式纯净）。 */
     static Result postScreen(String host, int port, String token, String xml,
-                             String md5, int texts, String reason) {
+                             String md5, int texts, String reason, String ver) {
         HttpURLConnection conn = null;
         try {
             byte[] body = xml.getBytes(StandardCharsets.UTF_8);
@@ -86,6 +86,9 @@ final class Uploader {
             conn.setRequestProperty("X-Ddwx-Md5", md5);
             conn.setRequestProperty("X-Ddwx-Texts", String.valueOf(texts));
             conn.setRequestProperty("X-Ddwx-Device", Build.MODEL == null ? "" : Build.MODEL);
+            // 版本号随每帧带上：换没换新包是排障的第一个问题，而机型名
+            // （X-Ddwx-Device）同一个型号永远不变，区分不出 0.3.0 和 0.4.0。
+            conn.setRequestProperty("X-Ddwx-Ver", ver == null ? "" : ver);
             conn.setRequestProperty("X-Ddwx-Reason", reason == null ? "" : reason);
 
             OutputStream os = conn.getOutputStream();
@@ -122,7 +125,7 @@ final class Uploader {
      * <p>body 刻意是空对象而不是空串：网关对 /ping 只做「读掉请求体」，
      * 但空串会让某些代理/防火墙当成畸形请求而丢掉。
      */
-    static Result heartbeat(String host, int port, String token) {
+    static Result heartbeat(String host, int port, String token, String ver) {
         HttpURLConnection conn = null;
         try {
             byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
@@ -132,6 +135,7 @@ final class Uploader {
             conn.setRequestProperty("X-Bridge-Token", token);
             conn.setRequestProperty("X-Ddwx-Device",
                     Build.MODEL == null ? "" : Build.MODEL);
+            conn.setRequestProperty("X-Ddwx-Ver", ver == null ? "" : ver);
 
             OutputStream os = conn.getOutputStream();
             try {

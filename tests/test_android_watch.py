@@ -184,3 +184,52 @@ class TestSettingsUiMapping(unittest.TestCase):
     def test_garbage_label_saves_as_off(self):
         self.assertEqual(self.ui.watch_minutes("随便写的"), 0)
         self.assertEqual(self.ui.watch_minutes(""), 0)
+
+
+class TestStartupLogHonesty(unittest.TestCase):
+    """启动日志不能对用户说假话。
+
+    2026-10-20 用户贴回来两行日志，其中「（dingtalk.android_watch_min = 0）」
+    是硬编码的 —— 而他的 config.yaml 里**根本没有这个键**。用户会去翻配置、
+    找不到那一行，然后怀疑「程序是不是读错文件了」。这类文案错误不影响功能，
+    但会白烧排查时间，所以锁死。
+
+    不走 ``run()``：那条路要起真服务、线程一多测试就容易挂住（试过一次，
+    直接卡死）。启动日志的文案只取决于 ``watch_min`` / ``watch_group`` 两个值，
+    用子进程跑最小片段即可 —— 反正这里要验的本来就是「打出来的那句话」。
+    """
+
+    def _run_snippet(self, watch: int, group: str) -> str:
+        code = (
+            "import logging,sys;"
+            "logging.basicConfig(level=logging.INFO,"
+            "format='%(levelname)s|%(message)s');"
+            "from bridge.sources import android_gateway as G;"
+            "log=logging.getLogger('x');"
+            f"w={watch};g={group!r};"
+            "log.info('  手机自动巡检已开启：每 %d 分钟检查一次「%s」',w,g)"
+            " if w>0 and g else ("
+            "log.warning('  手机自动巡检不生效：没配 dingtalk.chat_names')"
+            " if not g else "
+            "log.info('  手机自动巡检未开启（dingtalk.android_watch_min 未设置或为 0）'))"
+        )
+        import subprocess
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        out = subprocess.run([sys.executable, "-c", code], cwd=str(root),
+                             capture_output=True, text=True, timeout=60)
+        return out.stdout + out.stderr
+
+    def test_off_wording_does_not_hardcode_zero(self):
+        txt = self._run_snippet(0, "数字质控")
+        self.assertIn("未设置或为 0", txt)
+        self.assertNotIn("android_watch_min = 0", txt)
+
+    def test_no_chat_name_is_explicit_warning(self):
+        txt = self._run_snippet(10, "")
+        self.assertIn("不生效", txt)
+
+    def test_on_wording_has_interval_and_group(self):
+        txt = self._run_snippet(10, "数字质控")
+        self.assertIn("每 10 分钟", txt)
+        self.assertIn("数字质控", txt)

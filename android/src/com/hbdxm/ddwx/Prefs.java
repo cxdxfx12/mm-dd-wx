@@ -114,6 +114,23 @@ final class Prefs {
         return 30;
     }
 
+    /**
+     * 本 App 的版本号（如 "0.4.0"）。
+     *
+     * <p>工程是手工用 aapt2/javac 编的、不走 Gradle，所以没有 BuildConfig，
+     * 只能从 PackageManager 读。读不到返回 "?"，**绝不能返回空串** ——
+     * 空串在日志里和「旧版没这个字段」分不开，而这个字段存在的唯一意义
+     * 就是排「装没装上新包」。
+     */
+    static String appVersion(Context c) {
+        try {
+            return c.getPackageManager().getPackageInfo(c.getPackageName(), 0)
+                    .versionName;
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
     static void save(Context c, String host, int port, String token, int interval,
                      String target, boolean snapshot) {
         of(c).edit()
