@@ -1843,11 +1843,19 @@ class App(tk.Tk):
     # ---------------- 关闭 ----------------
 
     def _on_close(self):
-        if self.runner.alive():
-            if not messagebox.askyesno(
-                    "退出确认", "转发任务正在运行，退出会停止转发。\n\n确定停止并退出吗？",
-                    parent=self):
-                return
+        # 不论在不在转发都要问一次：空闲时点「退出」原来是直接关窗，
+        # 菜单里「退出」紧挨着「开始运行」，一不小心就点错，关了就没了。
+        running = self.runner.alive()
+        if running:
+            ask = ("转发任务正在运行，退出会停止转发。\n\n确定停止并退出吗？")
+        else:
+            ask = "确定退出「喵喵钉钉-微信消息转发桥」吗？"
+        # default="no"：回车/误按回车不会顺手确认掉
+        if not messagebox.askyesno("退出确认", ask + "\n",
+                                   icon="warning" if running else "question",
+                                   default="no", parent=self):
+            return
+        if running:
             self.state = "stopping"
             self._refresh_state()
             self.runner.stop(grace=4.0)
