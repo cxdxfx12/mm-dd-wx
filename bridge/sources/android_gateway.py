@@ -55,6 +55,7 @@ import socket
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -110,6 +111,17 @@ NEAR_DUP_WINDOW = 600.0
 PROBE_COOLDOWN = 1.2
 PROBE_MAX = 6
 PROBE_SETTLE_MAX = 20.0
+# 试探状态的保质期（秒）。锚点丢失后如果长时间一帧都没来（灭屏、用户拿走
+# 手机、离开会话），上一轮的试探状态不该带到现在用：真机 2026-10-26 14:16
+# 试探额度用光挂在被动「等」上，之后 42 分钟没帧；14:58 爆发的第一帧一来
+# 就撞上「额度已用光」直接 give_up，整波消息差点被基线重建吞掉。
+# 取值要点：一轮试探的极限时长 ≈ PROBE_MAX×(冷却+翻页往返) + SETTLE，
+# 约 40 秒；60 秒内没动静就认定这轮已经死了。过期后不再翻页 —— 锚点早已
+# 远在好几屏之外，翻了也翻不回，直接 give_up + 打捞（见 _salvage_rebuild）。
+ALIGN_STALE = 60.0
+# 打捞（_salvage_rebuild）一次最多捞几条。限制爆炸半径：判据再稳，也只
+# 承担「静默期后苏醒的第一屏」，不可能有一条以上的真新消息挤在底部。
+SALVAGE_MAX_UNITS = 8
 # 长消息「攒齐再发」最多等多久（秒）。等不到补全帧就发手头那半截 ——
 # 手机没手势权限、用户在操作别的界面、群消息太快把前半截顶掉，都可能让
 # 补全永远不来。宁可发一条不完整的，也不能永远不发。
@@ -691,6 +703,10 @@ def _deliver_ready(ctx: "_Ctx", msgs: list) -> int:
             with ctx.lock:
                 ctx.recent_keys[msg.uid] = (sender, msg.content,
                                             time.monotonic())
+                # 打捞（_salvage_rebuild）的「已投递」对照记录。比 recent_keys
+                # 的近似去重窗口长得多 —— 用户翻回早前的历史时，那些消息早
+                # 出了 NEAR_DUP_WINDOW，只能靠这份滚动记录挡住不重发。
+                ctx.delivered_texts.append((sender, msg.content))
         except Exception:
             log.exception("下游处理消息失败：%s", msg.uid)
     with ctx.lock:
@@ -900,6 +916,19 @@ class _Ctx:
     # 第一次「等手机翻页安定」的时刻；0 = 当前不在等待中。
     # 有了它，一边翻一边来的中间态帧只会消耗「等待时间」而不会消耗试探次数。
     align_wait_since: float = 0.0
+    # 最近一帧「锚点健康」的画面单元（普通帧 / 基线帧 commit 后更新；
+    # 补全帧不动它 —— 那是滚到半空的一帧，不代表会话底部）。
+    # 基线重建前的打捞（_salvage_rebuild）拿它当参照系：当前帧与它有
+    # 重叠 = 还是同一个会话，重叠区之下才是真新消息。
+    last_good_units: list = field(default_factory=list)
+    # 已投递内容的滚动记录（(norm_sender, 正文)）。打捞用它挡「已经发过的
+    # 又捞一遍」；比 recent_keys 的 NEAR_DUP_WINDOW 长得多 —— 用户翻回早前
+    # 的历史时，那些消息早出了近似去重窗口，只能靠这份记录挡。
+    delivered_texts: deque = field(default_factory=lambda: deque(maxlen=512))
+    # give_up 是否因「试探状态过期」（ALIGN_STALE）触发。只有过期触发的
+    # 重建才允许打捞 —— 活跃浏览（翻历史 / 换群）时的重建绝不能捞，否则
+    # 用户翻哪屏就把哪屏灌进微信群。
+    align_stale_gave_up: bool = False
     # ── 「先攒后发」缓冲 ───────────────────────────────────────────
     # 钉钉机器人的 H5 卡片是分批渲染的，这一帧看到的往往只是半成品。
     # 早期用「扣住等重报帧指纹一致」，但 H5 卡片每重绘一次整批指纹都变，
@@ -973,6 +1002,16 @@ class _Ctx:
     # 手机再单独填一遍必然出现「两边不一致」，而不一致的后果是每轮都点错群。
     watch_group: str = ""
     watch_min: int = 0
+    # 让路截止时刻（time.monotonic，0 = 没让路）。给这台机器上**另一个**
+    # 操作同一部手机的项目腾前台用：对方点「确定/上传」的那几秒，如果我们
+    # 恰好巡检，会把钉钉拉到前台，对方的点击就落空了（2026-10-20 实证）。
+    # 用单调时钟而不是墙上时间：用户改系统时间/夏令时不会让它提前或永不结束。
+    watch_pause_until: float = 0.0
+    # 「立刻切回目标群」的一次性指令（电脑端按钮点的）。用递增序号而不是布尔：
+    # 用户可能连点两下，第二下也必须生效；发完前心跳就已经取走时序号不会丢。
+    # 手机在 /ping 的响应里读 watch_now=1 就当场跑一轮巡检。
+    watch_now_seq: int = 0
+    watch_now_served: int = 0
     # 上一次「不是聊天页，本帧跳过」的说明。用户点开 @ 面板会连着报好几帧，
     # 内容一样就没必要重复写日志（日志是滚动文件，刷满了会盖掉真问题）。
     last_skip_note: str = ""
@@ -993,6 +1032,23 @@ class _Ctx:
     # watch_runs 尤其关键：它不涨 = 定时器没在转（APK 没装对/服务没连上）。
     last_watch: str = ""
     last_watch_runs: int = 0
+    # 「心跳里带没带巡检状态」的最后一个证据。
+    #
+    # 这不是可有可无的细节，而是 2026-10-20 卡了一整轮的那个问题：`/ping` 里
+    # 根本没有 watch 字段时，有两种完全不同的原因 ——
+    #   ① 手机端**没发**这两个头（老包/发头抛了异常）；
+    #   ② 手机端发了，但**巡检一次都没跑**（那也应该显示 "(还没巡检过)" 才对）。
+    # 光看「字段缺失」分不开这两者，只能靠人拿手机看设置页。记下最后一次心跳
+    # 到底带没带，就能把方向一次分开：带了 = 问题在巡检调度；没带 = 问题在上报。
+    #
+    # 取值："never"（一次都没收到心跳）/ "yes" / "no"
+    watch_header: str = "never"
+    # 最近一次巡检**失败**时的现场快照（X-Ddwx-Probe）：前台包名、根节点
+    # 能不能读到、标题读成什么、顶栏的 viewId。存在的理由很实际 ——
+    # 失败原因常常是同一句话（「读不到钉钉标题栏」），而它背后至少有三种
+    # 完全不同的情况：钉钉被拉到桌面前、停在某个没标题的页、根本不在钉钉里。
+    # 华为屏蔽第三方 logcat，没有这一行，人不在手机边上就只能靠猜。
+    last_probe: str = ""
     # 是否收到过**心跳**。判定失联必须有它：手机端只在画面变化时上报，
     # 群里半天没人说话时它本来就不发东西 —— 按「多久没收到上报」判会天天误报。
     heard_heartbeat: bool = False
@@ -1010,7 +1066,8 @@ class _Ctx:
     seen_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def touch(self, device: str = "", heartbeat: bool = False,
-              ver: str = "", watch: str = None, watch_runs: int = -1) -> None:
+              ver: str = "", watch: str = None, watch_runs: int = -1,
+              probe: str = None) -> None:
         """记一次「手机还活着」。心跳与业务上报都算。
 
         这里**只更新时间戳、不改状态**：状态机和它的日志全交给看门狗一处做，
@@ -1033,6 +1090,11 @@ class _Ctx:
                 self.last_watch = watch
             if watch_runs >= 0:
                 self.last_watch_runs = watch_runs
+            if probe is not None:
+                self.last_probe = probe
+            # 只在心跳里记（业务上报不带这两个头，记它会把证据冲成 "no"）
+            if heartbeat:
+                self.watch_header = "yes" if watch is not None else "no"
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1068,15 +1130,107 @@ class _Handler(BaseHTTPRequestHandler):
         「请求体过大」而是一句「连接被重置」，人就不知道到底哪儿错了。
         """
         remaining = min(max(0, length), cap)
-        while remaining > 0:
-            chunk = self.rfile.read(min(65536, remaining))
-            if not chunk:
-                return
-            remaining -= len(chunk)
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+        except (OSError, ConnectionError) as exc:
+            # 读请求体时对方已经走了（WinError 10054 就是这条路径进来的）。
+            # 这里**只该记一条 debug**：用户的日志窗口里出现一句
+            # 「ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个
+            # 现有的连接」是没有任何可操作信息的，只会让人以为程序坏了。
+            # 真正断了会由失联告警（按心跳判）报出来。
+            log.debug("读请求体时对方断开（%s 字节未读）：%s", remaining, exc)
+            self.close_connection = True
 
     def _path(self) -> str:
         p = urlparse(self.path).path
         return p.rstrip("/") or "/"
+
+    def _apply_watch_pause(self, seconds: int) -> str:
+        """让路：一段时间内不自动巡检，返回一句给人看的话。
+
+        为什么需要它（2026-10-20 线上事故）：这台机器上还有另一个项目
+        （运单揽件助手）在用 adb 操作同一台手机的申行者。我们的自动巡检
+        每轮会「打开最近任务 → 拉起钉钉 → 搜索并点开目标群」，全程占好几秒
+        前台。它恰好在对方点「确定」的那一刻跑起来，对方的点击就落到了
+        最近任务界面上 —— 表现是「注入了 176 条，列表却是 0」，那批单全废。
+
+        两个程序互不认识，谁也没错，错在没人协调。这个接口就是那段协调：
+        对方动手前调一下，我们这 `seconds` 秒内不碰前台；对方跑完（或超时）
+        自动恢复，不需要它记得恢复 —— 对方进程崩了也不会把巡检永久关死。
+
+        实现上只改 ``ctx.watch_pause_until``（单调时钟），不动 ``watch_min``：
+        ``watch_min`` 是用户在设置里填的长期配置，为了临时让路去改它，
+        一旦恢复失败就会把用户的设置弄丢。
+        """
+        ctx = self.ctx
+        seconds = max(0, min(int(seconds), 3600))
+        until = time.monotonic() + seconds if seconds else 0.0
+        with ctx.lock:
+            ctx.watch_pause_until = until
+        if not seconds:
+            log.info("解除让路：自动巡检恢复正常")
+            return "已解除让路，自动巡检恢复正常"
+        log.info("收到让路请求：%d 秒内不自动巡检（给另一个操作手机的程序腾前台）",
+                 seconds)
+        return f"已让路 {seconds} 秒，期间不切群、不抢前台"
+
+    def _watch_paused(self) -> float:
+        """还要让路多少秒，0 = 没在让路。"""
+        until = self.ctx.watch_pause_until
+        if not until:
+            return 0.0
+        left = until - time.monotonic()
+        return left if left > 0 else 0.0
+
+    def _queue_watch_now(self) -> str:
+        """挂一条「立刻切回目标群」的指令，返回一句给人看的话。
+
+        ⚠ 序号要**在锁里**加：抓取帧和心跳是两个不同线程，两边都在读
+        ``watch_now_seq`` / 写 ``watch_now_served``。不加锁的话会出现
+        「指令被读走了但 served 没更新 → 手机每帧都被要求切群」，
+        表现就是用户回个消息就被程序抢走前台。
+        """
+        ctx = self.ctx
+        with ctx.lock:
+            if not ctx.watch_group:
+                return ("没配目标群（dingtalk.chat_names），手机不知道该切到哪个群"
+                        " —— 去「设置」里填上群名")
+            ctx.watch_now_seq += 1
+            seq = ctx.watch_now_seq
+        log.info("收到「切到钉钉群」指令（第 %d 次）：等手机下次心跳带下去", seq)
+        return (f"已排队：手机会在 1～60 秒内切到「{ctx.watch_group}」"
+                f"（手机自己会戳醒心跳，通常几秒内就能切）")
+
+    # --- 断连：不该在日志里变成红色 traceback ---
+
+    def handle_one_request(self) -> None:
+        """收口「手机把连接掐了」这一类异常。
+
+        手机上滑掉 App、切飞行模式、换 WiFi、切后台 —— 都会在电脑侧抛出
+        ``ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接``。
+        这是**移动端的日常**，不是故障：消息该重传的会重传、真断了有失联告警兜着。
+        但 ``BaseHTTPRequestHandler`` 不接这个异常，它会一路冒到
+        ``ThreadingHTTPServer.handle_error`` 打成 ``Exception occurred during
+        processing of request`` 全屏 traceback，用户在日志窗口看到就以为程序崩了。
+        """
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, ConnectionAbortedError,
+                BrokenPipeError) as exc:
+            log.debug("手机断开连接（%s）：%s", self.address_string(), exc)
+            self.close_connection = True
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (ConnectionResetError, ConnectionAbortedError,
+                BrokenPipeError) as exc:
+            log.debug("连接中断（%s）：%s", self.address_string(), exc)
+            self.close_connection = True
 
     def _auth_ok(self) -> bool:
         # 两个头名都认：X-Bridge-Token 是本文档规定的口径，X-Auth-Token 是手机端
@@ -1139,6 +1293,10 @@ class _Handler(BaseHTTPRequestHandler):
                           # 这是「装了新包却没生效」最直接的证据。
                           "watch": self.ctx.last_watch or "(还没巡检过)",
                           "watch_runs": self.ctx.last_watch_runs,
+                          "probe": self.ctx.last_probe,
+                          # 心跳里到底带没带巡检状态。看这一项就能分清
+                          # 「手机没报」和「报了但巡检没跑」。
+                          "watch_header": self.ctx.watch_header,
                           "offline_after": self.ctx.offline_after,
                           "screen": _screen_meta(self.ctx.screen),
                           "stats": dict(self.ctx.count)})
@@ -1214,11 +1372,63 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:                                # noqa: N802
         path = self._path()
-        if path not in ("/", "/messages", "/screen", "/ping"):
+        if path not in ("/", "/messages", "/screen", "/ping", "/watch-now",
+                        "/watch-pause"):
             self._reply(404, {"ok": False, "error": "未知路径"})
             return
         if not self._auth_ok():
             self._reject_auth()
+            return
+
+        if path == "/watch-pause":
+            # 让路接口：另一个操作手机的程序（运单揽件助手）在点「确定/上传」
+            # 之前调它，我们这 N 秒内不巡检、不抢前台。传 seconds=0 立刻解除。
+            # 不传 seconds 默认 120 秒 —— 够对方跑完一批，又短到即使它崩了
+            # 我们也最多瞎 2 分钟，下一轮巡检自己就回来了。
+            try:
+                wp_len = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                wp_len = 0
+            raw = b""
+            if wp_len > 0:
+                try:
+                    raw = self.rfile.read(min(wp_len, 4096))
+                except (OSError, ConnectionError) as exc:
+                    log.debug("读让路请求体时对方断开：%s", exc)
+                    raw = b""
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+            except (ValueError, UnicodeDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            try:
+                seconds = int(payload.get("seconds", 120))
+            except (TypeError, ValueError):
+                self._reply(400, {"ok": False, "error": "seconds 必须是整数"})
+                return
+            msg = self._apply_watch_pause(seconds)
+            self._reply(200, {"ok": True, "message": msg,
+                              "seconds": max(0, min(seconds, 3600)),
+                              "paused_left": round(self._watch_paused(), 1)})
+            return
+
+        if path == "/watch-now":
+            # 电脑端「切到钉钉群」按钮走的接口。挂一条一次性指令，手机在下一次
+            # 心跳（60 秒内）或抓取帧（1 秒内戳醒心跳）取走。
+            #
+            # 为什么不直接连手机：手机没有常驻服务端，一直是它主动连电脑。
+            # 电脑这边唯一能做的就是「留话」，等它来取。
+            try:
+                wn_len = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                wn_len = 0
+            self._drain(wn_len)
+            msg = self._queue_watch_now()
+            self._reply(200, {"ok": True, "message": msg,
+                              "chat_name": self.ctx.watch_group,
+                              "pending": (self.ctx.watch_now_seq
+                                          > self.ctx.watch_now_served)})
             return
 
         if path == "/ping":
@@ -1239,17 +1449,41 @@ class _Handler(BaseHTTPRequestHandler):
             ver = (self.headers.get("X-Ddwx-Ver") or "").strip()
             # 巡检状态。手机端按 URL 编码塞进来（HTTP 头不能直接放中文），
             # 这里解回来。解不开就当没有 —— 诊断信息不该让心跳失败。
-            watch = _unquote_header(self.headers.get("X-Ddwx-Watch"))
+            # ⚠ 先取原始头再解码：`_unquote_header("")` 也返回 ""，
+            # 而「头不存在」和「头存在但为空」是**两件事** —— 前者是旧版手机端
+            # 不会发，后者是发了但还没巡检过。混为一谈就会出现「/ping 说带了，
+            # 其实手机根本没这个功能」这种把排查带偏的结论。
+            raw_watch = self.headers.get("X-Ddwx-Watch")
+            watch = _unquote_header(raw_watch) if raw_watch is not None else None
             try:
                 runs = int((self.headers.get("X-Ddwx-Watch-Runs") or "0").strip() or 0)
             except ValueError:
                 runs = 0
+            raw_probe = self.headers.get("X-Ddwx-Probe")
+            probe = _unquote_header(raw_probe) if raw_probe is not None else None
             self.ctx.touch(device=device, heartbeat=True, ver=ver,
-                           watch=watch, watch_runs=runs)
-            self._reply(200, {"ok": True, "source": "android",
-                              "chat_name": self.ctx.chat_name,
-                              "last_seen": self.ctx.last_seen_wall,
-                              "offline_after": self.ctx.offline_after})
+                           watch=watch, watch_runs=runs, probe=probe)
+            hb = {"ok": True, "source": "android",
+                  "chat_name": self.ctx.chat_name,
+                  "last_seen": self.ctx.last_seen_wall,
+                  "offline_after": self.ctx.offline_after,
+                  # 巡检结论回给手机，是为了让**电脑端界面**（点完「切到钉钉群」
+                  # 的按钮）能当场把结果说出来。界面只连本机网关、拿不到
+                  # 进程内的状态，不放在回包里它就只能干等或让用户自己去看。
+                  "watch": self.ctx.last_watch,
+                  "watch_runs": self.ctx.last_watch_runs,
+                  "probe": self.ctx.last_probe}
+            # 让路中：心跳里也给个标记，方便手机端/日志对上时间。
+            paused_left = self._watch_paused()
+            if paused_left:
+                hb["watch_paused_left"] = round(paused_left, 1)
+            # 「立刻切到钉钉群」指令随心跳下发（电脑端按钮点的）。
+            # 只发一次：手机取走后立刻清掉，否则它每 60 秒被切一次群 ——
+            # 用户回个消息就会被程序抢走前台。
+            if self.ctx.watch_now_seq > self.ctx.watch_now_served:
+                self.ctx.watch_now_served = self.ctx.watch_now_seq
+                hb["watch_now"] = 1
+            self._reply(200, hb)
             return
 
         limit = MAX_SCREEN_BODY if path == "/screen" else MAX_BODY
@@ -1395,7 +1629,17 @@ class _Handler(BaseHTTPRequestHandler):
         # 自动巡检指令：每一帧都带，手机端见 applyWatch（幂等，值没变不动调度器）。
         # 放在 parse 判断**外面** —— 它和「解析不解析消息」无关，只收不转的模式
         # 下手机同样会跑偏，同样需要它自己走回来。
-        if self.ctx.watch_min > 0 and self.ctx.watch_group:
+        #
+        # 让路期间（另一个操作手机的程序正在点确定/上传）**下发 0**：手机端
+        # 收到 0 就停掉巡检定时器，不去抢前台。这比在手机端加判断更稳 ——
+        # 手机那边的巡检是独立调度器，PC 侧管不到，只能通过「不下发」来闭麦。
+        # 让路一结束，下一帧又变回正常的 watch_min，手机自己就重新排上。
+        paused = self._watch_paused()
+        if paused:
+            body["watch_group"] = self.ctx.watch_group or ""
+            body["watch_min"] = 0
+            body["watch_paused_left"] = round(paused, 1)
+        elif self.ctx.watch_min > 0 and self.ctx.watch_group:
             body["watch_group"] = self.ctx.watch_group
             body["watch_min"] = self.ctx.watch_min
         else:
@@ -1403,6 +1647,12 @@ class _Handler(BaseHTTPRequestHandler):
             # 会一直沿用本地记住的旧值，用户在电脑上关掉了却停不下来。
             body["watch_group"] = self.ctx.watch_group or ""
             body["watch_min"] = 0
+        # 「电脑端点过按钮、指令还没被取走」。只是一个**提醒手机去戳心跳**的标记，
+        # 真正的指令在 /ping 响应里（watch_now=1）。分两处是刻意的：
+        # 指令必须在心跳里一次性取走（不然每帧都切群，用户回消息会被抢前台），
+        # 而抓取帧只负责「快」—— 它几百毫秒一次，能把 60 秒的等待压到 1 秒内。
+        if self.ctx.watch_now_seq > self.ctx.watch_now_served:
+            body["watch_now_pending"] = 1
         if self.ctx.parse:
             # 手机端日志里直接能看到「这一帧有没有产生转发」，省得两头对时间。
             # ⚠ 这里的数字是**收进缓冲**的条数，不一定是「已投递」的条数 ——
@@ -1605,15 +1855,22 @@ class _Handler(BaseHTTPRequestHandler):
                                 self.ctx.align_tried)
                     return [], "锚点丢失，翻一屏找", True
             differ.commit(frame.units)
+            self.ctx.last_good_units = list(frame.units)
             if diff.baseline:
                 log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
                          "此后只转发基线之后的新消息", len(frame.units))
                 return [], "已建立基线", False
             log.warning("安卓画面解析：锚点丢失，基线已重建到当前画面")
+            salvaged = (self._salvage_rebuild(frame)
+                        if self.ctx.align_stale_gave_up else [])
+            if salvaged:
+                out, _note, want_more = self._finish(salvaged, frame, differ)
+                return out, ("锚点丢失（打捞 %d 条）" % len(salvaged)), want_more
             return [], "锚点丢失", False
 
         if diff.baseline:
             differ.commit(frame.units)          # peek 之后必须自己推进锚点
+            self.ctx.last_good_units = list(frame.units)
             log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
                      "此后只转发基线之后的新消息", len(frame.units))
             # ── 基线帧上被切的长消息：补全，但**不发** ──────────────
@@ -1672,6 +1929,7 @@ class _Handler(BaseHTTPRequestHandler):
                             self.ctx.align_tried)
                 return [], "锚点丢失，翻一屏找", True
             differ.commit(frame.units)          # 认输了，基线重建到当前画面
+            self.ctx.last_good_units = list(frame.units)
             log.warning("安卓画面解析：上一帧的锚点在本帧里找不到（翻历史／换群／"
                         "一屏全换）—— 本帧不转发，基线已重建到当前画面")
             # ⚠ 重建基线 = 把屏上一切登记为「已知历史」，**这一屏里真正的新
@@ -1690,6 +1948,15 @@ class _Handler(BaseHTTPRequestHandler):
             #   全文被一起丢掉**，用户只看到「翻页之前那半截」。
             #   补全的成果不能因为「锚点对不上」这个跟它无关的理由作废。
             done = self._long_done("锚点丢失，基线重建前先投递已攒到的内容")
+            # ⚠ 打捞（2026-10-26）：光把屏上最新几条打进日志救不了消息。
+            #   但**只有静默期后（试探状态过期）的重建才允许捞** —— 活跃
+            #   翻历史触发的重建捞了就是把历史灌进群。
+            salvaged = (self._salvage_rebuild(frame)
+                        if self.ctx.align_stale_gave_up else [])
+            if salvaged:
+                out, _note, want_more = self._finish(salvaged, frame, differ)
+                out = ([done] if done is not None else []) + list(out)
+                return out, ("锚点丢失（打捞 %d 条）" % len(salvaged)), want_more
             if done is not None:
                 return [done], "锚点丢失（已投递攒到的长消息）", False
             return [], "锚点丢失", False
@@ -1717,6 +1984,7 @@ class _Handler(BaseHTTPRequestHandler):
         # 那一层。锚点必须推进 —— 不推进的话下一帧会重新判出同一批，
         # 缓冲虽然能归并掉，但会白白续命（把 quiet 一直往后推）。
         differ.commit(frame.units)
+        self.ctx.last_good_units = list(frame.units)
 
         # 一屏装不下的长消息：树里只有屏幕上那截，滚出去的部分根本不存在。
         return self._finish(new, frame, differ)
@@ -1792,6 +2060,65 @@ class _Handler(BaseHTTPRequestHandler):
             return rest, "长消息待补全", True
         return [], "长消息待补全", True
 
+    @staticmethod
+    def _known_hit(sender: str, content: str, known) -> bool:
+        """这条单元在已投递记录里吗？短消息 `is_same_message` 一律答 False，
+        补一条精确相等兜底 —— 打捞的去重宁可严格。"""
+        ns = norm_sender(sender)
+        return any((s == ns or not s or not ns)
+                   and (c == content or is_same_message(c, content))
+                   for s, c in known)
+
+    def _salvage_rebuild(self, frame) -> list:
+        """静默期后重建基线前的打捞。
+
+        **只在试探状态过期（ALIGN_STALE）触发的 give_up 上调用** —— 调用点
+        见 `align_stale_gave_up`。活跃浏览（翻历史 / 换群）触发的重建绝不
+        打捞，否则用户翻哪屏就把哪屏灌进微信群。
+
+        场景（真机 2026-10-26 14:16→14:58）：锚点丢失的试探状态挂了 42 分钟
+        （灭屏 / 用户拿走手机），期间爆发的消息在苏醒后的第一帧上直接
+        give_up，重建基线把它们连同「已知历史」一起吞掉，用户只能手动翻页
+        走补全通道捞回。打捞的依据全在「静默期」这个前提上：
+
+          · 同一会话的证据：屏上至少有 1 条「见过」的单元 —— 要么
+            与上一正常帧指纹相同（被顶上去的旧消息），要么与已投递记录
+            同文（H5 卡片重渲染会换指纹，只能按正文近似认）。一条都没有
+            = 换了群 / 深翻远史，宁可不捞 —— **认不出会话绝不能捞**，
+            把别的群的消息打进目标群是事故；
+          · 只捞**最靠下的证据之下**的单元：新消息只会从底部进来；往上
+            翻出的旧内容在证据之上，不碰；
+          · 已投递过的跳过（正文近似相同即算同一条，含换渲染形态）——
+            依据 `ctx.delivered_texts`，比 NEAR_DUP_WINDOW 长得多。
+        """
+        units = frame.units or []
+        good = self.ctx.last_good_units or []
+        if not units or not good:
+            return []
+        good_fps = {u.fp for u in good}
+        known = self.ctx.delivered_texts
+        evidence = -1                     # 最靠下的「见过」单元下标
+        for i, u in enumerate(units):
+            if u.fp in good_fps:
+                evidence = i
+                continue
+            if self._known_hit(u.sender, u.content, known):
+                evidence = i
+        if evidence < 0:
+            return []                     # 没有同会话证据，宁可不捞
+        below = units[evidence + 1:]
+        if not below:
+            return []
+        kept = []
+        for u in below:
+            if not self._known_hit(u.sender, u.content, known):
+                kept.append(u)
+        kept = kept[-SALVAGE_MAX_UNITS:]
+        if kept:
+            log.warning("安卓画面解析：静默期后重建基线，打捞证据之下 "
+                        "%d 条疑似新消息（交攒齐层去重）", len(kept))
+        return kept
+
     def _probe_decision(self, frame_md5: str) -> str:
         """锚点对不上时怎么处置：``probe`` / ``wait`` / ``give_up``。
 
@@ -1812,6 +2139,17 @@ class _Handler(BaseHTTPRequestHandler):
           · 其余 → probe。
         """
         now = time.monotonic()
+        # ⚠ 试探状态会过期（见 ALIGN_STALE 注释）。过期不再翻页：锚点早已
+        #   远在好几屏之外，翻了也翻不回；直接 give_up，让调用方走
+        #   「重建基线 + 打捞」。不清这条的话，挂了 42 分钟的旧额度会在
+        #   爆发的第一帧上瞬间判 give_up，连一次翻页救援都没有。
+        if self.ctx.align_at and (now - self.ctx.align_at) > ALIGN_STALE:
+            log.warning("安卓画面解析：锚点丢失的试探状态已挂了 %.0f 秒"
+                        "（期间没有新帧）—— 不再翻页，重建基线并打捞",
+                        now - self.ctx.align_at)
+            self._reset_probe()
+            self.ctx.align_stale_gave_up = True
+            return "give_up"
         settled = (now - self.ctx.align_at) >= PROBE_COOLDOWN
         moved = bool(frame_md5) and frame_md5 != self.ctx.align_md5
 
@@ -1824,6 +2162,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "多半是在翻历史或换了群，不再试探，重建基线",
                         self.ctx.align_tried)
             self._reset_probe()             # 一轮结束：额度留到下一轮
+            self.ctx.align_stale_gave_up = False
             return "give_up"
 
         self.ctx.align_tried += 1
@@ -1842,6 +2181,7 @@ class _Handler(BaseHTTPRequestHandler):
             log.warning("安卓画面解析：等了 %.0f 秒锚点仍未找回（%s）—— "
                         "不再等，重建基线", waited, why)
             self._reset_probe()
+            self.ctx.align_stale_gave_up = False
             return "give_up"
         return "wait"
 
@@ -2445,3 +2785,25 @@ class AndroidGatewaySource(Source):
         return (f"安卓网关 | 监听 {self.host}:{self.port} | "
                 f"会话 {self.chat_name or '(报文自带)'} | "
                 f"已收 {self.count['accepted']} 条")
+
+    def switch_to_group_now(self) -> str:
+        """让手机立刻把钉钉切回目标群，返回一句给人看的结果。
+
+        为什么不在这里直接发 HTTP 给手机：手机没有常驻的服务端，只有它主动
+        连电脑的份。所以走「挂指令」这条路 —— 下一跳心跳（60 秒内）就把
+        ``watch_now=1`` 带下去，手机收到当场跑一轮 SelfHeal。
+
+        ⚠ 只有**单独设了间隔**才需要这个。人点按钮时盯着屏幕等结果，
+        60 秒的心跳周期太长，所以这里会顺手把心跳周期之外的一条捷径也用上：
+        调用方（GUI）可以紧接着看 ``/ping`` 的 ``watch`` 字段是否刷新。
+        """
+        ctx = getattr(self, "_ctx", None)
+        if ctx is None:
+            return "网关还没启动，指令发不出去"
+        if not ctx.watch_group:
+            return ("没配目标群（dingtalk.chat_names），手机不知道该切到哪个群 "
+                    "—— 去「设置」里填上群名")
+        ctx.watch_now_seq += 1
+        return (f"已排队：手机会在下一次心跳（60 秒内）切到「{ctx.watch_group}」。"
+                f"想立刻看到效果，可以等手机上那一轮跑完，"
+                f"或在手机上点「立即查找要转发的群」")
