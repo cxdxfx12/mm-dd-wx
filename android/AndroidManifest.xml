@@ -23,8 +23,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.hbdxm.ddwx"
-    android:versionCode="6"
-    android:versionName="0.4.3">
+    android:versionCode="23"
+    android:versionName="0.5.10">
     <!-- ⚠ 这两个值是**真正进包**的（aapt2 以清单为准，build.py 里的
          version-code / version-name 参数对它不起作用 —— 2026-10-20 实测确认）。
          所以改版本号时必须**同时**改三处，少一处就会出现「文件名 0.4.1、
@@ -44,6 +44,19 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 设置页的「允许后台常驻」按钮用它申请电池优化白名单 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 「启动」按钮编程开启无障碍服务用。签名级权限，商店用户拿不到；
+         本应用是 adb 装的，装完 pm grant 一次即可（见 installer 说明）。
+         没授权时按钮自动退回「跳系统设置手动开」的老路，不会崩。 -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+    <!-- 「后台弹出界面」权限。
+         ⚠ 这条 2026-10-20 补上，因为它是巡检能不能工作的**前提**：
+         巡检要把钉钉拉到前台，而 Android 10+ 禁止后台应用启动 Activity。
+         无障碍服务名义上是例外，华为等 ROM 仍会额外要求这个开关。
+         关键点：**不声明这条，系统设置里压根不会出现那个权限项** ——
+         用户想开都没地方开，于是 startActivity 直接抛异常，
+         而界面上的提示却让他「去开一个不存在的开关」。
+         设置页的「允许后台弹出」按钮就用它申请。 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />

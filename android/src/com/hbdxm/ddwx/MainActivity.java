@@ -66,6 +66,45 @@ public class MainActivity extends Activity {
 
         loadPrefs();
 
+        // ---- 最顶上的一对大按钮：白天干活、晚上收工 --------------------
+        //
+        // 「启动」优先走编程开启（adb 给过 WRITE_SECURE_SETTINGS 就能一键
+        // 拉起，不用进系统设置翻菜单）；没给过就跳无障碍设置页手动开。
+        // 「退出」是把采集彻底停干净 —— 抓取、心跳、巡检、保活通知全停，
+        // 并且 disableSelf() 把无障碍服务自己关掉。用户场景：晚上拿手机
+        // 看别的东西，不想被 10 分钟一轮的巡检不停切走前台。
+        Button btnStart = findViewById(R.id.btn_start);
+        btnStart.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (CollectorService.get() != null && CollectorService.connected) {
+                    toast("采集已经在运行了，不用重复启动。要收工点下面的「退出」。");
+                    return;
+                }
+                if (tryEnableA11y()) {
+                    toast("已启动，几秒内服务连上后抓取自动恢复。");
+                }
+                // tryEnableA11y 走设置页兜底时，提示语它自己已经给了
+            }
+        });
+
+        Button btnExit = findViewById(R.id.btn_exit);
+        btnExit.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                CollectorService svc = CollectorService.get();
+                if (svc == null) {
+                    // 服务本身没绑：把可能还挂着的保活通知也撤掉，保证「彻底安静」
+                    KeepAliveService.stop(MainActivity.this);
+                    toast("采集本来就是停止的，通知栏也清干净了。");
+                    return;
+                }
+                svc.shutdownForNight();
+                toast("已彻底退出：抓取、心跳、巡检全停了，夜里不会再被切屏。"
+                        + "电脑端一会儿会显示离线，这是正常的。");
+            }
+        });
+
         Button access = findViewById(R.id.btn_access);
         access.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -85,6 +124,63 @@ public class MainActivity extends Activity {
                 }
                 svc.captureNow();
                 toast("已触发一次抓取，看下面的状态。");
+            }
+        });
+
+        // 「立即查找要转发的群」= 用户点名要的那个按钮：不管巡检开没开、
+        // 间隔是几分钟，点一下就当场把钉钉切到目标群（chat_names 第一个）。
+        //
+        // 和下面的「立即巡检一次」的区别只在于**不要求巡检已开启**：
+        // 巡检关着的时候用户照样要能验证「群名配对没配对」，
+        // 而旧逻辑会因为 watchMinutes<=0 直接拦掉，等于没有这个能力。
+        Button findGroup = findViewById(R.id.btn_find_group);
+        findGroup.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                CollectorService svc = CollectorService.get();
+                if (svc == null) {
+                    toast("服务没开。先点上面「打开系统无障碍设置」把本服务打开。");
+                    return;
+                }
+                String want = CollectorService.watchGroup;
+                if (want == null || want.trim().isEmpty()) {
+                    toast("还没收到目标群名。先在电脑上点「开始运行」，等手机连上再试。");
+                    return;
+                }
+                svc.findGroupNow();
+                toast("正在切到「" + want + "」，几秒后看下面的状态。");
+            }
+        });
+
+        // 立即巡检：等于把「每 10 分钟那一轮」当场跑一次。
+        // 存在的理由很实际 —— 等一个间隔（最长 30 分钟）才能知道群名配对没配对，
+        // 用户改配置时就完全无法当场验证。
+        Button watch = findViewById(R.id.btn_watch);
+        watch.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                CollectorService svc = CollectorService.get();
+                if (svc == null) {
+                    toast("服务没开。先去系统设置里开启本应用的无障碍服务。");
+                    return;
+                }
+                svc.findGroupNow();
+                toast("已触发一次巡检，几秒后看下面的状态。");
+            }
+        });
+
+        // 「后台弹出界面」权限。巡检要靠它把钉钉拉到前台。
+        // 没有这个开关，startActivity 会被系统直接拒掉（SecurityException），
+        // 表现就是「点了立即巡检，手机一点反应都没有」。
+        Button overlay = findViewById(R.id.btn_overlay);
+        overlay.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (canDrawOverlays()) {
+                    toast("已经允许了，不用再开。");
+                    return;
+                }
+                openOverlaySettings();
             }
         });
 
@@ -160,11 +256,89 @@ public class MainActivity extends Activity {
     // ------------------------------------------------------------------ 保活
 
     /**
+     * 编程开启无障碍服务。
+     *
+     * <p>正常路径需要 `WRITE_SECURE_SETTINGS` 权限 —— 这个权限给不了应用
+     * 商店用户，但我们的采集端是 adb 装的，装完 `pm grant` 一次即可（见
+     * installer 说明）。授过权就能一键拉起，不用进系统设置翻菜单；
+     * 没授过就退回「跳系统设置页手动开」的老路。
+     *
+     * @return true = 已编程开启（或本来就开着）；false = 跳了设置页等手动
+     */
+    private boolean tryEnableA11y() {
+        String want = new ComponentName(this, CollectorService.class).flattenToString();
+        // Android 11+ 查权限用 checkSelfPermission；老系统这个权限反正也拿不到
+        boolean granted = Build.VERSION.SDK_INT >= 23
+                && checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS)
+                   == PackageManager.PERMISSION_GRANTED;
+        if (granted) {
+            try {
+                String cur = Settings.Secure.getString(getContentResolver(),
+                        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+                boolean has = cur != null && (cur + ":").contains(want + ":");
+                if (!has) {
+                    String nv = (cur == null || cur.trim().isEmpty())
+                            ? want : cur + ":" + want;
+                    Settings.Secure.putString(getContentResolver(),
+                            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, nv);
+                }
+                Settings.Secure.putInt(getContentResolver(),
+                        Settings.Secure.ACCESSIBILITY_ENABLED, 1);
+                return true;
+            } catch (Throwable t) {
+                Log.w(CollectorService.TAG, "编程开启无障碍失败：" + t);
+                // 落到下面走设置页兜底
+            }
+        }
+        try {
+            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+            toast("在「无障碍 → 已安装的服务」里打开「喵喵采集端·读钉钉」"
+                    + "（想以后一键启动：adb 给本应用授权 WRITE_SECURE_SETTINGS）。");
+        } catch (Throwable t) {
+            toast("请到系统设置 → 无障碍 里手动开启本服务。");
+        }
+        return false;
+    }
+
+
+    /**
      * 申请「忽略电池优化」。
      *
      * <p>不做这一步的典型现场：手机锁屏十分钟后，系统进入深度省电，把采集端
      * 连同无障碍服务一起冻住，恢复亮屏也不自动解冻 —— 表现是「一条都不转了」。
      */
+    /** 有没有「后台弹出界面 / 显示在其他应用上层」权限。 */
+    private boolean canDrawOverlays() {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.M) {
+            return true;               // 6.0 以前这个权限不存在，视为已允许
+        }
+        return android.provider.Settings.canDrawOverlays(this);
+    }
+
+    /**
+     * 跳到系统的「显示在其他应用上层」开关页。
+     *
+     * <p>⚠ 必须先申请 `SYSTEM_ALERT_WINDOW`（清单里要有），否则这个设置项
+     * 在系统里根本不存在，跳过去只会看到一片空白 —— 用户会以为程序跳错了。
+     * 2026-10-20 就是因为清单漏了这条，用户被提示「去开后台弹出界面」，
+     * 而他手机设置里压根找不到那个开关。
+     */
+    private void openOverlaySettings() {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.M) {
+            toast("这个系统版本不需要设置这一项。");
+            return;
+        }
+        try {
+            Intent i = new Intent(
+                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    android.net.Uri.parse("package:" + getPackageName()));
+            startActivity(i);
+            toast("在这个页面里打开「允许显示在其他应用上层」。");
+        } catch (Throwable t) {
+            toast("跳不过去，请手动去 设置 → 应用 → 喵喵采集端 → 特殊权限 里打开。");
+        }
+    }
+
     private void openBatteryWhitelist() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
             toast("这个系统版本不需要设电池白名单。");
@@ -294,11 +468,11 @@ public class MainActivity extends Activity {
     private void refresh() {
         CollectorService svc = CollectorService.get();
         if (svc == null || !CollectorService.connected) {
-            status.setText("无障碍服务：未开启\n\n"
-                    + "1. 点上面第一个按钮去系统设置\n"
-                    + "2. 在「无障碍 → 已安装的服务」里找到「喵喵采集端·读钉钉」并打开\n"
-                    + "3. 填好下面的电脑 IP / 端口 / token，点「保存设置」\n"
-                    + "4. 回到钉钉，进入目标群聊页，保持亮屏\n\n"
+            status.setText("无障碍服务：未开启（已退出或没开过）\n\n"
+                    + "1. 点最上面的「▶ 启动采集」按钮（能自动开启；开不了就跳系统设置）\n"
+                    + "2. 填好下面的电脑 IP / 端口 / token，点「保存设置」\n"
+                    + "3. 回到钉钉，进入目标群聊页，保持亮屏\n\n"
+                    + "提示：晚上收工点「⏹ 退出」，巡检就不会再抢你的手机。\n\n"
                     + "注意：采集只读节点树，不点击、不输入，不会改动钉钉里的任何内容。");
             return;
         }

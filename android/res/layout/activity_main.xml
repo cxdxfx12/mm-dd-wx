@@ -15,14 +15,35 @@
         android:orientation="vertical"
         android:padding="16dp">
 
-        <TextView
-            android:id="@+id/status"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:background="#F2F2F2"
-            android:padding="12dp"
-            android:textSize="13sp"
-            android:text="@string/status_placeholder" />
+    <!-- 一对大按钮放在最顶上：用户晚上打开 App 第一眼就是它们。
+         「退出」必须把采集/心跳/巡检/保活通知全部停干净，并且把无障碍
+         服务自己关掉 —— 只停巡检不够，用户点退出要的是「彻底安静」。 -->
+    <Button
+        android:id="@+id/btn_start"
+        android:layout_width="match_parent"
+        android:layout_height="64dp"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:text="@string/btn_start" />
+
+    <Button
+        android:id="@+id/btn_exit"
+        android:layout_width="match_parent"
+        android:layout_height="64dp"
+        android:layout_marginTop="8dp"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:text="@string/btn_exit" />
+
+    <TextView
+        android:id="@+id/status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:background="#F2F2F2"
+        android:padding="12dp"
+        android:textSize="13sp"
+        android:text="@string/status_placeholder" />
 
         <Button
             android:id="@+id/btn_access"
@@ -36,6 +57,29 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/btn_capture" />
+
+        <!-- 用户点名要的那个按钮：正作用就是「现在去把钉钉切到目标群」。
+             和下面的「立即巡检一次」是两件事，别合并：
+               · 这个 = 立刻找群（不管巡检开没开、间隔多少）
+               · 下面那个 = 跑一轮定时巡检（关闭时会被拦）
+             刻意放在最靠上的按钮位，就是怕用户滚到下面才找到。 -->
+        <Button
+            android:id="@+id/btn_find_group"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/btn_find_group" />
+
+        <Button
+            android:id="@+id/btn_watch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/btn_watch" />
+
+        <Button
+            android:id="@+id/btn_overlay"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/btn_overlay" />
 
         <Button
             android:id="@+id/btn_ping"

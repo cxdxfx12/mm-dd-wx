@@ -23,6 +23,8 @@ final class Prefs {
     private static final String K_SNAPSHOT = "snapshot";
     private static final String K_WATCH_INTERVAL = "watch_interval_min";
     private static final String K_WATCH_GROUP = "watch_group";
+    /** 累计巡检轮次（跨重启单调递增）。见 {@link #watchRuns} 的说明。 */
+    private static final String K_WATCH_RUNS = "watch_runs_total";
 
     /** 钉钉安卓包名。 */
     static final String DINGTALK_PKG = "com.alibaba.android.rimet";
@@ -95,6 +97,25 @@ final class Prefs {
                 .putInt(K_WATCH_INTERVAL, clampWatch(interval))
                 .putString(K_WATCH_GROUP, group == null ? "" : group.trim())
                 .apply();
+    }
+
+    /**
+     * 累计巡检轮次 —— 跨重启保留。
+     *
+     * <p><b>为什么不能用内存里的计数器</b>（2026-10-20 真机踩到）：那个计数器
+     * 随服务重启归零。用户在「刚重开、第一轮巡检（连上 5 秒）还没跑」的那
+     * 一分钟里查电脑侧 ``/ping``，看到 ``watch_runs: 0``，就会判定成
+     * 「定时器根本没转」，然后去重装 —— 查错方向。
+     * 持久累计之后，它不涨就真的说明有问题。
+     */
+    static long watchRuns(Context c) {
+        return of(c).getLong(K_WATCH_RUNS, 0L);
+    }
+
+    static long bumpWatchRuns(Context c) {
+        long next = watchRuns(c) + 1L;
+        of(c).edit().putLong(K_WATCH_RUNS, next).apply();
+        return next;
     }
 
     /** 巡检间隔只允许用户给的几档：0（关）/ 5 / 10 / 15 / 30 分钟。 */

@@ -8,6 +8,7 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
+import android.util.Log;
 import android.provider.MediaStore;
 
 import java.io.File;
@@ -147,6 +148,17 @@ final class Uploader {
      */
     static Result heartbeat(String host, int port, String token, String ver,
                             String watch, long runs) {
+        return heartbeat(host, port, token, ver, watch, runs, "");
+    }
+
+    /**
+     * 带「失败现场」的心跳。
+     *
+     * @param probe 最近一次巡检失败时的页面快照（见 SelfHeal.probe）；
+     *              没失败过就是空串，电脑侧照旧只显示一句话结果。
+     */
+    static Result heartbeat(String host, int port, String token, String ver,
+                            String watch, long runs, String probe) {
         HttpURLConnection conn = null;
         try {
             byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
@@ -159,8 +171,22 @@ final class Uploader {
             conn.setRequestProperty("X-Ddwx-Ver", ver == null ? "" : ver);
             // 巡检状态。HTTP 头只能是 ISO-8859-1，中文群名/结果必须先编码，
             // 否则 HttpURLConnection 会直接抛 IllegalArgumentException（真机验证过）。
-            conn.setRequestProperty("X-Ddwx-Watch", encodeHeader(watch));
-            conn.setRequestProperty("X-Ddwx-Watch-Runs", String.valueOf(runs));
+            // ⚠ 这两个头如果 setRequestProperty 抛异常（比如编码后仍含非
+            // Latin-1 字节），心跳就会被当成失败 —— 「巡检状态看不出来」会
+            // 伪装成「手机掉线」。所以失败时降级成只报 ASCII 的提示，不能让
+            // 整条心跳跟着陪葬。
+            try {
+                conn.setRequestProperty("X-Ddwx-Watch", encodeHeader(watch));
+                conn.setRequestProperty("X-Ddwx-Watch-Runs", String.valueOf(runs));
+                if (probe != null && probe.length() > 0) {
+                    // 现场快照同样只能装进头里（心跳请求体固定是 {}）。
+                    // 单独 try：它比巡检结果更长，编码失败的几率更大，
+                    // 绝不能让它把「巡检结果」也连累掉。
+                    conn.setRequestProperty("X-Ddwx-Probe", encodeHeader(probe));
+                }
+            } catch (RuntimeException e) {
+                Log.w("DDWX", "巡检状态放不进 HTTP 头，本次只发心跳：" + e);
+            }
 
             OutputStream os = conn.getOutputStream();
             try {
@@ -173,7 +199,10 @@ final class Uploader {
             int code = conn.getResponseCode();
             String resp = readBody(code >= 400 ? conn.getErrorStream() : conn.getInputStream());
             if (code >= 200 && code < 300) {
-                return new Result(true, code, "心跳正常 " + trim(resp, 80));
+                // 响应体原样带回去：电脑端用它下发「立刻切群」这类一次性指令
+                // （见 CollectorService.maybeApplyWatch）。只靠 detail 里那段
+                // 截断过的可读串解析太脆 —— 日志文案一改就断。
+                return new Result(true, code, "心跳正常 " + trim(resp, 80), resp);
             }
             if (code == 401) {
                 return new Result(false, code,

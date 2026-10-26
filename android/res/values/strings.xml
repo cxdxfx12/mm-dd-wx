@@ -6,8 +6,15 @@
 
     <string name="status_placeholder">正在读取服务状态…</string>
 
+    <!-- 最上面的一对大按钮：白天干活、晚上收工。放在布局最顶上，打开 App 就能按到。 -->
+    <string name="btn_start">▶ 启动采集（开始干活）</string>
+    <string name="btn_exit">⏹ 退出（今晚不再打扰）</string>
+
     <string name="btn_access">打开系统无障碍设置（开启本服务）</string>
     <string name="btn_capture">立即抓取并上报一次</string>
+    <string name="btn_find_group">立即查找要转发的群（切到钉钉群页面）</string>
+    <string name="btn_watch">立即巡检一次（切回目标群）</string>
+    <string name="btn_overlay">允许后台弹出界面（巡检要用）</string>
     <string name="btn_ping">测试与电脑的连通性</string>
     <string name="btn_snapshot">存一份快照到 Download/mmddwx</string>
     <string name="btn_save">保存设置</string>

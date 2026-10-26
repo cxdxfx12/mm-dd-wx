@@ -68,6 +68,20 @@ public class KeepAliveService extends Service {
         }
     }
 
+    /**
+     * 用户点了「退出」：连常驻通知一起撤干净。
+     *
+     * <p>只 stopService 不够 —— 前台服务的通知不会自动消失，通知栏上
+     * 挂着「采集端运行中」会让人以为没退干净。onDestroy 里统一 cancel。
+     */
+    public static void stop(Context c) {
+        try {
+            c.stopService(new Intent(c, KeepAliveService.class));
+        } catch (Throwable t) {
+            Log.w(TAG, "停止保活服务失败：" + t);
+        }
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -92,6 +106,16 @@ public class KeepAliveService extends Service {
     @Override
     public void onDestroy() {
         handler.removeCallbacks(check);
+        // 前台服务的常驻通知不会随 stopService 自动消失，必须自己撤。
+        try {
+            NotificationManager nm =
+                    (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm != null) {
+                nm.cancel(NOTI_ID);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "撤常驻通知失败：" + t);
+        }
         super.onDestroy();
     }
 
