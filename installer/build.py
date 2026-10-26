@@ -43,8 +43,14 @@ EXCLUDE_FILE_NAMES = {"_env.json"}       # 开发机的解释器缓存，不随�
 # 首次安装由 setup_gui.py 从 config.example.yaml 生成。
 # .git 必须排除：早先的排除只在「文件/目录名」层面生效，rglob 仍会钻进
 # .git 把对象库整个搬走，既撑大安装包又可能因只读属性报 PermissionError。
+# ⚠ 这里只列「顶层目录/文件名」，新增的第三方源码目录必须同步加进来。
+# 2026-10-20 踩过：把 appium-master（Node 源码）下载到仓库根做参考，
+# payload 从 33.4 MB 涨到 40.3 MB —— 整个仓库被塞进安装包，还会解压进
+# Program Files。参考用的第三方代码一律不进交付物。
 EXCLUDE_TOP = {"data", "installer", "dist", "build", ".workbuddy", ".git",
-               "config.yaml", ".gitignore"}
+               "config.yaml", ".gitignore",
+               "appium-master",          # 只用来参考，不参与运行
+               }
 
 WELCOME = r"""
 =============================================================

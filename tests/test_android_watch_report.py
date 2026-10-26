@@ -29,7 +29,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from tests.test_android_gateway import GatewayCase  # noqa: E402
+from tests.test_android_gateway import TOKEN, GatewayCase  # noqa: E402
 
 
 class WatchCase(GatewayCase):
@@ -105,3 +105,61 @@ class TestWatchState(WatchCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWatchHeaderEvidence(GatewayCase):
+    """「心跳里带没带巡检状态」必须能从 /ping 一眼看出来。
+
+    这一项是被一次真实排查逼出来的（2026-10-20）：`/ping` 里根本找不到
+    ``watch`` 键时，有两种完全不同的原因 —— 手机端没发这个头，或者发了
+    但巡检一次都没跑。光看「字段缺失」分不开，只能跑去拿手机看设置页。
+    """
+
+    def ping(self) -> dict:
+        import json
+        import urllib.request
+        req = urllib.request.Request(self.url("/ping", token=TOKEN))
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def test_never_seen_before_any_heartbeat(self):
+        self.assertEqual("never", self.ping().get("watch_header"))
+
+    def test_old_apk_without_header_says_no(self):
+        import json
+        import urllib.request
+        req = urllib.request.Request(
+            self.url("/ping", token=TOKEN), data=b"{}", method="POST",
+            headers={"X-Ddwx-Ver": "0.4.2", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+        self.assertEqual("no", self.ping().get("watch_header"))
+
+    def test_heartbeat_with_header_says_yes(self):
+        import urllib.request
+        from urllib.parse import quote
+        req = urllib.request.Request(
+            self.url("/ping", token=TOKEN), data=b"{}", method="POST",
+            headers={"X-Ddwx-Ver": "0.4.6",
+                     "X-Ddwx-Watch": quote("13:22:05 · 定时 · 正常：已切回目标群"),
+                     "X-Ddwx-Watch-Runs": "3",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+        d = self.ping()
+        self.assertEqual("yes", d.get("watch_header"))
+        self.assertEqual(3, d.get("watch_runs"))
+        self.assertIn("已切回目标群", d.get("watch") or "")
+
+    def test_empty_watch_is_still_yes(self):
+        """带了但为空（刚启动没巡检过）—— 仍然是「带了」，别记成 no。"""
+        import urllib.request
+        req = urllib.request.Request(
+            self.url("/ping", token=TOKEN), data=b"{}", method="POST",
+            headers={"X-Ddwx-Watch": "", "X-Ddwx-Watch-Runs": "0",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+        d = self.ping()
+        self.assertEqual("yes", d.get("watch_header"))
+        self.assertEqual("(还没巡检过)", d.get("watch"))

@@ -384,7 +384,15 @@ def main() -> int:
             svc.start_watchdog()
             svc.announce_start(repr(source))
             try:
-                source.run(svc.handle)
+                # 第二个回调是附件转发：手机抓回的 Excel → 表格图 → 微信。
+                # 只有安卓网关源的 run 收两个参数（OCR 等旧源只有一个），
+                # 按签名分发，别让别的采集源在这里炸 TypeError。
+                import inspect
+
+                if len(inspect.signature(source.run).parameters) >= 2:
+                    source.run(svc.handle, svc.handle_attachment)
+                else:
+                    source.run(svc.handle)
             finally:
                 svc.announce_stop()
             return 0

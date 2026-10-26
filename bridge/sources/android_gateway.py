@@ -46,11 +46,13 @@
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import threading
@@ -92,6 +94,40 @@ UNKNOWN_PAGE_ALERT_AFTER = 3
 # 足以覆盖，又短到不会误伤「人工故意在十分钟后再发一条一样的话」。
 # 机器人日报每天格式相同、数字不同，content_key 会保留全部数字，不会撞。
 NEAR_DUP_WINDOW = 600.0
+# 「附件抓取」指令的冷却（秒）。卡片里的「附件：运单明细」会随卡片重渲染在
+# 几十帧里反复出现，不下冷却就是让手机反复跳 UC 下载同一个文件。10 分钟：
+# 覆盖一张卡片的可见期；真正的「同一份文件不重发」由收到文件后的 sha1 去重
+# 负责（content 变了 → 新文件 → 新 sha1 → 照收）。
+ATTACH_COOLDOWN = 600.0
+# 卡片正文里的附件行。两种实测形态：
+#   「附件：运单明细」（当日签卡片，不带扩展名 —— 点它照样会下载）
+#   「明细附件：拦截风险明细.xlsx」（拦截卡片，带扩展名）
+# 触发字眼 2026-10-27 起可配置（dingtalk.attach_keys，行首前缀、纯文本），
+# 这里只放默认值；_attach_re() 按配置现拼正则。
+DEFAULT_ATTACH_KEYS = ["附件：", "附件:"]
+
+
+def _clean_attach_keys(raw) -> list:
+    """清洗用户配置的触发字眼：去空、去重；全空回落默认。
+
+    接受两种形态：YAML 列表，或逗号分隔的字符串（后者是为了让
+    tools/ensure_config_keys.py 能把新键补进老配置 —— 它只补标量）。
+    """
+    if isinstance(raw, str):
+        raw = re.split(r"[,，]", raw)
+    out = []
+    for k in (raw or []):
+        k = str(k).strip()
+        if k and k not in out:
+            out.append(k)
+    return out or list(DEFAULT_ATTACH_KEYS)
+
+
+def _attach_re(keys: list) -> "re.Pattern":
+    """触发字眼 → 行首匹配正则。字眼是纯文本，必须 re.escape。"""
+    return re.compile(
+        r"^(?:明细)?(?:%s)\s*(\S[^\n]{0,40})$" % "|".join(re.escape(k) for k in keys),
+        re.M)
 # 锚点对不上时「请手机翻一屏试着找回」的节流参数。
 #   · PROBE_COOLDOWN：发完翻页指令后，至少等这么久才算「屏幕安定」。手机翻上去
 #     再翻回来约 700ms（Scroller 里 SWIPE_MS + SETTLE_MS），期间上报的都是中间
@@ -924,6 +960,30 @@ def _screen_meta(screen: dict | None) -> dict:
     }
 
 
+def _attach_name(content: str, keys: list) -> str:
+    """从消息正文里抠附件名；没有附件行返回空串。"""
+    m = _attach_re(_clean_attach_keys(keys)).search(content or "")
+    return m.group(1).strip() if m else ""
+
+
+def _order_attach(ctx: "_Ctx", pending: list) -> str:
+    """扫描本帧新单元里的附件行，返回要下发的附件名（没有则空串）。
+
+    冷却记在 ``ctx.attach_orders``（名字 → monotonic）：卡片重渲染会让
+    同一条附件行在几十帧里反复出现，冷却期内不重复下单。
+    """
+    now = time.monotonic()
+    for u in pending:
+        name = _attach_name(u.content, ctx.attach_keys)
+        if not name:
+            continue
+        if now - ctx.attach_orders.get(name, 0.0) < ATTACH_COOLDOWN:
+            continue
+        ctx.attach_orders[name] = now
+        return name
+    return ""
+
+
 @dataclass
 class _Ctx:
     token: str
@@ -959,6 +1019,19 @@ class _Ctx:
     # 又捞一遍」；比 recent_keys 的 NEAR_DUP_WINDOW 长得多 —— 用户翻回早前
     # 的历史时，那些消息早出了近似去重窗口，只能靠这份记录挡。
     delivered_texts: deque = field(default_factory=lambda: deque(maxlen=512))
+    # ── 附件抓取（「附件：运单明细」→ 手机点击下载 → 传回电脑）──────
+    # 电脑侧每帧扫描新消息里的附件行，冷却期内只下一次单（ATTACH_COOLDOWN）；
+    # 同一份文件不重发靠 attach_seen（sha1），不是靠这里的名字冷却 ——
+    # 名字冷却挡「这一分钟内别再点」，sha1 挡「这份文件别再发」。
+    attach_orders: dict = field(default_factory=dict)     # 附件名 -> monotonic
+    attach_seen: dict = field(default_factory=dict)       # sha1 -> True
+    # 触发字眼（dingtalk.attach_keys）：下单时随 fetch_attach 一起下发给手机，
+    # 手机端按同样的字眼找屏上的附件行 —— 两边必须一致，改配置两端同时生效。
+    attach_keys: list = field(
+        default_factory=lambda: list(DEFAULT_ATTACH_KEYS))
+    # 附件落盘目录与下游回调（service.handle_attachment）。空 = 不收文件。
+    files_dir: str = ""
+    on_file = None
     # give_up 是否因「试探状态过期」（ALIGN_STALE）触发。只有过期触发的
     # 重建才允许打捞 —— 活跃浏览（翻历史 / 换群）时的重建绝不能捞，否则
     # 用户翻哪屏就把哪屏灌进微信群。
@@ -1407,7 +1480,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:                                # noqa: N802
         path = self._path()
         if path not in ("/", "/messages", "/screen", "/ping", "/watch-now",
-                        "/watch-pause"):
+                        "/watch-pause", "/file"):
             self._reply(404, {"ok": False, "error": "未知路径"})
             return
         if not self._auth_ok():
@@ -1520,7 +1593,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(200, hb)
             return
 
-        limit = MAX_SCREEN_BODY if path == "/screen" else MAX_BODY
+        limit = MAX_SCREEN_BODY if path in ("/screen", "/file") else MAX_BODY
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -1538,6 +1611,10 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/screen":
             self._post_screen(raw, length)
+            return
+
+        if path == "/file":
+            self._post_file(raw, length)
             return
 
         try:
@@ -1585,6 +1662,82 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._reply(200, {"ok": True, "accepted": len(msgs),
                           "skipped": skipped, "chat_name": self.ctx.chat_name})
+
+    # --- 附件上传（仅 dingtalk.android_parse = true）---
+
+    def _post_file(self, raw: bytes, length: int) -> None:
+        """收手机传回的附件文件。
+
+        请求体是 JSON：``{"name": 显示名, "sha1": 文件摘要,
+        "data": base64, "chat": 群名}``。手机侧在下发抓取指令后点击附件、
+        等钉钉把文件下到公开 Download 目录、读出来传上来 —— 这条链路的
+        电脑侧终点就是这里：落盘 + 去重 + 交给 service 渲染投递。
+
+        去重两层：
+          · sha1 相同的文件**不再回调下游**（卡片重渲染会触发重复下载上传），
+            但仍回 ok=true —— 手机不需要重传，别让它把 409 当故障。
+          · 文件落盘名带 sha1 前缀：同名不同内容天然分文件。
+        """
+        try:
+            meta = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._reply(400, {"ok": False, "error": f"报文不是合法 JSON：{exc}"})
+            return
+        if not isinstance(meta, dict):
+            self._reply(400, {"ok": False, "error": "报文顶层必须是对象"})
+            return
+        name = str(meta.get("name") or "").strip()
+        chat = str(meta.get("chat") or "").strip()
+        sha = str(meta.get("sha1") or "").strip().lower()
+        data_b64 = str(meta.get("data") or "")
+        if not name or not sha or not data_b64:
+            self._reply(400, {"ok": False,
+                              "error": "缺 name / sha1 / data 字段"})
+            return
+        if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+            self._reply(400, {"ok": False, "error": "sha1 不是 40 位十六进制"})
+            return
+        try:
+            data = base64.b64decode(data_b64, validate=True)
+        except Exception as exc:                       # noqa: BLE001
+            self._reply(400, {"ok": False,
+                              "error": f"data 不是合法 base64：{exc}"})
+            return
+        if hashlib.sha1(data).hexdigest() != sha:
+            self._reply(400, {"ok": False,
+                              "error": "sha1 校验不符（传输损坏？请重传）"})
+            return
+        if not self.ctx.files_dir:
+            self._reply(500, {"ok": False,
+                              "error": "网关没配附件目录（files_dir 为空）"})
+            return
+
+        # 文件名只留白名单字符：手机传什么就信什么是路径穿越的老坑。
+        safe = re.sub(r"[^\w.\-()（）]", "_",
+                      name.replace("\\", "/").split("/")[-1]).strip("._")
+        if not safe:
+            safe = "attachment"
+        os.makedirs(self.ctx.files_dir, exist_ok=True)
+        path = os.path.join(self.ctx.files_dir, f"{sha[:12]}-{safe}")
+        duplicate = os.path.exists(path)
+        if not duplicate:
+            tmp = path + ".part"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)          # 先写临时名再改名：中断不留半个文件
+
+        fresh = not duplicate and sha not in self.ctx.attach_seen
+        self.ctx.attach_seen[sha] = True
+        cb = self.ctx.on_file
+        if cb is not None and fresh:
+            try:
+                cb(path, name, chat)
+            except Exception:                          # noqa: BLE001
+                log.exception("附件下游处理失败：%s", name)
+
+        log.info("收到手机附件「%s」（%d 字节%s）→ %s", name, len(data),
+                 "，重复跳过" if duplicate or not fresh else "", path)
+        self._reply(200, {"ok": True, "duplicate": duplicate or not fresh})
 
     def _post_screen(self, raw: bytes, length: int) -> None:
         """收一帧节点树。只做「存下来 + 记元信息」，不解析 —— 解析是采集端的事。"""
@@ -1701,6 +1854,16 @@ class _Handler(BaseHTTPRequestHandler):
             # 手机端见 android/.../CollectorService.maybeFillTruncated。
             if scroll:
                 body["scroll"] = True
+            # 附件抓取指令：新消息里出现「附件：xxx」→ 请手机点它、等下载、
+            # 把文件传回 /file。冷却期内同名不再下（卡片重渲染会反复出现）。
+            # 放在 parse 块里：只解析不转的模式没有消息概念，也没有附件可言。
+            if pending:
+                attach = _order_attach(self.ctx, pending)
+                if attach:
+                    body["fetch_attach"] = attach
+                    # 字眼一起下发：手机端按它找屏上的附件行。
+                    body["fetch_keys"] = ",".join(self.ctx.attach_keys)
+                    log.info("发现附件「%s」，已下发抓取指令", attach)
         self._reply(200, body)
 
     # --- 画面解析（仅 dingtalk.android_parse = true）---
@@ -2613,6 +2776,15 @@ class AndroidGatewaySource(Source):
             self.offline_after = 0.0          # 负数按「关闭」处理，别让它变成「秒级误报」
         self.chat_name = (dt.chat_names or [""])[0] if dt.chat_names else ""
         self.companies = list(dt.companies or [])
+        # 附件转发的触发字眼（行首前缀，纯文本）。随 fetch_attach 一起下发给
+        # 手机端 —— 手机按同样的字眼找屏上的附件行，两边永远一致。
+        self.attach_keys = _clean_attach_keys(getattr(dt, "attach_keys", None))
+        # 附件落盘目录：跟数据库同目录下的 attachments/（service 侧能找到）。
+        try:
+            base = Path(cfg.resolve(cfg.storage.db_path)).parent
+            self.files_dir = str(base / "attachments")
+        except Exception:                              # noqa: BLE001
+            self.files_dir = ""                        # 算不出就收不了文件，别炸
         # 自动巡检：盯的就是路由里的第一个群（chat_names[0]），不另开一个配置项 ——
         # 两处群名一旦不一致，手机每轮巡检都会点错群，而且从日志上很难看出来。
         self.watch_group = self.chat_name
@@ -2646,7 +2818,7 @@ class AndroidGatewaySource(Source):
             f"http://<本机IP>:{self.port}"
         return True, f"监听 {self.host}:{self.port}｜手机端填：{where}"
 
-    def run(self, on_message: MessageHandler) -> None:
+    def run(self, on_message: MessageHandler, on_file=None) -> None:
         ok, why = self.check()
         if not ok:
             raise RuntimeError(why)
@@ -2656,7 +2828,12 @@ class AndroidGatewaySource(Source):
                    companies=self.companies, on_message=on_message,
                    parse=self.parse, offline_after=self.offline_after,
                    watch_group=self.watch_group, watch_min=self.watch_min,
+                   attach_keys=self.attach_keys,
                    differ=FrameDiffer() if self.parse else None)
+        # 附件抓取链路：目录 + 下游回调。任一缺失都只是「收不了附件」，
+        # 不影响消息转发主流程。
+        ctx.files_dir = self.files_dir or ""
+        ctx.on_file = on_file
         # 「先攒后发」缓冲 + 把它定期排空的线程。
         # 关掉 parse 时不建（那种模式只收不转，没有消息要投）。
         if self.parse and on_message is not None:

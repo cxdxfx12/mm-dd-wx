@@ -19,9 +19,10 @@ from .notify import (DingTalkNotifier, SYSTEM_PREFIX, in_hhmm_window,
                      install_alert_handler)
 from .router import Router
 from .storage import Storage
-from .table_image import render_message
+from .table_image import render_message, render_table, save_png
 from .targets import build_target
 from .targets.base import Target
+from .xlsx_reader import read_rows
 
 log = logging.getLogger("bridge.service")
 
@@ -125,9 +126,20 @@ class BridgeService:
             # 图片走 send_image —— 目标不支持（旧实现/其它平台）就跳过，
             # 不算失败：文字已经发到了，表格图片是锦上添花。
             if result.ok and self.cfg.wechat.table_image:
-                png = render_message(text, out_dir=self._table_png_dir(),
-                                     key=msg.uid, title=msg.sender_name)
-                if png is not None:
+                # 消息自带 media_path（目前唯一来源是附件转发：xlsx 渲染好的
+                # 表格图）就直接用它；没有再尝试从正文解析表格。
+                png = (msg.media_path or "").strip()
+                if not png:
+                    png = render_message(text, out_dir=self._table_png_dir(),
+                                         key=msg.uid, title=msg.sender_name)
+                if png:
+                    # media_path 是「渲染时留的路径」，文件可能已被清理 ——
+                    # 没了就只发文字，别让一张图把已成功的文字投递报成异常。
+                    from pathlib import Path as _P
+
+                    if not _P(png).is_file():
+                        log.debug("图片文件已不在，跳过补图：%s", png)
+                        continue
                     self._throttle()
                     try:
                         r2 = self.target.send_image(tgt, str(png))
@@ -140,11 +152,58 @@ class BridgeService:
                             msg.uid, tgt, "ok" if r2.ok else "fail",
                             f"表格图: {r2.detail}")
                         if r2.ok:
-                            log.info("表格图片已投递 → %s（%s）", tgt, png.name)
+                            log.info("表格图片已投递 → %s（%s）", tgt, _P(png).name)
                         else:
                             log.warning("表格图片投递失败 → %s | %s",
                                         tgt, r2.detail)
         return True
+
+    # ---------- 附件转发 ----------
+
+    def handle_attachment(self, path: str, name: str, chat: str = "") -> bool:
+        """收到手机传回的附件文件 → 解析 xlsx → 渲染表格图 → 投递。
+
+        链路的最后一环：网关 ``/file`` 已做过 sha1 去重（同一份文件只会进到
+        这里一次），这里的防重复靠 uid（raw_id = ``attach-<sha1>``）入库判重
+        —— 它跨重启有效，比内存集合可靠。
+
+        解析失败**不重试也不报错**：附件渲染是锦上添花，为它打断正常转发
+        节奏不值得。日志里留一行就够了。
+        """
+        import hashlib
+
+        try:
+            rows = read_rows(path)
+        except Exception as exc:                    # noqa: BLE001
+            log.warning("附件 %s 解析失败（跳过转发）：%s", name, exc)
+            return False
+        if len(rows) < 2:
+            log.warning("附件 %s 只有表头没有数据（跳过转发）", name)
+            return False
+        head, data_rows = rows[0], rows[1:]
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            log.warning("附件 %s 读不回来：%s", path, exc)
+            return False
+        sha = hashlib.sha1(data).hexdigest()
+        try:
+            img = render_table(head, data_rows, title=name)
+            png = save_png(img, self._table_png_dir(), key=f"attach-{sha}") \
+                if img is not None else None
+        except Exception:                           # noqa: BLE001
+            log.exception("附件 %s 渲染表格图失败（只发文字）", name)
+            png = None
+        msg = Message(source="dingtalk", chat_name=chat or "",
+                      sender_name="附件",
+                      content=f"【附件】{name}（{len(data_rows)} 行）",
+                      msg_type="file",
+                      # ⚠ 必须转 str：media_path 会被 sqlite 原样绑定，
+                      # Path 对象在这里就是 ProgrammingError。
+                      media_path=str(png) if png else "",
+                      raw_id=f"attach-{sha}")
+        return self.handle(msg)
 
     def _table_png_dir(self) -> str:
         """表格图片的落盘目录：跟数据库同一个目录下的 table-png/。

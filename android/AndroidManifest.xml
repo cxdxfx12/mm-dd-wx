@@ -23,8 +23,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.hbdxm.ddwx"
-    android:versionCode="23"
-    android:versionName="0.5.10">
+    android:versionCode="28"
+    android:versionName="0.5.15">
     <!-- ⚠ 这两个值是**真正进包**的（aapt2 以清单为准，build.py 里的
          version-code / version-name 参数对它不起作用 —— 2026-10-20 实测确认）。
          所以改版本号时必须**同时**改三处，少一处就会出现「文件名 0.4.1、
@@ -57,6 +57,13 @@
          而界面上的提示却让他「去开一个不存在的开关」。
          设置页的「允许后台弹出」按钮就用它申请。 -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- 附件转发（0.5.11）：读 /sdcard/Download/UCDownloads/ 里钉钉下载的 Excel。
+         Android 11+ 分区存储下，读别的应用落在公共 Download 的**非媒体**文件
+         必须有「所有文件访问」。授权方式与 WRITE_SECURE_SETTINGS 相同：
+         装完用 adb 执行一次（appops set，uid 指定 com.hbdxm.ddwx，
+         op 为 MANAGE_EXTERNAL_STORAGE，值 allow）。
+         没授权时附件功能自动休眠（读目录失败就放弃，不影响消息转发）。 -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />

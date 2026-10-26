@@ -597,6 +597,11 @@ class App(tk.Tk):
         self.btn_stop = self._accent_btn(inner, "■  停止", self.stop_live, RED,
                                          "#c93a3f", width=88)
         self.btn_check = ttk.Button(inner, text="自 检", command=self.run_check)
+        # 用户点名要的按钮：点一下就让**手机**把钉钉切回目标群。
+        # 它和「钉钉预览」不是一回事 —— 预览只看电脑这一侧的钉钉窗口，
+        # 手机那台摆在工位上、被谁点走了，从电脑上根本看不出来。
+        self.btn_switch = ttk.Button(inner, text="切到钉钉群",
+                                     command=self.switch_phone_group)
         self.btn_preview = ttk.Button(inner, text="钉钉预览",
                                       command=self.dingtalk_preview)
         self.btn_forward = ttk.Button(inner, text="转发一条…",
@@ -610,9 +615,9 @@ class App(tk.Tk):
             b.pack(side="left", padx=(0, 10))
         ttk.Separator(inner, orient="vertical").pack(side="left", fill="y",
                                                      padx=(0, 10))
-        for b in (self.btn_check, self.btn_preview, self.btn_forward,
-                  self.btn_settings, self.btn_records, self.btn_export,
-                  self.btn_folder):
+        for b in (self.btn_check, self.btn_switch, self.btn_preview,
+                  self.btn_forward, self.btn_settings, self.btn_records,
+                  self.btn_export, self.btn_folder):
             b.pack(side="left", padx=(0, 6))
 
         # 底部信息条：左边是运行状态，右边是版本号与版权。
@@ -1346,6 +1351,116 @@ class App(tk.Tk):
 
 
     # ---------------- 钉钉预览 ----------------
+
+    def switch_phone_group(self):
+        """让**手机**把钉钉切回目标群（用户点名的「切到钉钉群」按钮）。
+
+        为什么走 HTTP 而不是直接调对象：真正跑转发的网关在**子进程**里，
+        本界面拿不到它的 ctx。所以只给网关留一句话，它等手机来取。
+
+        ⚠ 用 ``127.0.0.1`` 以外的事：这台机器上系统代理可能把 loopback
+        也劫持到 502（以前踩过），所以照旧用配置里的 host。
+        """
+        if not self.runner.alive():
+            messagebox.showinfo(
+                "提示",
+                "转发服务没在运行。\n\n"
+                "「切到钉钉群」是让手机那边动手，得先点「开始运行」"
+                "让网关连上手机。", parent=self)
+            return
+        self._log("正在让手机切到钉钉群…", "sys")
+        self.btn_switch.configure(state="disabled")
+
+        def work():
+            msg, ok = "", False
+            try:
+                import urllib.request
+                cfg = self.cfg.get("dingtalk") or {}
+                port = int(cfg.get("gateway_port") or 8765)
+                token = cfg.get("gateway_token") or ""
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/watch-now",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json",
+                             "X-Bridge-Token": token},
+                    method="POST")
+                # 不走系统代理：本机回环被代理劫持时，请求会莫名其妙 502。
+                op = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}))
+                with op.open(req, timeout=8) as r:
+                    payload = json.loads(r.read().decode("utf-8"))
+                ok = bool(payload.get("ok"))
+                msg = payload.get("message") or ""
+            except Exception as exc:
+                msg = f"发不出去：{exc}"
+            self.after(0, lambda: self._switch_done(ok, msg))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _switch_done(self, ok: bool, msg: str):
+        self._log(msg, "sys" if ok else "err")
+        if not ok:
+            self.btn_switch.configure(state="normal")
+            messagebox.showwarning("切群失败", msg, parent=self)
+            return
+        self.statusbar.configure(text="已通知手机切群，正在等结果…")
+        # 指令是「排队等手机来取」的，点完这一秒还什么都没发生 —— 状态栏
+        # 若就此定格在「已通知」，用户没法分辨「正在切」和「切失败了」。
+        # 所以盯一段时间 /ping，等手机的**新一轮**巡检跑完再报。
+        # ⚠ 必须盯 watch_runs（轮数）而不是 watch 文案：点按钮瞬间上一轮
+        #    巡检可能刚结束，watch 文案已经和基线不同 —— 按文案比较会把
+        #    上一轮的结果当成这一轮的回报（2026-10-20 21:10 真机：连点
+        #    三次，三次都报同一条旧结果）。
+        try:
+            before = self._read_watch()
+            self._watch_runs_before = int(before.get("watch_runs") or 0)
+        except Exception:
+            self._watch_runs_before = -1
+        self._switch_poll_left = 40          # 40 × 1s，留够一轮巡检的时间
+        self.after(1000, self._poll_switch)
+
+    def _read_watch(self) -> dict:
+        """读一次 ``/ping``，只取切群要用的几项。失败就返回空 dict。"""
+        import urllib.request
+        cfg = self.cfg.get("dingtalk") or {}
+        port = int(cfg.get("gateway_port") or 8765)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/ping",
+            headers={"X-Bridge-Token": cfg.get("gateway_token") or ""})
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with op.open(req, timeout=5) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def _poll_switch(self):
+        """等手机把巡检结果送回来（它会在切完后立刻补一次心跳）。"""
+        if self._switch_poll_left <= 0:
+            self.btn_switch.configure(state="normal")
+            self.statusbar.configure(text="切群：手机还没回话（可能没联网/没装新版）")
+            self._log("等了一分钟也没等到手机回报巡检结果。\n"
+                      "手机上「自动巡检」那一行的文案会写真正的原因；"
+                      "若显示「读不到钉钉标题栏」，点「自检」看手机现在停在哪一页。",
+                      "err")
+            return
+        self._switch_poll_left -= 1
+        try:
+            d = self._read_watch()
+        except Exception:
+            d = {}
+        runs = int((d or {}).get("watch_runs") or -1)
+        if self._watch_runs_before >= 0 and runs > self._watch_runs_before:
+            # 这才是**本轮**的结论（runs 增长 = 手机在收到指令之后跑的巡检）
+            self.btn_switch.configure(state="normal")
+            watch = (d or {}).get("watch") or ""
+            ok = "正常" in watch
+            self._log("手机回报：" + watch, "sys" if ok else "err")
+            self.statusbar.configure(
+                text="已切到钉钉群" if ok else watch.split("· ")[-1][:40])
+            if not ok:
+                probe = (d or {}).get("probe") or ""
+                if probe:
+                    self._log("失败现场：" + probe, "err")
+            return
+        self.after(1000, self._poll_switch)
 
     def dingtalk_preview(self):
         if self.runner.alive() or self._busy:

@@ -9,7 +9,9 @@ import android.view.accessibility.AccessibilityNodeInfo;
 
 import java.security.MessageDigest;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -84,6 +86,8 @@ public class CollectorService extends AccessibilityService {
     /** 自动巡检：上一轮的结果与时间。 */
     public static volatile String lastWatch = "尚未巡检";
     public static volatile String lastWatchAt = "";
+    /** 附件抓取（0.5.11）最近一句话状态。设置页/排障看这里。 */
+    public static volatile String lastAttach = "尚未抓取过附件";
     /** 最近一次巡检失败时的现场快照（前台包名、标题、可见 id）。只用于排查。 */
     public static volatile String lastProbe = "";
     public static volatile long watchRuns = 0L;
@@ -130,6 +134,9 @@ public class CollectorService extends AccessibilityService {
     private ScheduledFuture<?> watchTimer;
     private final AtomicBoolean watching = new AtomicBoolean(false);
 
+    /** 附件抓取进行中。巡检看到它就让路 —— 两个流程同时动界面会互相点掉对方。 */
+    public final AtomicBoolean attachBusy = new AtomicBoolean(false);
+
     /** 上一次成功上报的 md5。只有它变了才发，避免网络白跑。 */
     private volatile String sentMd5 = "";
 
@@ -138,6 +145,14 @@ public class CollectorService extends AccessibilityService {
     private volatile String lastBlindWhy = "";
     private volatile long lastBlindAt = 0L;
     private long lastEventAt = 0L;
+
+    /**
+     * 最近一次「联系上电脑」的时刻（帧上报成功或心跳成功都算），0 = 从未。
+     * 巡检定时器据此自动暂停：电脑端停了还把钉钉拽到前台，用户看到的就是
+     * 「手机自己乱跳」（2026-10-27 用户定的铁律）。宽限期取 3 个心跳周期。
+     */
+    private static final long PC_DOWN_WATCH_GRACE_MS = 3 * 60000L;
+    private volatile long lastPcOkAt = 0L;
 
     public static CollectorService get() {
         return instance;
@@ -343,6 +358,19 @@ public class CollectorService extends AccessibilityService {
         watchTimer = watchScheduler.scheduleWithFixedDelay(new Runnable() {
             @Override
             public void run() {
+                // 电脑端停了（网关不在）→ 巡检必须自动停（2026-10-27 用户定的）。
+                // 不停的话，电脑都不在了手机还每隔几分钟把钉钉拽到前台，
+                // 用户只看到「手机自己乱跳」。判定只认「多久没联系上电脑」：
+                // 心跳 60 秒一次，3 次没成功就算失联。电脑恢复后帧响应里
+                // 会重新带上巡检配置，这里自然恢复，不用人工干预。
+                long since = System.currentTimeMillis() - lastPcOkAt;
+                if (lastPcOkAt == 0L || since > PC_DOWN_WATCH_GRACE_MS) {
+                    lastWatch = stamp() + " · 电脑端失联，巡检暂停"
+                            + (lastPcOkAt == 0L ? "（还没联系上电脑）"
+                                               : "（已 " + since / 1000 + " 秒）");
+                    Log.w(TAG, lastWatch);
+                    return;
+                }
                 runWatchNow("定时");
             }
         }, FIRST_WATCH_DELAY_S, minutes * 60L, TimeUnit.SECONDS);
@@ -383,6 +411,12 @@ public class CollectorService extends AccessibilityService {
     }
 
     private void runWatchNow(final String why) {
+        if (attachBusy.get()) {
+            // 附件抓取正在动界面（点附件、UC 预览、退出确认框），这时候巡检
+            // 挤进来会把预览页点掉、或被预览页点掉 —— 两边都残。等下一轮。
+            lastWatch = "附件抓取中，巡检本轮让路";
+            return;
+        }
         if (TextUtils.isEmpty(watchGroup)) {
             // 没配置群名就绝不会去动界面：认错群比不动作危险得多。
             lastWatch = "没配置目标群，不巡检";
@@ -534,7 +568,9 @@ public class CollectorService extends AccessibilityService {
         heartbeatOk = r.ok;
         heartbeats++;
         lastHeartbeat = stamp() + " · " + (r.ok ? "正常" : r.detail);
-        if (!r.ok) {
+        if (r.ok) {
+            lastPcOkAt = System.currentTimeMillis();
+        } else {
             // 心跳失败不弹通知：一次网络抖动很常见，连续失联由电脑侧告警兜底。
             Log.w(TAG, "心跳失败：" + r.detail);
             return;
@@ -671,6 +707,7 @@ public class CollectorService extends AccessibilityService {
         Uploader.Result r = Uploader.postScreen(Prefs.host(this), Prefs.port(this), token,
                 xml, md5, tree.texts.size(), reason, Prefs.appVersion(this));
         if (r.ok) {
+            lastPcOkAt = System.currentTimeMillis();
             // 只有成功才记住指纹，否则一次网络抖动会把这一屏永久跳过
             sentMd5 = md5;
             posts++;
@@ -679,6 +716,7 @@ public class CollectorService extends AccessibilityService {
                     + " 字节 " + xml.length());
             maybeFillTruncated(r.body, token);
             maybeApplyWatch(r.body);
+            maybeFetchAttachment(r.body, token);
             // ⚠ 每一帧都看有没有「立刻切群」指令，不只在心跳里看：
             //    心跳 60 秒一次，而用户在电脑上点完按钮就盯着屏幕等。
             //    抓取帧几百毫秒一次，在这里看到就顺手把心跳戳醒，让它马上去
@@ -708,6 +746,49 @@ public class CollectorService extends AccessibilityService {
      * <p>解析刻意手写而不是上 JSON 库：整个 App 没有依赖，为两个字段引
      * org.json 不划算（Android 自带的那份行为还不一致，旧 ROM 上会抛）。
      */
+    /**
+     * 电脑侧在帧响应里发现「附件：xxx」时下发 fetch_attach 指令。
+     * 这里只做转发给 {@link AttachmentFetcher}，判断全在电脑侧。
+     */
+    private void maybeFetchAttachment(String resp, String token) {
+        if (TextUtils.isEmpty(resp)) {
+            return;
+        }
+        String name = jsonString(resp, "fetch_attach");
+        if (TextUtils.isEmpty(name)) {
+            return;
+        }
+        // 触发字眼随指令一起下发（dingtalk.attach_keys，逗号连接）。电脑上
+        // 改了配置，手机端找附件行就用新字眼 —— 两边永远一致。没带就回落默认。
+        List<String> keys = new ArrayList<>();
+        String keysRaw = jsonString(resp, "fetch_keys");
+        if (!TextUtils.isEmpty(keysRaw)) {
+            for (String k : keysRaw.split(",")) {
+                k = k.trim();
+                if (!k.isEmpty()) {
+                    keys.add(k);
+                }
+            }
+        }
+        Log.i(TAG, "收到附件抓取指令：" + name + "，字眼 " + keys);
+        AttachmentFetcher.fetch(this, token, name, keys);
+    }
+
+    /**
+     * 附件抓取结束后由 {@link AttachmentFetcher} 调用：回聊天页了就立刻
+     * 抓一帧（离开期间可能攒了新消息）+ 戳醒心跳把状态带上去。
+     */
+    public void onAttachRestored() {
+        sentMd5 = "";
+        captureAndSend("attach-restored");
+        pokeHeartbeat();
+    }
+
+    /** 给 AttachmentFetcher 用的巡检兜底入口（跑一轮「拉回目标群」）。 */
+    public void runWatchNowPublic(String why) {
+        runWatchNow(why);
+    }
+
     private void maybeApplyWatch(String resp) {
         if (TextUtils.isEmpty(resp)) {
             return;

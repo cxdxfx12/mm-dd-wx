@@ -41,7 +41,11 @@ final class Uploader {
 
     private static final int CONNECT_MS = 6000;
     private static final int READ_MS = 12000;
-    private static final int MAX_BODY = 600;
+    /**
+     * 响应体读取上限。曾经是 600 —— 帧响应里的指令（fetch_attach）排在最末，
+     * 前面 note 一长就把它截掉了。正常响应 ~200 字符，4096 余量足够。
+     */
+    private static final int MAX_BODY = 4096;
 
     private Uploader() {
     }
@@ -218,6 +222,52 @@ final class Uploader {
         }
     }
 
+    /**
+     * POST /file —— 把附件文件传回电脑（JSON：name/sha1/data=base64）。
+     *
+     * <p>附件转发链路（0.5.11）里手机侧的最后一站：钉钉把 Excel 下到公开
+     * Download/UCDownloads 后，读出来 base64 上传。文件都不大（真机实测 4KB），
+     * 走 JSON+base64 最省事；上限 4MB 由网关管着（同 /screen）。
+     */
+    static Result postFile(String host, int port, String token,
+                           String name, String sha1, byte[] data) {
+        HttpURLConnection conn = null;
+        try {
+            String b64 = android.util.Base64.encodeToString(data,
+                    android.util.Base64.NO_WRAP);
+            String json = "{\"name\":\"" + jsonEscape(name)
+                    + "\",\"sha1\":\"" + sha1
+                    + "\",\"data\":\"" + b64 + "\"}";
+            byte[] body = json.getBytes(StandardCharsets.UTF_8);
+            conn = open("http://" + host + ":" + port + "/file", "POST");
+            conn.setFixedLengthStreamingMode(body.length);
+            conn.setReadTimeout(30000);       // 电脑侧要写盘+渲染，比普通请求宽一点
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            conn.setRequestProperty("X-Bridge-Token", token);
+            conn.setRequestProperty("X-Ddwx-Device",
+                    Build.MODEL == null ? "" : Build.MODEL);
+            OutputStream os = conn.getOutputStream();
+            try {
+                os.write(body);
+                os.flush();
+            } finally {
+                closeQuietly(os);
+            }
+            int code = conn.getResponseCode();
+            String resp = readBody(code >= 400 ? conn.getErrorStream() : conn.getInputStream());
+            if (code >= 200 && code < 300) {
+                return new Result(true, code, "附件已上传（" + data.length + " 字节）", resp);
+            }
+            return new Result(false, code, "HTTP " + code + " " + trim(resp, MAX_BODY));
+        } catch (Exception e) {
+            return new Result(false, 0, describe(e));
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
     /** GET /ping?token=... —— 设置页的「测试连通性」。 */
     static Result ping(String host, int port, String token) {
         HttpURLConnection conn = null;
@@ -342,6 +392,26 @@ final class Uploader {
         } catch (UnsupportedEncodingException e) {
             return "";                    // UTF-8 一定存在，这里只是兜底
         }
+    }
+
+    /** 最小 JSON 字符串转义：反斜杠、双引号、控制字符。附件名不至于更怪。 */
+    private static String jsonEscape(String s) {
+        if (s == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch == '\\' || ch == '"') {
+                sb.append('\\');
+            }
+            if (ch < 0x20) {
+                sb.append(' ');
+            } else {
+                sb.append(ch);
+            }
+        }
+        return sb.toString();
     }
 
     private static HttpURLConnection open(String spec, String method) throws IOException {

@@ -41,6 +41,11 @@ class DingTalkConfig:
     # 用户 2026-10-20 定为「定时巡检，可选 5 / 10 / 15 分钟」，默认关 ——
     # 开着就意味手机会被程序抢前台，这个决定必须由用户明确做。
     android_watch_min: int = 0
+    # android 模式：附件转发触发字眼（行首前缀，纯文本不是正则）。消息里
+    # 出现以这些字眼开头的行（允许带「明细」前缀，如「明细附件：xxx」），
+    # 就让手机点开对应卡片、下载文件并转发。2026-10-27 用户要求可配置 ——
+    # 默认「附件：/附件:」（半角全角冒号各一份）。
+    attach_keys: list[str] = field(default_factory=lambda: ["附件：", "附件:"])
     ui_poll_interval: float = 5.0           # ui / ocr 模式的轮询间隔（秒）
     title_check: bool = True                # OCR 模式：每帧校验窗口标题，防转发错群
     title_ratio: float = 0.55               # 标题模糊匹配阈值（OCR 对标题有误识，需容错）
