@@ -64,7 +64,8 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from ..config import Config
-from ..fingerprint import fp_of, is_same_message, norm_sender
+from ..fingerprint import (NEAR_MIN_LEN, content_key, fp_of, is_same_message,
+                           norm_sender)
 from ..models import MSG_TYPES, Message
 from .android_parse import (FrameDiffer, ParseError, Unit, clipped_units,
                             needs_scroll, parse_frame,
@@ -665,6 +666,23 @@ def _rebuild_message(entry) -> "Message | None":
         return base
 
 
+def known_hit(sender: str, content: str, known) -> bool:
+    """这条单元在已投递记录里吗？
+
+    短消息 `is_same_message` 一律答 False，补一条精确相等兜底。判据刻意
+    收得极紧：要么正文逐字相等，要么「字面片段集合」完全相等（即同一张
+    卡片换了渲染形态，见 `fingerprint.is_same_message`）—— 宁可多发，
+    也不能把两条真正不同的消息判成同一条吃掉。
+
+    打捞（`_salvage_rebuild`）与正常投递（`_deliver_ready`）共用这一份，
+    **别各写一份**（指纹/判据漂移的坑本仓库踩过，见 fingerprint.py 模块注释）。
+    """
+    ns = norm_sender(sender)
+    return any((s == ns or not s or not ns)
+               and (c == content or is_same_message(c, content))
+               for s, c in known)
+
+
 def _deliver_ready(ctx: "_Ctx", msgs: list) -> int:
     """同 ``_GatewayHandler._deliver`` 的投递部分，供 flusher 线程复用。
 
@@ -697,6 +715,22 @@ def _deliver_ready(ctx: "_Ctx", msgs: list) -> int:
             with ctx.lock:
                 ctx.count["rejected"] += 1
             continue
+        # ⚠ NEAR_DUP_WINDOW 只是短窗。真机 2026-10-26 23:50→00:02：同一条
+        #   「当日签」卡片在 12 分钟后被翻屏重渲染（「当前情况」块与 top10
+        #   表格行顺序互换 → 指纹变），窗口已过，被当成新消息又投了一遍。
+        #   `delivered_texts` 没有时限（deque 512 条），判据与打捞共用
+        #   `known_hit`。⚠ 只对长消息生效（≥ NEAR_MIN_LEN）：delivered_texts
+        #   无时限，若让「收到」这类短消息的精确相等也进来，正常的重复发言
+        #   会被吃掉 —— 短消息宁可多发，这是 fingerprint.py 定死的方针。
+        if len(content_key(msg.content)) >= NEAR_MIN_LEN:
+            with ctx.lock:
+                known = list(ctx.delivered_texts)
+            if known_hit(sender, msg.content, known):
+                log.info("投递记录里已有同一条（超出去重窗口的长窗兜底），跳过：%s",
+                         msg.content[:40].replace("\n", " "))
+                with ctx.lock:
+                    ctx.count["rejected"] += 1
+                continue
         try:
             ctx.on_message(msg)
             emitted += 1
@@ -2062,12 +2096,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _known_hit(sender: str, content: str, known) -> bool:
-        """这条单元在已投递记录里吗？短消息 `is_same_message` 一律答 False，
-        补一条精确相等兜底 —— 打捞的去重宁可严格。"""
-        ns = norm_sender(sender)
-        return any((s == ns or not s or not ns)
-                   and (c == content or is_same_message(c, content))
-                   for s, c in known)
+        """打捞的「已投递」判据 —— 委托模块级 `known_hit`，别各写一份。"""
+        return known_hit(sender, content, known)
 
     def _salvage_rebuild(self, frame) -> list:
         """静默期后重建基线前的打捞。

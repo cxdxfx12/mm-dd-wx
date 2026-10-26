@@ -173,5 +173,96 @@ class TestDeliveredMemory(unittest.TestCase):
                          ["静默期里来的一条"])
 
 
+# 真机 2026-10-26 23:50→00:02 的原始现场：同一条「当日签」卡片被翻屏重渲染，
+# 「当前情况」块与 top10 表格行顺序互换 —— 字面片段集合完全一样，只是排列不同。
+_CARD_A = (
+    "【当日签履约情况】\n"
+    "我开始帮你跟进今天的当日签啦。\n"
+    "目前已接入 691 票当日签任务，涉及 102 名小件员、4 个承包区。\n"
+    "当前情况：\n已签收：668票\n待签收：23票\n履约率：96.67%\n"
+    "以下是top10尚未履约票数的小件员：\n"
+    "小件员编码: 3112099924 ｜ 小件员: 刘未 ｜ 票数: 2\n"
+    "附件：运单明细")
+_CARD_B = (
+    "【当日签履约情况】\n"
+    "我开始帮你跟进今天的当日签啦。\n"
+    "目前已接入 691 票当日签任务，涉及 102 名小件员、4 个承包区。\n"
+    "小件员编码: 3112099924 ｜ 小件员: 刘未 ｜ 票数: 2\n"
+    "当前情况：\n已签收：668票\n待签收：23票\n履约率：96.67%\n"
+    "以下是top10尚未履约票数的小件员：\n"
+    "附件：运单明细")
+
+
+class TestLongWindowDedup(unittest.TestCase):
+    """NEAR_DUP_WINDOW 过期后，正常投递路径也要对照无时限的 delivered_texts。
+
+    现场真机日志：
+        23:50:05 已投递（当日晚签卡片，形态 A）
+        23:56:05 同一卡片换了渲染形态（357 秒前已发过同一条），跳过  ← 窗口内，拦住
+        00:02:26 已投递（同一卡片形态 B）                          ← 12 分钟，窗口已过，漏了
+    """
+
+    def _ready_handler(self):
+        h = make_handler()
+        seen = []
+        h.ctx.on_message = seen.append
+        h.ctx.lock = threading.Lock()
+        h.ctx.count = {"accepted": 0, "rejected": 0}
+        h.ctx.recent_keys = {}
+        return h, seen
+
+    def _age_recent_keys(self, h, age):
+        """把 recent_keys 里所有记录的时间戳拨回 age 秒前，模拟窗口过期。"""
+        for k, (s, c, _) in list(h.ctx.recent_keys.items()):
+            h.ctx.recent_keys[k] = (s, c, time.monotonic() - age)
+
+    def test_reordered_rerender_after_window_is_skipped(self):
+        """12 分钟后的换形态重渲染必须被 delivered_texts 拦住（本次事故本体）。
+
+        旧算法下：dup_age 为 None → 照发 → 微信群里同一张卡出现两遍。
+        """
+        from bridge.fingerprint import is_same_message
+        self.assertTrue(is_same_message(_CARD_A, _CARD_B))   # 前提：判据认得这是同一张卡
+        h, seen = self._ready_handler()
+        _deliver_ready(h.ctx, [Message(source="dingtalk",
+                                       sender_name="签收跟单专员",
+                                       content=_CARD_A, raw_id="a1")])
+        self.assertEqual(len(seen), 1)
+        self._age_recent_keys(h, G.NEAR_DUP_WINDOW + 60)     # 12 分钟 > 10 分钟窗口
+        emitted = _deliver_ready(h.ctx, [Message(source="dingtalk",
+                                                 sender_name="签收跟单专员",
+                                                 content=_CARD_B, raw_id="a2")])
+        self.assertEqual(emitted, 0)                          # 重复的不许再投
+        self.assertEqual(len(seen), 1)
+
+    def test_genuinely_new_card_after_window_still_delivered(self):
+        """数字变了的下一期卡片不是重渲染，必须照发 —— 宁可多发不漏发。"""
+        h, seen = self._ready_handler()
+        _deliver_ready(h.ctx, [Message(source="dingtalk",
+                                       sender_name="签收跟单专员",
+                                       content=_CARD_A, raw_id="a1")])
+        self._age_recent_keys(h, G.NEAR_DUP_WINDOW + 60)
+        changed = _CARD_A.replace("已签收：668票", "已签收：670票")
+        emitted = _deliver_ready(h.ctx, [Message(source="dingtalk",
+                                                 sender_name="签收跟单专员",
+                                                 content=changed, raw_id="a3")])
+        self.assertEqual(emitted, 1)
+        self.assertEqual(len(seen), 2)
+
+    def test_short_message_repeat_after_window_still_delivered(self):
+        """短消息不受长窗兜底约束 —— delivered_texts 无时限，若把「收到」
+        这类正常重复发言吃掉就是永久漏发（fingerprint.py 定死的方针）。"""
+        h, seen = self._ready_handler()
+        _deliver_ready(h.ctx, [Message(source="dingtalk",
+                                       sender_name="张三", content="收到",
+                                       raw_id="s1")])
+        self._age_recent_keys(h, G.NEAR_DUP_WINDOW + 60)
+        emitted = _deliver_ready(h.ctx, [Message(source="dingtalk",
+                                                 sender_name="张三", content="收到",
+                                                 raw_id="s2")])
+        self.assertEqual(emitted, 1)
+        self.assertEqual(len(seen), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
