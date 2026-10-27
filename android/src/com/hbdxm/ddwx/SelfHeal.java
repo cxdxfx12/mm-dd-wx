@@ -79,6 +79,16 @@ final class SelfHeal {
             "搜索", "搜索聊天", "搜索消息", "搜一搜", "Search",
     };
 
+    /**
+     * 全局搜索结果页顶部的分类 tab（2026-10-27 真机实测）。这些文字**永远**
+     * 在树上、永远可点，而搜索结果是异步渲染的 —— fallback 找「任意可点
+     * 祖先」时第一个扫到的就是它们，点掉之后标题栏显示「综合」，
+     * 巡检报「点开的是『综合』」。这些词永远不许当 fallback 的点按目标。
+     */
+    private static final java.util.Set<String> SEARCH_TAB_WORDS = new java.util.HashSet<>(
+            java.util.Arrays.asList("综合", "群组", "聊天记录", "联系人",
+                    "应用", "全部", "更多"));
+
     private SelfHeal() {
     }
 
@@ -702,11 +712,16 @@ final class SelfHeal {
         long deadline = System.currentTimeMillis() + RESULT_WAIT_MS;
         while (true) {
             sleep(500L);
-            String found = findResultRow(svc, want);
+            // 结果行没渲染出来之前**绝不允许 fallback 抢点** —— 搜索页顶部的
+            // tab（「综合」等）永远可点，先放开就会把巡检带去点标签（2026-10-27
+            // 连续两轮「点开的是『综合』」就是它）。只在轮询到点的最后一刻
+            // 才放开，保住「绝不空手而归」的老底线。
+            boolean timeUp = System.currentTimeMillis() >= deadline;
+            String found = findResultRow(svc, want, timeUp);
             if (found != null) {
                 return found;                       // findResultRow 内部已点
             }
-            if (System.currentTimeMillis() >= deadline) {
+            if (timeUp) {
                 Log.w(TAG, "巡检：搜索结果等了 " + RESULT_WAIT_MS + "ms 没出来"
                         + "（搜索框实际内容：\"" + currentInputText(svc) + "\"）");
                 return null;
@@ -717,9 +732,12 @@ final class SelfHeal {
     /**
      * 在结果里找完全同名的行并点它（{@code want} 是 norm 过的目标群名）。
      *
+     * @param allowFallback false = 只认精确命中，找不到就空手而归（让调用方
+     *                      继续轮询）；true = 允许退回「任意可点祖先」。
      * @return 命中的原文；没找到返回 null（不点任何东西）
      */
-    private static String findResultRow(AccessibilityService svc, String want) {
+    private static String findResultRow(AccessibilityService svc, String want,
+                                        boolean allowFallback) {
 
         // ③ 在结果里找**完全同名**的那一行，点它。
         //
@@ -730,6 +748,14 @@ final class SelfHeal {
         //  同一个群名 tex 也出现了两次。所以顺序必须固定：
         //  先认会话条目（viewId 含 tv_friend_name 的那层），认不到再退回
         //  通用可点祖先，并且**排除**落在标签区里的那个。
+        //
+        // ⚠ 2026-10-27 再加一条：fallback **不许提前抢跑**。结果页顶部
+        //    「综合 / 群组 / 聊天记录」三个 tab 是永远可点的文本节点，而搜索
+        //    结果是异步渲染的 —— 结果还没画出来时，fallback 就会第一个扫到
+        //    tab 并当场点掉（点完的页面标题恰好就是「综合」），外层的轮询
+        //    「等结果行」机制等于没做。真机两次「点开的是『综合』」就是它。
+        //    所以 fallback 必须由调用方在轮询超时后才放开（allowFallback），
+        //    并且 tab 文本本身永远不许当 fallback。
         String hit = null;
         AccessibilityNodeInfo target = null;
         AccessibilityNodeInfo fallback = null;
@@ -759,7 +785,8 @@ final class SelfHeal {
                 target = n;
                 break;
             }
-            if (fallback == null && !inTag) {
+            if (fallback == null && !inTag
+                    && !SEARCH_TAB_WORDS.contains(t)) {
                 AccessibilityNodeInfo c = clickableAncestor(n, 4);
                 if (c != null) {
                     fallback = c;
@@ -767,7 +794,7 @@ final class SelfHeal {
                 }
             }
         }
-        if (target == null) {
+        if (target == null && allowFallback) {
             target = fallback;
             hit = fallbackHit;
         }
