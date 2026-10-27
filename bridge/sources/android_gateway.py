@@ -90,6 +90,18 @@ SCREEN_LOG_EVERY = 30
 # 连续这么多帧都认不出「聊天页」→ 升到 WARNING（会触发钉钉告警）。
 # 认不出意味着一条都不转发，属于「程序在跑但静默失效」，必须让人知道。
 UNKNOWN_PAGE_ALERT_AFTER = 3
+# ── 「电脑侧主动要一帧」（2026-10-27 真机踩到）────────────────────────
+# 手机端「画面 md5 没变就不给电脑发」（省流量，设计如此）。于是出现一个死锁：
+# **电脑重启 / 刚装好时手上没有基线，而手机画面恰好没变 —— 手机觉得没新东西，
+# 一个包都不发，电脑就永远等在那里**。现场表现是「群里明明来消息了就是不转发，
+# 我手动翻一下手机才补上」（用户原话）。
+# 修法：电脑侧在每个心跳回包里告诉手机「我现在需要一帧」，手机看到新的请求
+# 编号就清掉自己的 md5 指纹、立刻重发一次当前画面。
+# 编号用「电脑的墙上时间秒」，不用自增计数：电脑重启后计数归零会小于手机记住的
+# 旧值，手机就会当成「已经处理过的老请求」而忽略 —— 时间戳天生单调，重启也不会退。
+WANT_FRAME_MIN_GAP = 60             # 两次请求的最小间隔（秒），别把心跳变成刷帧机
+WANT_FRAME_IDLE_S = 1800            # 半小时一帧都没有：要一帧自证「我还能看见」
+
 # 「同一条卡片换了渲染形态」的近似去重窗口（秒）。
 # 实测两种形态的间隔：几分钟内来回切（上翻重绘、卡片重新渲染）。取 10 分钟
 # 足以覆盖，又短到不会误伤「人工故意在十分钟后再发一条一样的话」。
@@ -949,6 +961,55 @@ def lan_ips() -> list[str]:
 
 # --------------------------------------------------------------- HTTP 服务
 
+def _want_frame(ctx: "_Ctx") -> int:
+    """电脑侧现在要不要手机重发一帧？返回请求编号（0 = 不要）。
+
+    为什么会需要：手机端「画面 md5 没变就不发」是省流量的正确设计，但它和
+    「电脑侧没有基线」撞在一起就是死锁 —— 电脑重启后手上什么都没有，手机却
+    觉得「跟上次一样，没什么可报的」，于是一个包都不发；用户看到的现象就是
+    「群里有消息不转发，我手动翻一下手机才突然补上来」（2026-10-27 真机）。
+
+    两种情形要：
+    ① **没有基线**（刚启动 / 换群重建前）：这时候屏上有什么我都看不见，
+       只能求它发一帧；
+    ② **半小时一帧都没有**：群里可能真没人说话，但也可能采集端已经瞎了
+       （灭屏挂起、无障碍被系统关掉、App 被杀）。要一帧能立刻区分这两件事
+       —— 有业务帧 = 手机在岗只是安静；只有诊断帧 = 手机在但看不见钉钉。
+
+    编号用**墙上时间秒**而不是自增计数：电脑重启后计数从 0 开始会小于手机
+    记住的旧值，手机就当成「处理过的老请求」忽略掉 —— 时间戳单调，重启不倒退。
+    """
+    now = time.time()
+    differ = getattr(ctx, "differ", None)
+    if differ is None:
+        # 只收不转（android_parse = false）：没有基线这回事，屏上有什么都不解析，
+        # 求帧纯属白烧流量，别要。
+        return 0
+    need = not getattr(differ, "baseline_built", False)
+    if not need:
+        last_ts = float((ctx.screen or {}).get("ts") or 0.0)
+        need = (now - last_ts) > WANT_FRAME_IDLE_S
+    if not need:
+        return 0
+    if now - ctx.frame_req_at < WANT_FRAME_MIN_GAP:
+        # 刚求过：把**同一个**编号再回一次（手机记过就不会重复处理），
+        # 免得心跳 60 秒一轮把手机变成刷帧机。
+        return ctx.frame_req
+    # 严格递增：同一秒内连求两次时 int(now) 会相同，手机就会当成老请求忽略。
+    # （编号是秒级时间戳，手机端用 int 收 —— 2038 年前不会溢出。）
+    ctx.frame_req = max(int(now), ctx.frame_req + 1)
+    ctx.frame_req_at = now
+    # 日志节流：基线没建起来时这里每 60 秒会走一次，不节流会把日志刷成一片。
+    # 10 分钟报一次刚好 —— 一条都不报会让「求了但手机不理我」完全无声。
+    if now - ctx.frame_log_at >= 600:
+        ctx.frame_log_at = now
+        log.info("手机这阵子没给过画面（%s），请它重发一帧当前屏幕%s",
+                 ("电脑侧还没建基线" if not getattr(differ, "baseline_built", False)
+                  else "超过 %.0f 分钟零帧" % (WANT_FRAME_IDLE_S / 60)),
+                 tail("frame_req"))
+    return ctx.frame_req
+
+
 def _screen_meta(screen: dict | None) -> dict:
     """画面缓冲的对外摘要。
 
@@ -1147,6 +1208,12 @@ class _Ctx:
     # 最新一帧节点树。只留最新一份：这一层的语义就是「手机现在长什么样」，
     # 历史帧由解析器自己按需比对，网关不做序列缓存。
     screen: dict | None = None
+    # 「电脑想要一帧」的请求编号（墙上时间秒，0 = 还没要过）与上次请求时刻。
+    # 手机端拿它跟自己的记录比，比它大就说明是**新**请求 —— 于是清掉画面指纹、
+    # 重发一次当前画面（见 WANT_FRAME_MIN_GAP 那段注释）。
+    frame_req: int = 0
+    frame_req_at: float = 0.0
+    frame_log_at: float = 0.0
     # 帧解析（dingtalk.android_parse 才开启）。differ 有状态 —— 它记着上一帧的
     # 锚点，用来判「哪几条是新的」，所以必须跟 ctx 一起走、由同一把锁保护。
     parse: bool = False
@@ -1455,6 +1522,9 @@ class _Handler(BaseHTTPRequestHandler):
                           # 「手机没报」和「报了但巡检没跑」。
                           "watch_header": self.ctx.watch_header,
                           "offline_after": self.ctx.offline_after,
+                          # 只读展示（不推进编号）：人工排查时能看出电脑最近
+                          # 有没有求过帧、手机有没有理它。
+                          "want_frame": self.ctx.frame_req,
                           "screen": _screen_meta(self.ctx.screen),
                           "stats": dict(self.ctx.count)})
 
@@ -1629,7 +1699,11 @@ class _Handler(BaseHTTPRequestHandler):
                   # 进程内的状态，不放在回包里它就只能干等或让用户自己去看。
                   "watch": self.ctx.last_watch,
                   "watch_runs": self.ctx.last_watch_runs,
-                  "probe": self.ctx.last_probe}
+                  "probe": self.ctx.last_probe,
+                  # 「请你重发一帧当前画面」。手机拿它跟自己的记录比，比它大
+                  # 就清指纹重发。**必须随每次心跳都带**（不是只带一次）：
+                  # 手机可能正好在重启 App，或者在忙别的抓取 —— 只带一次就丢。
+                  "want_frame": _want_frame(self.ctx)}
             # 让路中：心跳里也给个标记，方便手机端/日志对上时间。
             paused_left = self._watch_paused()
             if paused_left:

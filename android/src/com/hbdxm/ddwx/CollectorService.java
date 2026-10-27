@@ -582,6 +582,21 @@ public class CollectorService extends AccessibilityService {
             lastWatch = "电脑端要求立刻切群，正在执行…";
             runWatchNow("电脑端");
         }
+        // 电脑端说「我这没有基线 / 半小时没收你画面了，重发一帧」。
+        //
+        // ⚠ 必须**清掉 sentMd5** 再抓。不清就是死锁：doCapture 第一件事就是
+        // 比 md5，画面没变直接 return，电脑永远等不到（2026-10-27 真机：
+        // 电脑重启后三十多分钟一个包都不发，用户手动翻手机才补上）。
+        // 编号是电脑的墙上时间秒，单调递增 —— 电脑重启也不会比旧值小，
+        // 所以「比记录大 = 新请求」这条判据跨重启依然成立。
+        int wantFrame = jsonInt(r.body, "want_frame", 0);
+        if (wantFrame > 0 && wantFrame > Prefs.frameReq(this)) {
+            Prefs.setFrameReq(this, wantFrame);
+            sentMd5 = "";
+            Log.i(TAG, "电脑端请求重发一帧（#" + wantFrame + "），已清画面指纹");
+            lastResult = "电脑端要一帧，重发当前画面";
+            captureAndSend("pc-frame-req");
+        }
     }
 
     // ------------------------------------------------------------------ 抓取

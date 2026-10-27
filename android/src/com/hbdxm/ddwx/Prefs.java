@@ -25,6 +25,13 @@ final class Prefs {
     private static final String K_WATCH_GROUP = "watch_group";
     /** 累计巡检轮次（跨重启单调递增）。见 {@link #watchRuns} 的说明。 */
     private static final String K_WATCH_RUNS = "watch_runs_total";
+    /**
+     * 电脑端最后一次「请你重发一帧」的请求编号（电脑的墙上时间秒）。
+     *
+     * <p>它必须持久化：心跳 60 秒一次，同一编号会在多次心跳里重复出现（电脑侧
+     * 节流就是靠这个），不记住的话每次心跳都要重发一整屏节点树 —— 那是几百 KB。
+     */
+    private static final String K_FRAME_REQ = "pc_frame_req_at";
 
     /** 钉钉安卓包名。 */
     static final String DINGTALK_PKG = "com.alibaba.android.rimet";
@@ -116,6 +123,15 @@ final class Prefs {
         long next = watchRuns(c) + 1L;
         of(c).edit().putLong(K_WATCH_RUNS, next).apply();
         return next;
+    }
+
+    /** 电脑端最后一次「请你重发一帧」的编号（0 = 还没被要求过）。 */
+    static long frameReq(Context c) {
+        return of(c).getLong(K_FRAME_REQ, 0L);
+    }
+
+    static void setFrameReq(Context c, long req) {
+        of(c).edit().putLong(K_FRAME_REQ, req).apply();
     }
 
     /** 巡检间隔只允许用户给的几档：0（关）/ 5 / 10 / 15 / 30 分钟。 */
