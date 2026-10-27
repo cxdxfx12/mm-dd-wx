@@ -163,6 +163,20 @@ final class Uploader {
      */
     static Result heartbeat(String host, int port, String token, String ver,
                             String watch, long runs, String probe) {
+        return heartbeat(host, port, token, ver, watch, runs, probe, "");
+    }
+
+    /**
+     * 带「附件抓取结论」的心跳。
+     *
+     * @param attach 最近一次附件抓取的一句话结论（{@link AttachmentFetcher#lastStatus}）。
+     *               为什么要搭心跳回来：2026-10-27 19:52 电脑侧下单成功、手机端
+     *               一个字都没有 —— 失败原因（屏上找不到附件行 / 点了没下载 /
+     *               UC 卡住）全在手机 logcat 里，而华为屏蔽第三方 logcat。
+     *               人不在手机边上就完全靠猜。
+     */
+    static Result heartbeat(String host, int port, String token, String ver,
+                            String watch, long runs, String probe, String attach) {
         HttpURLConnection conn = null;
         try {
             byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
@@ -190,6 +204,15 @@ final class Uploader {
                 }
             } catch (RuntimeException e) {
                 Log.w("DDWX", "巡检状态放不进 HTTP 头，本次只发心跳：" + e);
+            }
+            // 附件结论单独 try：它常带文件名/失败现场（更长），编码失败的概率
+            // 比巡检结果高。绝不能让「附件为什么没抓成」把巡检状态也连累掉。
+            if (attach != null && attach.length() > 0) {
+                try {
+                    conn.setRequestProperty("X-Ddwx-Attach", encodeHeader(attach));
+                } catch (RuntimeException e) {
+                    Log.w("DDWX", "附件结论放不进 HTTP 头，本次略过：" + e);
+                }
             }
 
             OutputStream os = conn.getOutputStream();

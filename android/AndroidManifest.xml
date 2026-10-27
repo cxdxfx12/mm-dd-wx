@@ -23,8 +23,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.hbdxm.ddwx"
-    android:versionCode="29"
-    android:versionName="0.5.16">
+    android:versionCode="30"
+    android:versionName="0.5.17">
     <!-- ⚠ 这两个值是**真正进包**的（aapt2 以清单为准，build.py 里的
          version-code / version-name 参数对它不起作用 —— 2026-10-20 实测确认）。
          所以改版本号时必须**同时**改三处，少一处就会出现「文件名 0.4.1、

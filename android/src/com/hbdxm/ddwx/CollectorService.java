@@ -564,7 +564,8 @@ public class CollectorService extends AccessibilityService {
             return;
         }
         Uploader.Result r = Uploader.heartbeat(Prefs.host(this), Prefs.port(this), token,
-                Prefs.appVersion(this), lastWatch, watchTotalRuns(), lastProbe);
+                Prefs.appVersion(this), lastWatch, watchTotalRuns(), lastProbe,
+                AttachmentFetcher.lastStatus);
         heartbeatOk = r.ok;
         heartbeats++;
         lastHeartbeat = stamp() + " · " + (r.ok ? "正常" : r.detail);

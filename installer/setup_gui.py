@@ -39,7 +39,7 @@ APP_NAME = "喵喵钉钉-微信消息转发桥"
 #   bridge/__init__.py 里的 __version__。手工单独跑 setup_gui.py 调试时
 #   才会用到这里的值 —— 改了记得跟 bridge/__init__.py 对齐。
 #   格式必须是「0.xx」，与主程序底部的版本号一致。
-VERSION = "0.42"
+VERSION = "0.43"
 PUBLISHER = "杭州喵喵至家网络有限公司"
 WEBSITE = "www.hbdxm.com"
 COPYRIGHT = f"杭州喵喵至家网络有限公司　{WEBSITE}"

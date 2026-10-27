@@ -89,6 +89,48 @@ class TestAttachKeys(unittest.TestCase):
         self.assertEqual(_clean_attach_keys(",,，"), ["附件：", "附件:"])
 
 
+class TestButtonStyleAttachLine(unittest.TestCase):
+    """真机 2026-10-27 19:52：按钮行「查看完整月报明细（Excel）」被抠成「（Excel）」。
+
+    那张卡片的按钮文案里只有格式标记、没有文件名。抠成「（Excel）」的后果：
+    日志看不出是哪个附件；手机端拿这个名字去找节点，只能靠 fallback 点
+    「随便哪一行附件」（点错也不会报错）。整行当名字才对 —— 它就是屏上
+    可点的原文，手机端 contains 必中。
+    """
+
+    KEYS = ["附件：", "附件:", "明细附件", "查看完整月报明细"]
+
+    def test_format_only_suffix_uses_whole_line(self):
+        self.assertEqual(_attach_name("查看完整月报明细（Excel）", self.KEYS),
+                         "查看完整月报明细（Excel）",
+                         "只抠出「（Excel）」—— 名字里一个能认的字都没有")
+        self.assertEqual(_attach_name("查看完整月报明细(Excel)", self.KEYS),
+                         "查看完整月报明细(Excel)")
+
+    def test_real_filename_still_stripped(self):
+        """有真文件名的形态不能跟着改成整行 —— 微信消息会变成「附件：xxx」。"""
+        self.assertEqual(
+            _attach_name("明细附件：客户声音待履约汇总_311392_20261027.xlsx",
+                         self.KEYS),
+            "客户声音待履约汇总_311392_20261027.xlsx")
+
+    def test_whole_line_button_without_suffix(self):
+        # 有的卡片按钮不带「（Excel）」后缀
+        self.assertEqual(_attach_name("查看完整月报明细", self.KEYS),
+                         "查看完整月报明细")
+
+    def test_label_key_alone_does_not_match(self):
+        # 「附件：」是标签不是按钮：键后空着说明这行没有附件名
+        self.assertEqual(_attach_name("附件：", ["附件："]), "")
+
+    def test_real_report_content(self):
+        """19:52 那条月报正文的真尾巴（说明行 + 按钮行）。"""
+        content = ("以下为网点维度的履约情况汇总，可查看附件关注小件员履约详情\n"
+                   "查看完整月报明细（Excel）")
+        self.assertEqual(_attach_name(content, self.KEYS),
+                         "查看完整月报明细（Excel）")
+
+
 class TestFetchAttachOrder(unittest.TestCase):
     """网关在新消息里发现附件行 → 下发 fetch_attach 指令，同名有冷却。"""
 

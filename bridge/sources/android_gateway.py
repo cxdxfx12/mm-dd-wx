@@ -119,6 +119,11 @@ ATTACH_COOLDOWN = 600.0
 # 这里只放默认值；_attach_re() 按配置现拼正则。
 DEFAULT_ATTACH_KEYS = ["附件：", "附件:"]
 
+# 「手机那边附件没抓成」的措辞特征（见 AttachmentFetcher.lastStatus 的各个分支）。
+# 只有命中这些词才升级成 WARNING —— 成功的结论（「已上传 xxx.xlsx」）不值得
+# 再打一行，正常链路的「收到手机附件」日志已经说清楚了。
+_ATTACH_BAD_WORDS = ("找不到", "失败", "放弃", "没见到", "拒绝", "异常", "读不到", "休眠")
+
 
 def _clean_attach_keys(raw) -> list:
     """清洗用户配置的触发字眼：去空、去重；全空回落默认。
@@ -1033,10 +1038,35 @@ def _screen_meta(screen: dict | None) -> dict:
     }
 
 
+# 键后「只剩文件格式标记」的行 —— 它是**卡片按钮文案**（「查看完整月报明细
+# （Excel）」），不是「附件：<文件名>」。真机 2026-10-27 19:52 抓到过「（Excel）」
+# 这种名字：日志看不出是哪个附件，手机端也只能靠 fallback 点「随便哪一行」。
+# 这种行直接用**整行原文**当名字（它就是屏上的可点文本，手机端 contains 必中）。
+_FORMAT_ONLY_RE = re.compile(
+    r"^[（(【\[]?\s*(?:excel|xlsx?|xlsm|word|docx?|pdf|csv|zip|rar|7z|txt|pptx?"
+    r"|图片|文件)\s*[）)】\]]?$", re.I)
+
+
 def _attach_name(content: str, keys: list) -> str:
-    """从消息正文里抠附件名；没有附件行返回空串。"""
+    """从消息正文里抠附件名；没有附件行返回空串。
+
+    两种命中形态（真机都见过）：
+      · 「附件：运单明细」 → 名字取键后的真名字「运单明细」；
+      · 「查看完整月报明细（Excel）」 → 键后只剩格式标记，名字取**整行**。
+    """
     m = _attach_re(_clean_attach_keys(keys)).search(content or "")
-    return m.group(1).strip() if m else ""
+    if not m:
+        # 卡片按钮有时不带格式后缀，整行就是短语本身（「查看完整月报明细」）。
+        # 只认 ≥4 字的键按整行全等命中 —— 「附件：」这种标签不算按钮。
+        lines = [ln.strip() for ln in (content or "").splitlines()]
+        for k in _clean_attach_keys(keys):
+            if len(k) >= 4 and k in lines:
+                return k
+        return ""
+    name = m.group(1).strip()
+    if _FORMAT_ONLY_RE.match(name):
+        return m.group(0).strip()
+    return name
 
 
 def _attach_timeout_check(ctx: "_Ctx") -> None:
@@ -1273,6 +1303,13 @@ class _Ctx:
     # 完全不同的情况：钉钉被拉到桌面前、停在某个没标题的页、根本不在钉钉里。
     # 华为屏蔽第三方 logcat，没有这一行，人不在手机边上就只能靠猜。
     last_probe: str = ""
+    # 手机端附件抓取的最近一句结论（X-Ddwx-Attach，APK 0.5.17 起带）。
+    #
+    # 为什么必须上报：2026-10-27 19:52 电脑侧「发现附件」下单成功，之后手机端
+    # 一个字都没有 —— 抓失败的原因（屏上找不到附件行 / 点了没下载 / UC 卡住）
+    # 全躺在手机 logcat 里，而华为屏蔽第三方 logcat。用户只看到「没转发」，
+    # 电脑侧只看到「发现附件」，中间那一段完全靠猜。现在失败现场随心跳回传。
+    last_attach: str = ""
     # 是否收到过**心跳**。判定失联必须有它：手机端只在画面变化时上报，
     # 群里半天没人说话时它本来就不发东西 —— 按「多久没收到上报」判会天天误报。
     heard_heartbeat: bool = False
@@ -1291,7 +1328,7 @@ class _Ctx:
 
     def touch(self, device: str = "", heartbeat: bool = False,
               ver: str = "", watch: str = None, watch_runs: int = -1,
-              probe: str = None) -> None:
+              probe: str = None, attach: str = None) -> None:
         """记一次「手机还活着」。心跳与业务上报都算。
 
         这里**只更新时间戳、不改状态**：状态机和它的日志全交给看门狗一处做，
@@ -1316,6 +1353,8 @@ class _Ctx:
                 self.last_watch_runs = watch_runs
             if probe is not None:
                 self.last_probe = probe
+            if attach is not None:
+                self.last_attach = attach
             # 只在心跳里记（业务上报不带这两个头，记它会把证据冲成 "no"）
             if heartbeat:
                 self.watch_header = "yes" if watch is not None else "no"
@@ -1518,6 +1557,8 @@ class _Handler(BaseHTTPRequestHandler):
                           "watch": self.ctx.last_watch or "(还没巡检过)",
                           "watch_runs": self.ctx.last_watch_runs,
                           "probe": self.ctx.last_probe,
+                          # 手机端附件抓取的最近一句结论（空 = 还没抓过 / 旧 APK）。
+                          "attach": self.ctx.last_attach or "(还没抓过附件)",
                           # 心跳里到底带没带巡检状态。看这一项就能分清
                           # 「手机没报」和「报了但巡检没跑」。
                           "watch_header": self.ctx.watch_header,
@@ -1688,8 +1729,19 @@ class _Handler(BaseHTTPRequestHandler):
                 runs = 0
             raw_probe = self.headers.get("X-Ddwx-Probe")
             probe = _unquote_header(raw_probe) if raw_probe is not None else None
+            # 附件抓取结论（APK 0.5.17 起）。和巡检状态同一套做法：编码进头、
+            # 解不开就当没有 —— 诊断信息绝不能让心跳本身失败。
+            raw_attach = self.headers.get("X-Ddwx-Attach")
+            attach = _unquote_header(raw_attach) if raw_attach is not None else None
+            prev_attach = self.ctx.last_attach
             self.ctx.touch(device=device, heartbeat=True, ver=ver,
-                           watch=watch, watch_runs=runs, probe=probe)
+                           watch=watch, watch_runs=runs, probe=probe,
+                           attach=attach)
+            # 失败了当场说一句（只在新结论时打，否则每 60 秒刷一遍同样的字）。
+            # 成功不用打：正常链路后面本来就有「收到手机附件」那行。
+            if attach and attach != prev_attach and any(
+                    k in attach for k in _ATTACH_BAD_WORDS):
+                log.warning("手机那边附件没抓成：%s", attach)
             hb = {"ok": True, "source": "android",
                   "chat_name": self.ctx.chat_name,
                   "last_seen": self.ctx.last_seen_wall,
