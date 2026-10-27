@@ -68,9 +68,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 from ..config import Config
 from ..fingerprint import (NEAR_MIN_LEN, content_key, fp_of, is_same_message,
                            norm_sender)
+from ..logfun import tail
 from ..models import MSG_TYPES, Message
 from .android_parse import (FrameDiffer, ParseError, Unit, clipped_units,
-                            needs_scroll, parse_frame,
+                            needs_scroll, parse_frame, unit_age_seconds,
                             units_to_messages)
 from .base import MessageHandler, Source, infer_company
 from .pending import PendingBuffer
@@ -159,6 +160,17 @@ ALIGN_STALE = 60.0
 # 打捞（_salvage_rebuild）一次最多捞几条。限制爆炸半径：判据再稳，也只
 # 承担「静默期后苏醒的第一屏」，不可能有一条以上的真新消息挤在底部。
 SALVAGE_MAX_UNITS = 8
+# 基线打捞（_sweep_recent，2026-10-27）的时间上限：屏上消息头顶时间条读出
+# 的时刻距现在 ≤ 30 分钟才捞。用户原话「手机和当前时间相差在 30 分钟的消息
+# 要转发」。上限同时挡住两类风险：翻历史时满屏旧消息（时间条超龄）、
+# 「星期一/10-16」这类读不出时刻的段（直接不捞）。条数上限同打捞，限制
+# 爆炸半径 —— 程序重启后的第一屏正常也就十几条。
+SWEEP_MAX_AGE_S = 30 * 60.0
+SWEEP_MAX_UNITS = 15
+# 附件抓取下单后多久没收到文件就告警并释放冷却（秒）。正常链路 8~12 秒，
+# 硬上限约 40 秒（20s 等落盘 + 12 步返回）；120 秒还没文件，基本是手机端
+# 没找到附件行 / UC 下载失败，不告警就只有「发现附件」一条日志，最难查。
+ATTACH_FETCH_TIMEOUT = 120.0
 # 长消息「攒齐再发」最多等多久（秒）。等不到补全帧就发手头那半截 ——
 # 手机没手势权限、用户在操作别的界面、群消息太快把前半截顶掉，都可能让
 # 补全永远不来。宁可发一条不完整的，也不能永远不发。
@@ -783,7 +795,7 @@ def _deliver_ready(ctx: "_Ctx", msgs: list) -> int:
         ctx.count["accepted"] += emitted
     if emitted:
         head = next((m.content[:40].replace("\n", " ") for m in msgs), "")
-        log.info("安卓画面新增 %d 条消息：%s", emitted, head)
+        log.info("安卓画面新增 %d 条消息：%s%s", emitted, head, tail("new_msgs"))
     return emitted
 
 
@@ -966,6 +978,28 @@ def _attach_name(content: str, keys: list) -> str:
     return m.group(1).strip() if m else ""
 
 
+def _attach_timeout_check(ctx: "_Ctx") -> None:
+    """附件下单后迟迟没收到文件：告警一次并释放冷却。
+
+    背景（真机 2026-10-27 17:57）：「明细附件：客户声音待履约汇总….xlsx」
+    下发抓取指令后手机端一直没回传，PC 日志只有「发现附件」一行，之后
+    什么都没有 —— 冷却还占着，就算卡片再渲染也不会重新下单。这里把
+    超时的单撤掉（卡片再次出现 = 立刻重新下单）并打出 warning，让
+    「抓了但没抓到」在日志里看得见。正常链路 8~12 秒，硬上限约 40 秒，
+    120 秒（ATTACH_FETCH_TIMEOUT）还没文件就认定失败。
+    """
+    now = time.monotonic()
+    for name, at in list(ctx.attach_orders.items()):
+        if now - at < ATTACH_FETCH_TIMEOUT:
+            continue
+        del ctx.attach_orders[name]
+        if ctx.attach_file_at and ctx.attach_file_at > at:
+            continue            # 期间收到过文件：链路正常，冷却自然结束
+        log.warning("附件抓取超时：下单「%s」已 %.0f 秒没收到文件"
+                    "（手机端多半没找到附件行 / UC 下载失败）—— "
+                    "已释放冷却，卡片再次出现会重新下单", name, now - at)
+
+
 def _order_attach(ctx: "_Ctx", pending: list) -> str:
     """扫描本帧新单元里的附件行，返回要下发的附件名（没有则空串）。
 
@@ -977,6 +1011,7 @@ def _order_attach(ctx: "_Ctx", pending: list) -> str:
     """
     if not getattr(ctx, "attach_enabled", True):
         return ""
+    _attach_timeout_check(ctx)
     now = time.monotonic()
     for u in pending:
         name = _attach_name(u.content, ctx.attach_keys)
@@ -1024,12 +1059,20 @@ class _Ctx:
     # 又捞一遍」；比 recent_keys 的 NEAR_DUP_WINDOW 长得多 —— 用户翻回早前
     # 的历史时，那些消息早出了近似去重窗口，只能靠这份记录挡。
     delivered_texts: deque = field(default_factory=lambda: deque(maxlen=512))
+    # 持久去重回调（storage.is_duplicate，uid → bool）。基线打捞（_sweep_recent）
+    # 靠它判断「这条入库过没」—— 内存里的 delivered_texts 重启就空了，而打捞
+    # 恰恰要覆盖「程序重启后的第一屏」。uid = "android:{fp}:{seq}"，与正常
+    # 投递路径同一套指纹，重启后依然稳定可复现。
+    dup_check = None
     # ── 附件抓取（「附件：运单明细」→ 手机点击下载 → 传回电脑）──────
     # 电脑侧每帧扫描新消息里的附件行，冷却期内只下一次单（ATTACH_COOLDOWN）；
     # 同一份文件不重发靠 attach_seen（sha1），不是靠这里的名字冷却 ——
     # 名字冷却挡「这一分钟内别再点」，sha1 挡「这份文件别再发」。
     attach_orders: dict = field(default_factory=dict)     # 附件名 -> monotonic
     attach_seen: dict = field(default_factory=dict)       # sha1 -> True
+    # 最近一次收到附件文件的时刻（monotonic）。附件超时告警（_attach_timeout_
+    # check）用它区分「已收到，冷却正常结束」和「超时没收到，要告警放行」。
+    attach_file_at: float = 0.0
     # 触发字眼（dingtalk.attach_keys）：下单时随 fetch_attach 一起下发给手机，
     # 手机端按同样的字眼找屏上的附件行 —— 两边必须一致，改配置两端同时生效。
     attach_keys: list = field(
@@ -1735,6 +1778,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         fresh = not duplicate and sha not in self.ctx.attach_seen
         self.ctx.attach_seen[sha] = True
+        # 附件超时告警的「已收到」标记：哪怕这份文件不是当次下单的那份
+        # （名字对不上），也说明链路活着，不该在冷却上再叠一次告警。
+        self.ctx.attach_file_at = time.monotonic()
         cb = self.ctx.on_file
         if cb is not None and fresh:
             try:
@@ -1805,11 +1851,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.ctx.touch(device=screen["device"], ver=screen.get("ver", ""))
 
         if count == 1:
-            log.info("收到第一帧手机画面：%d 字节，%d 条文本（来自 %s）",
-                     length, texts, screen["device"] or "未知名")
+            log.info("收到第一帧手机画面：%d 字节，%d 条文本（来自 %s）%s",
+                     length, texts, screen["device"] or "未知名", tail("frames"))
         elif count % SCREEN_LOG_EVERY == 0:
-            log.info("手机画面已累计 %d 帧（最新 %d 字节 / %d 条文本）",
-                     count, length, texts)
+            log.info("手机画面已累计 %d 帧（最新 %d 字节 / %d 条文本）%s",
+                     count, length, texts, tail("frames"))
         else:
             log.debug("画面 #%d：%d 字节，%d 条文本，md5=%s",
                       count, length, texts, screen["md5"][:8])
@@ -1870,7 +1916,8 @@ class _Handler(BaseHTTPRequestHandler):
                     body["fetch_attach"] = attach
                     # 字眼一起下发：手机端按它找屏上的附件行。
                     body["fetch_keys"] = ",".join(self.ctx.attach_keys)
-                    log.info("发现附件「%s」，已下发抓取指令", attach)
+                    log.info("发现附件「%s」，已下发抓取指令%s", attach,
+                             tail("attach_order"))
         self._reply(200, body)
 
     # --- 画面解析（仅 dingtalk.android_parse = true）---
@@ -2062,7 +2109,12 @@ class _Handler(BaseHTTPRequestHandler):
             self.ctx.last_good_units = list(frame.units)
             if diff.baseline:
                 log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
-                         "此后只转发基线之后的新消息", len(frame.units))
+                         "此后只转发基线之后的新消息%s", len(frame.units),
+                         tail("baseline"))
+                # 30 分钟内的真新消息不随基线吞掉（2026-10-27）
+                s = self._sweep_deliver(frame, differ)
+                if s:
+                    return s
                 return [], "已建立基线", False
             log.warning("安卓画面解析：锚点丢失，基线已重建到当前画面")
             salvaged = (self._salvage_rebuild(frame)
@@ -2070,16 +2122,22 @@ class _Handler(BaseHTTPRequestHandler):
             # 打捞窗口只在重建这一次：不复位的话，之后任何重建都会带上打捞，
             # 「翻历史/换群」触发的重建就会把历史灌进微信群。
             self.ctx.align_stale_gave_up = False
-            if salvaged:
-                out, _note, want_more = self._finish(salvaged, frame, differ)
-                return out, ("锚点丢失（打捞 %d 条）" % len(salvaged)), want_more
+            # 30 分钟内的真新消息不随基线吞掉（_sweep_recent 自带证据与
+            # 时间护栏，翻历史/换群时捞不出东西）。
+            swept = [u for u in self._sweep_recent(frame)
+                     if u.fp not in {x.fp for x in salvaged}]
+            combined = list(salvaged) + swept
+            if combined:
+                out, _note, want_more = self._finish(combined, frame, differ)
+                return out, ("锚点丢失（打捞 %d 条）" % len(combined)), want_more
             return [], "锚点丢失", False
 
         if diff.baseline:
             differ.commit(frame.units)          # peek 之后必须自己推进锚点
             self.ctx.last_good_units = list(frame.units)
             log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
-                     "此后只转发基线之后的新消息", len(frame.units))
+                     "此后只转发基线之后的新消息%s", len(frame.units),
+                     tail("baseline"))
             # ── 基线帧上被切的长消息：补全，但**不发** ──────────────
             #
             # 旧实现这里只 log.info 一句就完了，理由是「建基线时滚动会把刚
@@ -2096,6 +2154,15 @@ class _Handler(BaseHTTPRequestHandler):
             # 但要补全**不等于**要投递：它在基线里，多半几分钟前就发过了
             # （同一条 16:39 已转发过完整版）。所以打上 `long_baseline`，
             # 一路补全、收尾时只入库不投递。
+            #
+            # ⚠ 2026-10-27：基线里除了「多半发过的长消息」，还可能有**真的
+            #   没见过的新消息**（程序重启 / 手机离线后恢复的第一屏）。先把
+            #   30 分钟内的真新消息捞出来投掉（_sweep_deliver），长消息
+            #   照旧只补全不入群 —— 两件事互不妨碍。
+            swept_out, swept_note, swept_want = [], None, False
+            s = self._sweep_deliver(frame, differ)
+            if s:
+                swept_out, swept_note, swept_want = s
             why = needs_scroll(frame)
             if why:
                 sus, _ = self._long_suspects(frame.units, frame)
@@ -2107,8 +2174,11 @@ class _Handler(BaseHTTPRequestHandler):
                                         top_cut=min(sus[-1].y0, sus[-1].y1)
                                         < frame.view[1] - 12)
                     self.ctx.long_baseline = True
-                    return [], "基线里的长消息，只补全不转发", True
+                    return swept_out, (swept_note or
+                                       "基线里的长消息，只补全不转发"), True
                 log.info("安卓画面解析：当前屏有消息没显示全（%s）", why)
+            if swept_out:
+                return swept_out, swept_note, swept_want
             return [], "已建立基线", False
         if diff.anchor_lost:
             # 锚点丢失 ≠ 一定是翻历史。真机上最常见的两个原因恰恰是**漏发**：
@@ -2161,10 +2231,15 @@ class _Handler(BaseHTTPRequestHandler):
             salvaged = (self._salvage_rebuild(frame)
                         if self.ctx.align_stale_gave_up else [])
             self.ctx.align_stale_gave_up = False   # 同上：打捞窗口只此一次
-            if salvaged:
-                out, _note, want_more = self._finish(salvaged, frame, differ)
+            # 30 分钟内的真新消息不随基线吞掉（_sweep_recent 自带证据与
+            # 时间护栏，翻历史/换群时捞不出东西）。
+            swept = [u for u in self._sweep_recent(frame)
+                     if u.fp not in {x.fp for x in salvaged}]
+            combined = list(salvaged) + swept
+            if combined:
+                out, _note, want_more = self._finish(combined, frame, differ)
                 out = ([done] if done is not None else []) + list(out)
-                return out, ("锚点丢失（打捞 %d 条）" % len(salvaged)), want_more
+                return out, ("锚点丢失（打捞 %d 条）" % len(combined)), want_more
             if done is not None:
                 return [done], "锚点丢失（已投递攒到的长消息）", False
             return [], "锚点丢失", False
@@ -2272,6 +2347,78 @@ class _Handler(BaseHTTPRequestHandler):
     def _known_hit(sender: str, content: str, known) -> bool:
         """打捞的「已投递」判据 —— 委托模块级 `known_hit`，别各写一份。"""
         return known_hit(sender, content, known)
+
+    def _sweep_recent(self, frame) -> list:
+        """基线（首帧 / 重建）时把屏上「30 分钟内且从没见过」的消息捞出来。
+
+        背景（2026-10-27 用户原话「还是老是漏掉消息」）：首帧建基线和锚点
+        丢失重建都会把屏上一切登记为「已知历史」—— 程序重启、手机离线、
+        长卡片挤掉锚点，那一刻屏上真正的新消息就被吞掉，且**不入库**，
+        forward_recent.py 都补不回来。打捞判据层层收窄：
+
+          · 同会话证据：屏上至少有一条「入库过 / 投过」的单元，且只捞
+            **证据之下**的单元（新消息只会从底部进来）。一条证据都没有
+            = 换了群 / 全新安装，宁可不捞 —— 把别的群的消息打进目标群
+            是事故；
+          · 时间判据：单元头顶时间条必须读得出绝对时刻（「今天 17:57」）
+            且距现在 ≤ SWEEP_MAX_AGE_S（30 分钟）。裸「今天」「星期一」
+            「10-16」读不出时刻，一律不捞；
+          · 没入库过（dup_check = storage.is_duplicate，重启后仍然有效）
+            且没投过（known_hit，本进程内的近似去重记录）；
+          · 被屏幕上/下沿夹掉的单元不捞 —— 内容是错的，交给长消息补全
+            通道；
+          · 条数上限 SWEEP_MAX_UNITS，限制爆炸半径。
+        """
+        units = frame.units or []
+        if not units:
+            return []
+        check = self.ctx.dup_check
+        known = list(self.ctx.delivered_texts)
+
+        def _is_known(u) -> bool:
+            if check is not None:
+                try:
+                    # 正常投递路径 raw_id = f"{fp}:{seq}"，批内第一次出现
+                    # 就是 :1 —— 用它当「这条内容见过没」的判据。
+                    if check(f"android:{u.fp}:1"):
+                        return True
+                except Exception:                  # noqa: BLE001
+                    log.exception("dup_check 失败，按「见过」处理（宁可不捞）")
+                    return True
+            return known_hit(u.sender, u.content, known)
+
+        good_fps = {u.fp for u in (self.ctx.last_good_units or [])}
+        evidence = -1
+        for i, u in enumerate(units):
+            if u.fp in good_fps or _is_known(u):
+                evidence = i
+        if evidence < 0:
+            return []                     # 没有同会话证据，宁可不捞
+        bad = {id(u) for u in clipped_units(frame)}   # 被夹的交给补全通道
+        now = datetime.now()
+        kept = []
+        for u in units[evidence + 1:]:
+            if id(u) in bad:
+                continue
+            age = unit_age_seconds(u.ts, now)
+            if age is None or age > SWEEP_MAX_AGE_S:
+                continue
+            if _is_known(u):
+                continue
+            kept.append(u)
+        kept = kept[-SWEEP_MAX_UNITS:]
+        if kept:
+            log.warning("安卓画面解析：基线打捞 %d 条 30 分钟内没见过的消息"
+                        "（交攒齐层去重）", len(kept))
+        return kept
+
+    def _sweep_deliver(self, frame, differ) -> tuple | None:
+        """把打捞结果交攒齐层投出去。没有可捞的返回 None（调用方走原路）。"""
+        swept = self._sweep_recent(frame)
+        if not swept:
+            return None
+        out, _note, want = self._finish(swept, frame, differ)
+        return out, ("基线打捞 %d 条（30 分钟内）" % len(swept)), want
 
     def _salvage_rebuild(self, frame) -> list:
         """静默期后重建基线前的打捞。
@@ -2468,7 +2615,8 @@ class _Handler(BaseHTTPRequestHandler):
             kept.append(u)
         if not kept:
             return [], "补全帧没有新内容", False
-        log.info("安卓画面解析：上翻补全到 %d 条此前没看到的内容", len(kept))
+        log.info("安卓画面解析：上翻补全到 %d 条此前没看到的内容%s",
+                 len(kept), tail("fill"))
         return kept, "补全帧", False
 
     # --- 长消息攒齐 ---
@@ -2743,11 +2891,13 @@ class _Handler(BaseHTTPRequestHandler):
             took += 1
             if action == "grow":
                 log.info("安卓画面解析：%s 的卡片又长了一截（现 %d 字），"
-                         "继续攒着不发", msg.sender_name, len(msg.content))
+                         "继续攒着不发%s", msg.sender_name, len(msg.content),
+                         tail("pending"))
             elif action == "new":
                 log.info("安卓画面解析：收到 %s 的一条消息（%d 字），"
-                         "先攒着，静默 %.0f 秒后发最全的版本",
-                         msg.sender_name, len(msg.content), buf.quiet)
+                         "先攒着，静默 %.0f 秒后发最全的版本%s",
+                         msg.sender_name, len(msg.content), buf.quiet,
+                         tail("pending"))
         return took
 
 
@@ -2839,7 +2989,11 @@ class AndroidGatewaySource(Source):
             f"http://<本机IP>:{self.port}"
         return True, f"监听 {self.host}:{self.port}｜手机端填：{where}"
 
-    def run(self, on_message: MessageHandler, on_file=None) -> None:
+    def run(self, on_message: MessageHandler, on_file=None,
+            dup_check=None) -> None:
+        """启动网关。``dup_check``（uid → bool）接 ``storage.is_duplicate``：
+        基线打捞（_sweep_recent）靠它判断「这条入库过没」—— 内存里的
+        delivered_texts 重启就空了，而打捞恰恰要覆盖重启后的第一屏。"""
         ok, why = self.check()
         if not ok:
             raise RuntimeError(why)
@@ -2852,6 +3006,7 @@ class AndroidGatewaySource(Source):
                    attach_keys=self.attach_keys,
                    attach_enabled=self.attach_enabled,
                    differ=FrameDiffer() if self.parse else None)
+        ctx.dup_check = dup_check
         # 附件抓取链路：目录 + 下游回调。任一缺失都只是「收不了附件」，
         # 不影响消息转发主流程。
         ctx.files_dir = self.files_dir or ""

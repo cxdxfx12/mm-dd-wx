@@ -46,6 +46,7 @@ import logging
 import time
 from pathlib import Path
 
+from ..logfun import tail
 from .base import SendResult, Target
 
 log = logging.getLogger("bridge.targets.wechat_ocr")
@@ -403,7 +404,8 @@ class WeChatOcrTarget(Target):
         fast_ok, fast_title = self._current_chat_title(hwnd)
         if fast_ok and self._title_matches(target, fast_title):
             self._current = target
-            log.info("已打开目标会话「%s」，跳过会话列表扫描", target)
+            log.info("已打开目标会话「%s」，跳过会话列表扫描%s", target,
+                     tail("chat_open"))
             return True, f"已在目标会话（标题栏：{fast_title[:24]}）"
         # 点击前是否「确认开着一个别的会话」
         other_open_before = fast_ok and not self._title_matches(target, fast_title)

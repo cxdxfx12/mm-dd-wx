@@ -33,8 +33,9 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
+from bisect import bisect_right
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from ..fingerprint import is_same_message, norm_sender, unit_fp
 from ..models import Message
@@ -60,6 +61,27 @@ TIME_ONLY_RE = re.compile(
     r"星期[一二三四五六日天]|"
     r"\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2})\s*$"
 )
+
+# 「能读出绝对时刻」的时间条：只有「今天/昨天/前天/大前天 HH:MM」。
+# 裸「今天」、星期、日期都没有时刻，解析不出秒龄。
+_TS_ABS_RE = re.compile(r"^(今天|昨天|前天|大前天)\s*(\d{1,2}):(\d{2})$")
+_TS_DAY_OFFSET = {"今天": 0, "昨天": 1, "前天": 2, "大前天": 3}
+
+
+def unit_age_seconds(ts: str, now: datetime | None = None) -> float | None:
+    """时间条文本 → 距 ``now`` 的秒数；读不出绝对时刻返回 ``None``。
+
+    「今天 17:57」→ 秒龄；「星期一」「10-16」「今天」（裸的）→ None。
+    手机时钟偶尔比电脑快几十秒，负数按 0 处理（刚到的新消息不该被当旧）。
+    """
+    m = _TS_ABS_RE.match((ts or "").strip())
+    if not m:
+        return None
+    now = now or datetime.now()
+    base = (now - timedelta(days=_TS_DAY_OFFSET[m.group(1)])).replace(
+        hour=int(m.group(2)), minute=int(m.group(3)),
+        second=0, microsecond=0)
+    return max(0.0, (now - base).total_seconds())
 
 # 非文本消息的占位描述（图片/文件这类只有 content-desc，没有正文）。
 # 用半角方括号 —— 机器人正文里的【】是全角，不会被误伤。
@@ -247,6 +269,11 @@ class Unit:
     # bottom 留在可视区** —— 于是 top > bottom。这个差值就是没露出来的高度。
     # 详见 ``clipped_units`` 的 ③。
     clipped_below: int = 0
+    # 这条消息头顶上最近的时间条原文（「今天 08:13」「昨天 20:01」…）。
+    # 钉钉只在新的时间分段画一条，所以这是**一组**消息的近似时刻，不是
+    # 精确的推送时间。认不出时刻的段（「星期一」「10-16」、裸「今天」）
+    # 也原样存 —— 消费方用 ``unit_age_seconds`` 解析，解不出就当旧消息。
+    ts: str = ""
 
     @property
     def fp(self) -> str:
@@ -254,7 +281,8 @@ class Unit:
 
     def as_dict(self) -> dict:
         return {"sender": self.sender, "content": self.content,
-                "kind": self.kind, "y0": self.y0, "y1": self.y1, "fp": self.fp}
+                "kind": self.kind, "y0": self.y0, "y1": self.y1, "fp": self.fp,
+                "ts": self.ts}
 
 
 KIND_OF_PLACEHOLDER = {
@@ -1066,8 +1094,10 @@ def parse_frame(text: str) -> Frame:
     frame.view = container.bounds
 
     units: list[Unit] = []
+    seps: list[tuple[int, str]] = []    # (y0, 文本)——给每条消息归属时间条
     for unit in _container_units(container):
         if unit.kind == "time":
+            seps.append((unit.y0, unit.content))
             frame.separators.append(unit.content)
         else:
             units.append(unit)
@@ -1083,6 +1113,15 @@ def parse_frame(text: str) -> Frame:
     # （行级 bounds 在真机上是准的；只有深层子节点的 bounds 会失真，见
     # `_is_time_strip` 的说明。）
     units.sort(key=lambda u: u.y0)
+    # 时间归属：每条消息头顶上最近的那条时间条就是它（们）的发消息时刻
+    # （钉钉只在新的一分钟段画一条）。认不出时刻的旧段（「星期一」「10-16」、
+    # 裸「今天」）原样存进去，让消费方自己决定要不要用 —— 这里只管归属。
+    if seps:
+        sep_ys = [y for y, _ in seps]
+        for u in units:
+            i = bisect_right(sep_ys, u.y0) - 1
+            if i >= 0:
+                u.ts = seps[i][1]
     _fill_clamp_depth(units, container, frame.view)
     frame.units = units
     return frame

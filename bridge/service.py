@@ -15,6 +15,7 @@ from datetime import datetime
 
 from .config import Config
 from .formatter import DEFAULT_TEMPLATE, render
+from .logfun import tail
 from .models import Message
 from .notify import (DingTalkNotifier, SYSTEM_PREFIX, in_hhmm_window,
                      install_alert_handler)
@@ -142,7 +143,7 @@ class BridgeService:
             if result.ok:
                 self.counter["sent"] += 1
                 self._consec_fail = 0
-                log.info("%s已投递 → %s", prefix, tgt)
+                log.info("%s已投递 → %s%s", prefix, tgt, tail("sent"))
             else:
                 self.counter["failed"] += 1
                 self._consec_fail += 1
@@ -181,7 +182,8 @@ class BridgeService:
                             msg.uid, tgt, "ok" if r2.ok else "fail",
                             f"表格图: {r2.detail}")
                         if r2.ok:
-                            log.info("表格图片已投递 → %s（%s）", tgt, _P(png).name)
+                            log.info("表格图片已投递 → %s（%s）%s", tgt, _P(png).name,
+                                 tail("table_png"))
                         else:
                             log.warning("表格图片投递失败 → %s | %s",
                                         tgt, r2.detail)

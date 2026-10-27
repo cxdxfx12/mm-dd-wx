@@ -385,11 +385,17 @@ def main() -> int:
             svc.announce_start(repr(source))
             try:
                 # 第二个回调是附件转发：手机抓回的 Excel → 表格图 → 微信。
-                # 只有安卓网关源的 run 收两个参数（OCR 等旧源只有一个），
-                # 按签名分发，别让别的采集源在这里炸 TypeError。
+                # 第三个回调是持久去重（storage.is_duplicate）：基线打捞
+                # 靠它判断「这条入库过没」。只有安卓网关源收三个参数
+                # （OCR 等旧源只有一个），按签名分发，别让别的采集源在这里
+                # 炸 TypeError。
                 import inspect
 
-                if len(inspect.signature(source.run).parameters) >= 2:
+                params = len(inspect.signature(source.run).parameters)
+                if params >= 3:
+                    source.run(svc.handle, svc.handle_attachment,
+                               svc.storage.is_duplicate)
+                elif params >= 2:
                     source.run(svc.handle, svc.handle_attachment)
                 else:
                     source.run(svc.handle)
