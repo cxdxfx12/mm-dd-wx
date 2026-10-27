@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import random
 import threading
 import time
@@ -27,6 +28,8 @@ from .xlsx_reader import read_rows
 log = logging.getLogger("bridge.service")
 
 WATCHDOG_TICK = 30.0          # 看门狗巡检间隔（秒）
+RETRY_DELAY_S = 30.0          # 投递失败后的补投延迟（秒）
+RETRY_NOTE = "失败补投"        # 补投投递记录里的标记
 
 
 class BridgeService:
@@ -38,8 +41,16 @@ class BridgeService:
         self.counter: Counter = Counter()
         self.last_target_check: tuple[bool, str] = (True, "尚未检查")
         self._last_send = 0.0
-        self._send_lock = threading.Lock()
+        self._send_lock = threading.RLock()     # 补投线程与投递线程共用，须可重入
         self._send_count = 0                    # 已发送条数，用于插入随机长停顿
+
+        # ---- 投递失败补投（2026-10-27：遮挡这种瞬态失败不该永久漏消息）----
+        self.retry_delay = RETRY_DELAY_S
+        self._retry_stop = threading.Event()
+        self._retry_queue: queue.Queue = queue.Queue()
+        self._retry_thread = threading.Thread(
+            target=self._retry_worker, daemon=True, name="ddwx-retry")
+        self._retry_thread.start()
 
         # ---- 通知相关 ----
         self.notifier: DingTalkNotifier | None = DingTalkNotifier.from_config(
@@ -105,19 +116,37 @@ class BridgeService:
 
         text = render(msg, matched.template or DEFAULT_TEMPLATE)
         for tgt in matched.targets:
+            ok = self._deliver_to_target(msg, tgt, text)
+            if not ok:
+                # 瞬态失败（窗口被挡、幽灵窗、一次网络抖动）占绝大多数，
+                # 失败一次就放弃等于永久漏消息 —— uid 已入库，后续帧会被
+                # 去重跳过，再没有自然重来的机会。延后 30 秒补投一次。
+                self._retry_queue.put((msg, tgt, text))
+        return True
+
+    def _deliver_to_target(self, msg: Message, tgt: str, text: str,
+                           note: str = "") -> bool:
+        """把一条消息投给一个目标：文字 + 可选表格图。返回文字是否发出。
+
+        全程持 ``_send_lock``：补投线程与正常投递并发时，两个流程的点击/
+        OCR 绝不能交错（投递端不是线程安全的）。
+        """
+        prefix = f"[{note}] " if note else ""
+        with self._send_lock:
             self._throttle()
             result = self.target.send_text(tgt, text)
             self.storage.log_delivery(
-                msg.uid, tgt, "ok" if result.ok else "fail", result.detail
+                msg.uid, tgt, "ok" if result.ok else "fail",
+                f"{prefix}{result.detail}" if prefix else result.detail
             )
             if result.ok:
                 self.counter["sent"] += 1
                 self._consec_fail = 0
-                log.info("已投递 → %s", tgt)
+                log.info("%s已投递 → %s", prefix, tgt)
             else:
                 self.counter["failed"] += 1
                 self._consec_fail += 1
-                log.error("投递失败 → %s | %s", tgt, result.detail)
+                log.error("%s投递失败 → %s | %s", prefix, tgt, result.detail)
                 self._alert_delivery_fail(tgt, result.detail)
 
             # ---- 表格转图片（文字照发，表格补一张图）----
@@ -139,7 +168,7 @@ class BridgeService:
 
                     if not _P(png).is_file():
                         log.debug("图片文件已不在，跳过补图：%s", png)
-                        continue
+                        return True
                     self._throttle()
                     try:
                         r2 = self.target.send_image(tgt, str(png))
@@ -156,7 +185,31 @@ class BridgeService:
                         else:
                             log.warning("表格图片投递失败 → %s | %s",
                                         tgt, r2.detail)
-        return True
+            return result.ok
+
+    # ---------- 投递失败补投 ----------
+
+    def _retry_worker(self) -> None:
+        """补投线程：失败的投递 30 秒后原样再发一次，只补一次。
+
+        为什么只一次：遮挡/幽灵窗这类瞬态故障，隔半分钟重试几乎必过；
+        真故障（会话没了、规则变了）重试也是同样结果，无限重试只会
+        往业务群反复重发同样的东西 —— 那比漏一条更糟（2026-10-20 铁律）。
+        """
+        while True:
+            item = self._retry_queue.get()
+            if item is None:
+                return
+            msg, tgt, text = item
+            if self._retry_stop.wait(self.retry_delay):
+                continue                    # 服务已停：丢弃，不再投
+            log.info("投递失败 %.0f 秒后补投 → %s（%s）",
+                     self.retry_delay, tgt, msg.sender_name)
+            try:
+                if self._deliver_to_target(msg, tgt, text, note=RETRY_NOTE):
+                    log.info("补投成功 → %s", tgt)
+            except Exception:               # noqa: BLE001
+                log.exception("补投异常（放弃）：%s", msg.uid)
 
     # ---------- 附件转发 ----------
 
@@ -502,6 +555,11 @@ class BridgeService:
         self._watchdog_stop.set()
         if self._watchdog and self._watchdog.is_alive():
             self._watchdog.join(timeout=2.0)
+        # 补投线程：置停 + 唤醒队列，别让 close 卡在 30 秒延迟上
+        self._retry_stop.set()
+        self._retry_queue.put(None)
+        if self._retry_thread.is_alive():
+            self._retry_thread.join(timeout=1.0)
         if self._alert_handler is not None:
             try:
                 logging.getLogger("bridge").removeHandler(self._alert_handler)

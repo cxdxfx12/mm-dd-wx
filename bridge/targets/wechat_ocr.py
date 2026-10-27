@@ -80,6 +80,15 @@ class _POINT(ctypes.Structure):
     _fields_ = [("x", wt.LONG), ("y", wt.LONG)]
 
 
+class _WindowPlacement(ctypes.Structure):
+    """GetWindowPlacement 的出参（幽灵窗唤醒时取「正常矩形」用）。"""
+
+    _fields_ = [("length", ctypes.c_uint), ("flags", ctypes.c_uint),
+                ("showCmd", ctypes.c_uint),
+                ("ptMinPosition", wt.POINT), ("ptMaxPosition", wt.POINT),
+                ("rcNormalPosition", wt.RECT)]
+
+
 user32.WindowFromPoint.argtypes = [_POINT]
 user32.WindowFromPoint.restype = ctypes.c_void_p
 user32.GetAncestor.argtypes = [ctypes.c_void_p, wt.UINT]
@@ -709,6 +718,11 @@ class WeChatOcrTarget(Target):
             # 排除登录小窗（176×199）和其他挂件
             elif r and (r[2] - r[0]) > 400 and (r[3] - r[1]) > 400:
                 found.append(h)
+            elif r and (r[2] - r[0]) <= 0 and (r[3] - r[1]) <= 0:
+                # 幽灵窗（2026-10-27）：可见、非最小化，但矩形归零 —— 微信
+                # 4.x 主窗口会偶尔退化成这个形态。登录小窗是 176×199 的
+                # **真实**矩形，不会被这条误收；幽灵窗交给 _activate 唤醒。
+                found.append(h)
             return True
 
         user32.EnumWindows(cb, 0)
@@ -763,6 +777,13 @@ class WeChatOcrTarget(Target):
                 user32.ShowWindow(wt.HWND(hwnd), 9)          # SW_RESTORE
                 time.sleep(0.3)
 
+            # 幽灵窗检查（2026-10-27 真机）：可见、非最小化，但矩形归零。
+            # 这种窗口激活「成功」也白搭 —— 画面根本不渲染，先唤醒再说。
+            r = self._rect(hwnd)
+            if not r or r[2] - r[0] <= 0 or r[3] - r[1] <= 0:
+                log.info("微信主窗口矩形退化（%s）—— 幽灵窗，先唤醒", r)
+                self._revive_ghost(hwnd)
+
             user32.SetForegroundWindow(wt.HWND(hwnd))
             time.sleep(self.focus_delay)
             if self._is_foreground(hwnd):
@@ -782,6 +803,42 @@ class WeChatOcrTarget(Target):
             # `wt.HWND_TOPMOST`），排查时白试了三次单点调用才定位。堆栈一行就够。
             log.exception("激活微信窗口失败：%s", exc)
             return False
+
+    def _revive_ghost(self, hwnd: int) -> bool:
+        """把退化成幽灵窗的微信主窗口唤醒，返回唤醒后矩形是否恢复正常。
+
+        幽灵窗形态（2026-10-27 真机 17:19 事故实测）：``IsWindowVisible=1``、
+        非最小化、`SetForegroundWindow` 照样「成功」（回读前台也是它），
+        但**窗口不渲染** —— 严重时矩形归零，轻时矩形完好而屏幕像素是别的
+        窗口（遮挡检测 5 处全中、错误地报「被遮挡」）。激活三连对它全部
+        「无效地成功」，只有强制 Windows/Qt 重建窗口表面才救得回来。
+        恢复梯（真机验证有效）：SW_HIDE→SW_SHOW 逼 Qt 重建表面 →（仍退化）
+        按 placement 的正常矩形 SetWindowPos 强制重排。
+        """
+        hwnd_w = wt.HWND(hwnd)
+        user32.ShowWindow(hwnd_w, 0)                     # SW_HIDE
+        time.sleep(0.3)
+        user32.ShowWindow(hwnd_w, 5)                     # SW_SHOW
+        time.sleep(0.6)
+        r = self._rect(hwnd)
+        if r and r[2] - r[0] > 200 and r[3] - r[1] > 200:
+            log.info("微信幽灵窗已唤醒（HIDE→SHOW，矩形 %s）", r)
+            return True
+        p = _WindowPlacement()
+        p.length = ctypes.sizeof(_WindowPlacement)
+        if user32.GetWindowPlacement(hwnd_w, ctypes.byref(p)):
+            n = p.rcNormalPosition
+            w, hgt = n.right - n.left, n.bottom - n.top
+            if w > 200 and hgt > 200:
+                user32.SetWindowPos(hwnd_w, 0, n.left, n.top, w, hgt,
+                                    SWP_NOACTIVATE | SWP_SHOWWINDOW)
+                time.sleep(0.8)
+                r = self._rect(hwnd)
+                if r and r[2] - r[0] > 200 and r[3] - r[1] > 200:
+                    log.info("微信幽灵窗已唤醒（SetWindowPos，矩形 %s）", r)
+                    return True
+        log.warning("微信幽灵窗唤醒失败（矩形 %s）", self._rect(hwnd))
+        return False
 
     def _grab_foreground(self, hwnd: int, rounds: int = 3) -> bool:
         """硬抢前台，抢到为止（最多 ``rounds`` 轮）。返回是否真的到了前台。
@@ -948,6 +1005,17 @@ class WeChatOcrTarget(Target):
         bad = self._occluded_points(hwnd)
         if not bad:
             return True, ""
+        # 微信已在前台、采样点却还不是它的像素 —— 2026-10-27 17:19 真机：
+        # 主窗口退化成幽灵窗（能激活、有矩形、不渲染），「遮挡」只是假象。
+        # 拦下投递是对的（不拦就会把别的窗口像素 OCR 后乱发），但先唤醒一次。
+        if self._is_foreground(hwnd):
+            log.warning("微信已在前台但 %d 处采样点不是它的像素 —— 疑似幽灵窗，"
+                        "尝试唤醒后重测", len(bad))
+            if self._revive_ghost(hwnd):
+                time.sleep(0.5)
+                bad = self._occluded_points(hwnd)
+                if not bad:
+                    return True, ""
         return False, (f"微信窗口被其它窗口遮挡（{len(bad)} 处，如坐标 "
                        f"{bad[0]}）—— 抓到的画面不是微信，请关掉挡在微信前面的"
                        f"窗口后重试")
