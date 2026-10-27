@@ -166,6 +166,31 @@ def watch_minutes(label: str) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- 附件触发字眼
+#
+# 默认值必须与 bridge/sources/android_gateway.DEFAULT_ATTACH_KEYS 一致
+# （tests/test_settings_attach_keys.py 里锁死了这一条）：那份是手机端和
+# 网关真正用的，这份只在界面上显示。
+DEFAULT_ATTACH_KEYS = ("附件：", "附件:")
+
+
+def attach_keys_text(raw) -> str:
+    """配置里的触发字眼 → 输入框里显示的逗号串。
+
+    配置允许两种写法（YAML 列表 / 逗号串），界面上统一成逗号串；
+    读不出东西时回落默认 —— 留一个空输入框会让人以为「已经关掉了」，
+    实际网关拿到的仍是默认字眼，那种「我明明清空了它还在转」最难查。
+    """
+    if isinstance(raw, str):
+        items = re.split(r"[,，]", raw)
+    elif isinstance(raw, (list, tuple)):
+        items = [str(x) for x in raw]
+    else:
+        items = []
+    out = [x.strip() for x in items if str(x).strip()]
+    return ",".join(out) if out else ",".join(DEFAULT_ATTACH_KEYS)
+
+
 def _scroll_area(parent, bg: str = BG) -> tk.Frame:
     """返回一个可垂直滚动的内层 Frame；内容装得下时自动收起滚动条。
 
@@ -416,6 +441,11 @@ class SettingsDialog:
         # 「手机被切走后最多丢多久的群消息」，可选项多了用户反而不会算。
         self.st["gw_watch"] = tk.StringVar(value=_watch_label(
             d.get("android_watch_min", 0)))
+        # 附件转发：总开关 + 触发字眼（2026-10-27 用户要求搬进设置中心）。
+        self.st["attach_on"] = tk.BooleanVar(
+            value=bool(d.get("attach_enabled", True)))
+        self.st["attach_keys"] = tk.StringVar(
+            value=attach_keys_text(d.get("attach_keys")))
 
         srcbox = _card(page, "数据来源：消息从哪儿读")
         srcbox.pack(fill="x", padx=12, pady=(12, 8))
@@ -482,6 +512,39 @@ class SettingsDialog:
                      "都会被切到钉钉，选 5 分钟就基本干不了别的；"
                      "② 有盲区 —— 手机被切走那段时间的群消息根本没读到，补不回来，"
                      "间隔越大盲区越大。",
+             bg=WARN_BG, fg=WARN_FG).pack(fill="x", padx=30, pady=(0, 12))
+
+        # ---- 附件转发 ----
+        # 这两项原来只能手改 config.yaml（attach_keys 是 2026-10-27 才加的），
+        # 用户在界面上找不到；现在搬进来，与手机网关参数挨着放。
+        abox = _card(page, "附件转发：钉钉卡片里的 Excel 自动下载并发到微信")
+        abox.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Checkbutton(abox, text="启用附件自动下载与转发",
+                        variable=self.st["attach_on"]).pack(anchor="w", padx=14,
+                                                            pady=(10, 2))
+        _tip(abox, "手机模式下生效：卡片正文里出现以触发字眼开头的行时，让手机点开这张"
+                   "卡片、下载文件，再传回电脑解析成表格发到微信。关掉后不下发任何抓取"
+                   "指令，手机什么都不做（消息照常转发）。"
+             ).pack(fill="x", padx=30)
+
+        arow = tk.Frame(abox, bg=CARD)
+        arow.pack(fill="x", padx=14, pady=(6, 0))
+        tk.Label(arow, text="触发字眼", bg=CARD, fg=TEXT, font=F_UI,
+                 width=8, anchor="w").pack(side="left")
+        ttk.Entry(arow, textvariable=self.st["attach_keys"], width=32
+                  ).pack(side="left", padx=(4, 8))
+        tk.Button(arow, text="恢复默认", font=F_SMALL, bg=CARD, fg=ACCENT,
+                  activebackground=CARD, relief="flat", cursor="hand2",
+                  command=lambda: self.st["attach_keys"].set(
+                      ",".join(DEFAULT_ATTACH_KEYS))
+                  ).pack(side="left")
+        _tip(abox, "多个字眼用半角逗号分隔（中文逗号也认）。全角「：」和半角「:」算"
+                   "两个不同字眼，想都认就都写上。只匹配**行首**，且行首允许带「明细」"
+                   "二字（如「明细附件：拦截风险明细.xlsx」）；字眼后最多 40 个字符当"
+                   "文件名 —— 所以别在字眼前后加空格。"
+             ).pack(fill="x", padx=30)
+        _tip(abox, "改完要先「停止」再「开始运行」才生效（配置只在启动时读一次）。"
+                   "字眼会随指令一起下发到手机，不用改手机里的设置。",
              bg=WARN_BG, fg=WARN_FG).pack(fill="x", padx=30, pady=(0, 12))
 
         box = _card(page, "投递")
@@ -1042,6 +1105,23 @@ class SettingsDialog:
                 parent=self.win)
             return
 
+        # ---- 附件转发 ----
+        attach_on = bool(self.st["attach_on"].get())
+        attach_keys = [x.strip() for x in
+                       re.split(r"[,，]", self.st["attach_keys"].get())
+                       if x.strip()]
+        if not attach_keys:
+            attach_keys = list(DEFAULT_ATTACH_KEYS)
+        long_keys = [k for k in attach_keys if len(k) > 12]
+        if long_keys:
+            messagebox.showwarning(
+                "触发字眼太长",
+                "这些字眼超过 12 个字，几乎不可能是卡片里的固定前缀：\n"
+                + "、".join(long_keys) +
+                "\n\n只填冒号前那几个字即可，例如「附件：」「明细附件：」。",
+                parent=self.win)
+            return
+
         # ---- 钉钉通知相关校验 ----
         try:
             n_cooldown = max(30, int(float(self.st["n_cooldown"].get())))
@@ -1134,6 +1214,11 @@ class SettingsDialog:
         S("dingtalk", "android_watch_min",
           watch_minutes(str(self.st["gw_watch"].get())),
           after="android_offline_after")
+        # 附件转发：开关 + 触发字眼。写成逗号串（不是 YAML 列表）——
+        # ensure_config_keys 只补标量，且网关两种形态都认。
+        S("dingtalk", "attach_enabled", attach_on, after="android_watch_min")
+        S("dingtalk", "attach_keys", ",".join(attach_keys),
+          after="attach_enabled")
         S("wechat", "dry_run", bool(self.st["dry_run"].get()), after="interval")
         S("wechat", "interval", interval, after="dry_run")
         S("wechat", "show_hotkey", hotkey, after="wxauto_path")

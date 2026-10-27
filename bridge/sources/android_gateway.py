@@ -971,7 +971,12 @@ def _order_attach(ctx: "_Ctx", pending: list) -> str:
 
     冷却记在 ``ctx.attach_orders``（名字 → monotonic）：卡片重渲染会让
     同一条附件行在几十帧里反复出现，冷却期内不重复下单。
+
+    总开关 ``ctx.attach_enabled`` 也在这里判 —— 关掉时连冷却都不记，
+    重新打开后卡片再出现能立刻抓，不必等 10 分钟冷却过去。
     """
+    if not getattr(ctx, "attach_enabled", True):
+        return ""
     now = time.monotonic()
     for u in pending:
         name = _attach_name(u.content, ctx.attach_keys)
@@ -1029,6 +1034,8 @@ class _Ctx:
     # 手机端按同样的字眼找屏上的附件行 —— 两边必须一致，改配置两端同时生效。
     attach_keys: list = field(
         default_factory=lambda: list(DEFAULT_ATTACH_KEYS))
+    # 总开关（dingtalk.attach_enabled）：关掉就完全不下发抓取指令。
+    attach_enabled: bool = True
     # 附件落盘目录与下游回调（service.handle_attachment）。空 = 不收文件。
     files_dir: str = ""
     on_file = None
@@ -2779,6 +2786,8 @@ class AndroidGatewaySource(Source):
         # 附件转发的触发字眼（行首前缀，纯文本）。随 fetch_attach 一起下发给
         # 手机端 —— 手机按同样的字眼找屏上的附件行，两边永远一致。
         self.attach_keys = _clean_attach_keys(getattr(dt, "attach_keys", None))
+        # 总开关：关掉就不下发 fetch_attach（手机端不用知道这个键）。
+        self.attach_enabled = bool(getattr(dt, "attach_enabled", True))
         # 附件落盘目录：跟数据库同目录下的 attachments/（service 侧能找到）。
         try:
             base = Path(cfg.resolve(cfg.storage.db_path)).parent
@@ -2829,6 +2838,7 @@ class AndroidGatewaySource(Source):
                    parse=self.parse, offline_after=self.offline_after,
                    watch_group=self.watch_group, watch_min=self.watch_min,
                    attach_keys=self.attach_keys,
+                   attach_enabled=self.attach_enabled,
                    differ=FrameDiffer() if self.parse else None)
         # 附件抓取链路：目录 + 下游回调。任一缺失都只是「收不了附件」，
         # 不影响消息转发主流程。

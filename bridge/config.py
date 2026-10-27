@@ -46,6 +46,9 @@ class DingTalkConfig:
     # 就让手机点开对应卡片、下载文件并转发。2026-10-27 用户要求可配置 ——
     # 默认「附件：/附件:」（半角全角冒号各一份）。
     attach_keys: list[str] = field(default_factory=lambda: ["附件：", "附件:"])
+    # 附件转发的总开关（设置中心 → 采集与投递 → 附件转发）。关掉就不下发
+    # 抓取指令，手机端自然什么都不做 —— 手机端不需要知道这个键。
+    attach_enabled: bool = True
     ui_poll_interval: float = 5.0           # ui / ocr 模式的轮询间隔（秒）
     title_check: bool = True                # OCR 模式：每帧校验窗口标题，防转发错群
     title_ratio: float = 0.55               # 标题模糊匹配阈值（OCR 对标题有误识，需容错）

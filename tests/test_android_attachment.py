@@ -116,6 +116,26 @@ class TestFetchAttachOrder(unittest.TestCase):
         unit = type("U", (), {"content": "今天没有附件的一句普通话"})()
         self.assertEqual(_order_attach(ctx, [unit]), "")
 
+    def test_enabled_by_default(self):
+        """新装/老配置（没有 attach_enabled 这个键）必须照常抓附件。"""
+        self.assertTrue(self._ctx().attach_enabled)
+
+    def test_disabled_switch_orders_nothing(self):
+        """总开关关掉时一条指令都不下，手机端因此完全不动作。
+
+        为什么要有这个开关：原先只能靠「把字眼清空」来关，而网关对空值
+        回落默认字眼 —— 用户在设置里清空后它还在抓，属于最难查的那类。
+        另外关着的时候不能占用冷却，否则重新打开要白等 10 分钟。
+        """
+        from bridge.sources.android_gateway import _order_attach
+        ctx = self._ctx()
+        ctx.attach_enabled = False
+        unit = type("U", (), {"content": "附件：运单明细"})()
+        self.assertEqual(_order_attach(ctx, [unit]), "")
+        self.assertEqual(ctx.attach_orders, {})
+        ctx.attach_enabled = True                     # 重新打开立刻就能抓
+        self.assertEqual(_order_attach(ctx, [unit]), "运单明细")
+
 
 class TestFileEndpoint(GatewayCase):
     """/file 上传：鉴权、落盘、sha1 校验、重复去重。"""
