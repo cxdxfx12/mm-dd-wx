@@ -53,3 +53,6 @@ desktop.ini
 
 # 第三方探测工具（本地下载，不入库）
 appium-master/
+
+# 临时排障脚本与截图（不入库）
+tmpd/
