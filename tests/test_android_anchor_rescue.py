@@ -106,6 +106,24 @@ class TestProbeDecision(unittest.TestCase):
         self.assertEqual(h.ctx.align_tried, 0)
         self.assertEqual(h.ctx.align_wait_since, 0.0)
 
+    def test_stale_give_up_clears_align_state(self):
+        """过期 give_up 后丢失时刻也必须清掉。
+
+        现场（2026-10-27 16:40/16:54）：16:40 过期重建基线后 ``align_at``
+        还挂着 15:11 的老时间戳；16:54 锚点再对不上时立刻又命中「过期」
+        分支，日志打出「已挂 6184 秒」（其实距上一帧只有 14 分钟），
+        还白白跳过了一次翻页找回的机会。
+        """
+        h = make_handler()
+        h.ctx.align_at = time.monotonic() - (G.ALIGN_STALE + 1)
+        h.ctx.align_md5 = "OLD"
+        h.ctx.align_tried = 2
+        self.assertEqual(h._probe_decision("NEW"), "give_up")
+        self.assertEqual(h.ctx.align_at, 0.0, "过期认输后丢失时刻要清掉")
+        self.assertEqual(h.ctx.align_md5, "")
+        # 清干净之后，锚点再对不上应从 probe 重新开始，而不是再 give_up
+        self.assertEqual(h._probe_decision("NEW2"), "probe")
+
 
 class TestProbeConstants(unittest.TestCase):
 

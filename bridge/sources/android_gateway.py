@@ -2067,6 +2067,9 @@ class _Handler(BaseHTTPRequestHandler):
             log.warning("安卓画面解析：锚点丢失，基线已重建到当前画面")
             salvaged = (self._salvage_rebuild(frame)
                         if self.ctx.align_stale_gave_up else [])
+            # 打捞窗口只在重建这一次：不复位的话，之后任何重建都会带上打捞，
+            # 「翻历史/换群」触发的重建就会把历史灌进微信群。
+            self.ctx.align_stale_gave_up = False
             if salvaged:
                 out, _note, want_more = self._finish(salvaged, frame, differ)
                 return out, ("锚点丢失（打捞 %d 条）" % len(salvaged)), want_more
@@ -2157,6 +2160,7 @@ class _Handler(BaseHTTPRequestHandler):
             #   翻历史触发的重建捞了就是把历史灌进群。
             salvaged = (self._salvage_rebuild(frame)
                         if self.ctx.align_stale_gave_up else [])
+            self.ctx.align_stale_gave_up = False   # 同上：打捞窗口只此一次
             if salvaged:
                 out, _note, want_more = self._finish(salvaged, frame, differ)
                 out = ([done] if done is not None else []) + list(out)
@@ -2386,9 +2390,17 @@ class _Handler(BaseHTTPRequestHandler):
         return "wait"
 
     def _reset_probe(self) -> None:
-        """一轮结束：等待起点与翻页额度一起归零。"""
+        """一轮结束：丢失时刻、等待起点与翻页额度一起归零。
+
+        ⚠ ``align_at``/``align_md5`` 必须一起清：give_up 后基线已重建到当前
+        画面，锚点是新的了，老状态残留的话，下一帧锚点再对不上时会**立刻**
+        再命中「过期」分支 —— 实测 2026-10-27 16:40 过期重建后，16:54 的帧
+        打出「已挂 6184 秒」（起点其实是 15:11），还白白跳过了一次翻页找回。
+        """
         self.ctx.align_wait_since = 0.0
         self.ctx.align_tried = 0
+        self.ctx.align_at = 0.0
+        self.ctx.align_md5 = ""
 
     def _ingest_fill(self, frame) -> tuple[list, str, bool]:
         """上翻补全帧：把「锚点上方、此前没见过」的内容挑出来。
