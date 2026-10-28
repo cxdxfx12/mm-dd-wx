@@ -451,12 +451,11 @@ public class CollectorService extends AccessibilityService {
         lastWatchAt = stamp();
         SelfHeal.Result r = SelfHeal.ensureGroup(this, group);
         lastWatch = lastWatchAt + " · " + why + " · " + r;
+        // ⚠ 快查每轮都刷新（2026-10-28）：原来只在失败时记，会把一次旧故障
+        //    现场永久冻结在 /ping 里（权限弹窗早被点掉了，probe 还报着它），
+        //    排障反被误导。
+        lastProbe = SelfHeal.probe(this);
         if (!r.ok) {
-            // 失败时把「当时钉钉停在哪一页」一起记下来（2026-10-20）。
-            // 光有结论没用：同一句「读不到标题栏」背后可能是被拉到桌面、
-            // 停在没有标题的页、或者根本不在钉钉。华为屏蔽 logcat，
-            // 事后想再加诊断就得重装 APK —— 所以宁可现在就多存一行。
-            lastProbe = SelfHeal.probe(this);
             Log.w(TAG, "巡检失败现场：" + lastProbe);
         }
         if (r.ok) {

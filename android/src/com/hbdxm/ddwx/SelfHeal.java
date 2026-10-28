@@ -135,6 +135,16 @@ final class SelfHeal {
         }
         String want = norm(group);
         try {
+            // ⓪ 系统权限弹窗（「是否允许钉钉通话？」这类）卡在前台时，无障碍
+            //    读到的整棵树都是弹窗的（十几个节点），钉钉被压在后面 —— 画面
+            //    冻结、心跳还在，最难被发现（2026-10-28 真机：UC 下载触发的弹窗
+            //    卡了近 1 小时，期间消息全漏）。返回键 = 拒绝，通话权限对采集
+            //    链路毫无影响，拒了就行。
+            if (systemDialogPackage(svc) != null) {
+                back(svc);
+                sleep(800L);
+            }
+
             // ① 前台不是钉钉 —— 先拉起来。这一步不需要看树，也最便宜。
             //
             // ⚠ 拉完必须**回读确认**（2026-10-20 真机）：
@@ -186,7 +196,14 @@ final class SelfHeal {
                 }
             }
             if (norm(title).equals(want)) {
-                return noop("已在目标群");
+                // ⚠「标题对」≠「在最新处」（2026-10-28 真机事故）：视口可能停在
+                //    半屏的机器人 H5 卡片上，新消息全在下面 —— 画面不变、一帧不发、
+                //    消息全漏，而巡检每轮都报「已在目标群」。必须滚到底部。
+                int n = scrollChatToBottom(svc);
+                return n > 0
+                        ? new Result(true, "已在目标群（视口曾停在历史处，回到底部滚了 "
+                                + n + " 轮）", true)
+                        : noop("已在目标群");
             }
 
             // ②.5 停在网页/内置浏览器这类**盖住一切**的页面上时，先退出去。
@@ -232,7 +249,9 @@ final class SelfHeal {
             if (!norm(after).equals(want)) {
                 return fail("点开的是「" + clip(after) + "」，不是目标群");
             }
-            return new Result(true, "已切回目标群（原在「" + clip(title) + "」）", true);
+            int n = scrollChatToBottom(svc);
+            return new Result(true, "已切回目标群（原在「" + clip(title) + "」"
+                    + (n > 0 ? "，回到底部滚了 " + n + " 轮" : "") + "）", true);
         } catch (Throwable t) {
             Log.w(TAG, "自动巡检出错", t);
             return fail("内部错误：" + t);
@@ -626,6 +645,89 @@ final class SelfHeal {
             Log.w(TAG, "发送返回键失败：" + t);
             return false;
         }
+    }
+
+    /**
+     * 前台根节点是不是系统权限弹窗（com.android.permissioncontroller）。
+     * 是就返回它的包名，不是返回 null。
+     */
+    static String systemDialogPackage(AccessibilityService svc) {
+        try {
+            AccessibilityNodeInfo root = safeRoot(svc);
+            if (root == null) {
+                return null;
+            }
+            CharSequence p = root.getPackageName();
+            if (p != null && p.toString().startsWith(
+                    "com.android.permissioncontroller")) {
+                return p.toString();
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "探测系统弹窗出错：" + t);
+        }
+        return null;
+    }
+
+    /**
+     * 把聊天列表滚到底部（最新消息处），返回实际滚动轮数（0 = 没滚）。
+     *
+     * <p>为什么必须存在（2026-10-28 真机事故）：机器人 H5 卡片把触摸事件
+     * 全吃掉，视口停在历史位置时 adb 手势怎么滑都滑不动；而新消息全在视口
+     * 下面到达，屏幕内容不变 → 手机 md5 判重永远跳过 → 一帧都不发 → 漏
+     * 消息一个半小时。
+     *
+     * <p>用无障碍 {@code ACTION_SCROLL_FORWARD} 直接作用于列表节点，
+     * 不经过触摸分发，卡片吃不掉。判停：连续两轮「滚动后树没变化」就认为
+     * 已到底（RecyclerView 在底部也可能回 true，光看返回值不可靠）。
+     * 硬上限 40 轮，防异常页面死循环。
+     */
+    static int scrollChatToBottom(AccessibilityService svc) {
+        if (svc == null) {
+            return 0;
+        }
+        int rounds = 0;
+        try {
+            int stable = 0;
+            for (int i = 0; i < 40; i++) {
+                AccessibilityNodeInfo root = safeRoot(svc);
+                if (root == null) {
+                    break;
+                }
+                List<AccessibilityNodeInfo> before = flatten(root);
+                boolean scrolled = false;
+                for (AccessibilityNodeInfo n : before) {
+                    if (!n.isScrollable()) {
+                        continue;
+                    }
+                    Rect b = new Rect();
+                    n.getBoundsInScreen(b);
+                    // 只滚占屏的大列表（聊天消息列表）；顶部横滑 tab 这类小条不动
+                    if (b.height() < 600 || b.width() < 600) {
+                        continue;
+                    }
+                    if (n.performAction(
+                            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
+                        scrolled = true;
+                    }
+                }
+                if (!scrolled) {
+                    break;
+                }
+                rounds++;
+                sleep(250L);
+                AccessibilityNodeInfo root2 = safeRoot(svc);
+                if (root2 == null || flatten(root2).size() == before.size()) {
+                    if (++stable >= 2) {
+                        break;      // 滚了但树没变 = 已经在底部
+                    }
+                } else {
+                    stable = 0;
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "滚到底部出错", t);
+        }
+        return rounds;
     }
 
     /** 括号开头的是「(内部群)」「(4)」这类角标；纯数字是未读/成员数。 */
