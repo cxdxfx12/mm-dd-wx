@@ -96,6 +96,7 @@ final class AttachmentFetcher {
             Log.w(TAG, "附件抓取已在进行，忽略本次指令：" + name);
             return;
         }
+        svc.attachBusySince = System.currentTimeMillis();   // 让路宽限期计时
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
@@ -108,6 +109,7 @@ final class AttachmentFetcher {
                     f.restoreQuietly(svc);          // 异常也必须回聊天页
                 } finally {
                     svc.attachBusy.set(false);
+                    svc.attachBusySince = 0L;
                 }
             }
         }, "ddwx-attach");

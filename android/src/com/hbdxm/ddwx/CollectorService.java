@@ -134,8 +134,31 @@ public class CollectorService extends AccessibilityService {
     private ScheduledFuture<?> watchTimer;
     private final AtomicBoolean watching = new AtomicBoolean(false);
 
-    /** 附件抓取进行中。巡检看到它就让路 —— 两个流程同时动界面会互相点掉对方。 */
+    /** 本轮巡检开始的时刻（毫秒），0 = 没在跑。watching 卡死自救用。 */
+    public volatile long watchRunStartAt = 0L;
+
+    /** 一轮巡检的正常上限。超时就判定卡死，强制解锁让下一轮进来。 */
+    private static final long WATCH_STUCK_MS = 150000L;
+
+    /**
+     * 附件抓取进行中。巡检看到它就让路 —— 两个流程同时动界面会互相点掉对方。
+     *
+     * <p>⚠ 让路**只能有宽限期**（2026-10-29 真机事故）：抓取全程硬上限约
+     * 40 秒（找节点 + 点击 + 等落盘 20s + 回聊天 12 步），但真机上抓取线程
+     * 卡死过两小时（15:10 下单 → 17:03 才死，华为屏蔽 logcat 卡在哪一跳无法
+     * 取证），{@code attachBusy} 一直为真 → 巡检全程让路 → 没人把停在历史
+     * 位置的视口拉回底部 → **零帧两小时**。所以超过
+     * {@link #ATTACH_YIELD_MAX_MS} 后巡检无视这个标志照常跑：卡死的线程若
+     * 最终走完，{@code finally} 会把标志清掉，无副作用；两个流程真撞车，
+     * 也比采集全瞎强。
+     */
     public final AtomicBoolean attachBusy = new AtomicBoolean(false);
+
+    /** attachBusy 置真的时刻，0 = 没在抓。让路宽限期的计时起点。 */
+    public volatile long attachBusySince = 0L;
+
+    /** 附件抓取让路的宽限期。超过即判定抓取线程卡死，巡检不再让路。 */
+    private static final long ATTACH_YIELD_MAX_MS = 90000L;
 
     /** 上一次成功上报的 md5。只有它变了才发，避免网络白跑。 */
     private volatile String sentMd5 = "";
@@ -412,19 +435,41 @@ public class CollectorService extends AccessibilityService {
 
     private void runWatchNow(final String why) {
         if (attachBusy.get()) {
-            // 附件抓取正在动界面（点附件、UC 预览、退出确认框），这时候巡检
-            // 挤进来会把预览页点掉、或被预览页点掉 —— 两边都残。等下一轮。
-            lastWatch = "附件抓取中，巡检本轮让路";
-            return;
+            long busyMs = attachBusySince <= 0L ? Long.MAX_VALUE
+                    : System.currentTimeMillis() - attachBusySince;
+            if (busyMs < ATTACH_YIELD_MAX_MS) {
+                // 附件抓取正在动界面（点附件、UC 预览、退出确认框），这时候巡检
+                // 挤进来会把预览页点掉、或被预览页点掉 —— 两边都残。等下一轮。
+                lastWatch = "附件抓取中，巡检本轮让路";
+                return;
+            }
+            Log.w(TAG, "附件抓取标志已挂 " + (busyMs / 1000) + " 秒"
+                    + "（抓取全程硬上限约 40 秒）—— 判定抓取线程卡死，"
+                    + "巡检不再让路（2026-10-29 零帧两小时的教训）");
         }
         if (TextUtils.isEmpty(watchGroup)) {
             // 没配置群名就绝不会去动界面：认错群比不动作危险得多。
             lastWatch = "没配置目标群，不巡检";
             return;
         }
+        long nowMs = System.currentTimeMillis();
         if (!watching.compareAndSet(false, true)) {
-            return;                       // 上一轮还没跑完
+            long runMs = watchRunStartAt <= 0L ? Long.MAX_VALUE
+                    : nowMs - watchRunStartAt;
+            if (runMs < WATCH_STUCK_MS) {
+                return;                       // 上一轮还没跑完
+            }
+            // 上一轮巡检线程卡死（同理：正常一轮最多几十秒）。强制解锁，
+            // 否则后续所有 tick 都在这里静默 return，lastWatch 冻结在旧值，
+            // 外面看起来就像「巡检在让路」—— 2026-10-29 真机 17:40 现象。
+            Log.w(TAG, "上一轮巡检已挂 " + (runMs / 1000) + " 秒 —— "
+                    + "判定卡死，强制解锁重跑");
+            watching.set(false);
+            if (!watching.compareAndSet(false, true)) {
+                return;
+            }
         }
+        watchRunStartAt = nowMs;
         ScheduledExecutorService w = watchScheduler;
         if (w == null || w.isShutdown()) {
             w = Executors.newSingleThreadScheduledExecutor();
@@ -438,6 +483,7 @@ public class CollectorService extends AccessibilityService {
                     lastWatch = "巡检内部错误：" + t;
                     Log.w(TAG, "巡检出错", t);
                 } finally {
+                    watchRunStartAt = 0L;
                     watching.set(false);
                 }
             }
