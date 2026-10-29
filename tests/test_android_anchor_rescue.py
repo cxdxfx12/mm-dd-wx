@@ -69,13 +69,21 @@ class TestProbeDecision(unittest.TestCase):
         self.assertEqual(h.ctx.align_tried, 0)
 
     def test_wait_times_out_to_give_up(self):
-        """手机没手势权限 / 页面卡死时，不能永远等下去。"""
+        """手机没手势权限 / 页面卡死时，不能永远等下去。
+
+        2026-10-29 起超时不是就地 commit：先请手机回到底部（``to_bottom``），
+        回底那一帧才重建基线 —— 视口停在历史中间时重建＝把历史当新起点。
+        """
         h = make_handler()
         h.ctx.align_at = time.monotonic() - 0.3
         h.ctx.align_md5 = "AAA"
         h.ctx.align_wait_since = time.monotonic() - (G.PROBE_SETTLE_MAX + 1)
-        self.assertEqual(h._probe_decision("BBB"), "give_up")
+        self.assertEqual(h._probe_decision("BBB"), "wait")
         self.assertEqual(h.ctx.align_wait_since, 0.0, "认输后等待状态要清掉")
+        self.assertTrue(h.ctx.want_bottom, "要请手机回到底部")
+        # 手机没手势权限时回不来：等够时间就就地重建，不能永远卡着
+        h.ctx.await_bottom_at = time.monotonic() - (G.PROBE_SETTLE_MAX + 1)
+        self.assertEqual(h._probe_decision("CCC"), "give_up")
 
     def test_budget_exhausted_gives_up(self):
         """一轮真翻满了仍对不上 → 认输（多半是在翻历史/换群）。"""
@@ -83,19 +91,29 @@ class TestProbeDecision(unittest.TestCase):
         h.ctx.align_at = time.monotonic() - 5.0
         h.ctx.align_md5 = "AAA"
         h.ctx.align_tried = G.PROBE_MAX
-        self.assertEqual(h._probe_decision("BBB"), "give_up")
+        self.assertEqual(h._probe_decision("BBB"), "wait")
+        self.assertTrue(h.ctx.await_bottom, "认输要先回到底部再重建基线")
 
     def test_give_up_resets_budget_for_next_round(self):
-        """认输要清额度：否则一次长卡片之后，今天剩余时间都不再有救援机会。"""
+        """认输要清额度：否则一次长卡片之后，今天剩余时间都不再有救援机会。
+
+        2026-10-29 起认输会**先请手机回到底部**（``await_bottom``）：那一帧
+        才是重建基线的时机；消费掉这个标志之后，额度确实没有被永久吃掉。
+        """
         h = make_handler()
         h.ctx.align_at = time.monotonic() - 5.0
         h.ctx.align_md5 = "AAA"
         h.ctx.align_tried = G.PROBE_MAX
-        h._probe_decision("BBB")
+        self.assertEqual(h._probe_decision("BBB"), "wait")
         self.assertEqual(h.ctx.align_tried, 0)
-        # 下一轮重新拥有完整额度
+        self.assertTrue(h.ctx.await_bottom, "认输要请手机回到底部")
+        # 手机回到底后送来的那一帧：重建基线
+        h.ctx.frame_reason = "probe-bottom"
+        self.assertEqual(h._probe_decision("CCC"), "give_up")
+        self.assertFalse(h.ctx.await_bottom, "回底只许消费一次")
+        # 再往后锚点又对不上 → 重新拥有完整额度
         h.ctx.align_at = time.monotonic() - 5.0
-        self.assertEqual(h._probe_decision("CCC"), "probe")
+        self.assertEqual(h._probe_decision("DDD"), "probe")
 
     def test_normal_frame_clears_everything(self):
         """锚点回来了 = 这一轮结束，额度和等待起点都归零。"""
@@ -118,9 +136,12 @@ class TestProbeDecision(unittest.TestCase):
         h.ctx.align_at = time.monotonic() - (G.ALIGN_STALE + 1)
         h.ctx.align_md5 = "OLD"
         h.ctx.align_tried = 2
-        self.assertEqual(h._probe_decision("NEW"), "give_up")
+        self.assertEqual(h._probe_decision("NEW"), "wait")
         self.assertEqual(h.ctx.align_at, 0.0, "过期认输后丢失时刻要清掉")
         self.assertEqual(h.ctx.align_md5, "")
+        # 过期后先请手机回底；回底那一帧才重建（2026-10-29）
+        h.ctx.frame_reason = "probe-bottom"
+        self.assertEqual(h._probe_decision("NEW1"), "give_up")
         # 清干净之后，锚点再对不上应从 probe 重新开始，而不是再 give_up
         self.assertEqual(h._probe_decision("NEW2"), "probe")
 

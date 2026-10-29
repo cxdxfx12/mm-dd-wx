@@ -174,6 +174,19 @@ def _attach_re(keys: list) -> "re.Pattern":
 PROBE_COOLDOWN = 1.2
 PROBE_MAX = 14
 PROBE_SETTLE_MAX = 45.0
+# 「翻不动」判据：连续这么多轮试探拿到的**内容**一模一样，就认定翻不动。
+#
+# ⚠ 2026-10-29 真机（用户原话「老是锚点对不上」「不跳来回跳怎么找锚点呢」）：
+#   手机端的 scroll 指令语义是「上翻一屏 → 报帧 → **立刻翻回底部**」（长消息
+#   补全需要回位，否则基线错位）。锚点试探借用同一条指令的后果是：**每一轮
+#   都从底部出发、只能看到底部上方那同一屏**，位置根本不累积 —— 14 轮全在
+#   原地打转。日志实证：连续 40 帧字节数 180558/180567（同一屏），而 H5 卡片
+#   每重绘一次整批指纹都变、md5 也跟着变，于是「屏幕在动」判据永远成立，
+#   试探永不收敛（20:41–20:43 一口气 175 次）。
+#   修法：① 试探改走独立的 ``probe`` 指令（手机端**只上翻不回位**，位置累积），
+#   认输时再下发 ``to_bottom`` 一次性开回最新；② 判「翻没翻动」不看 md5，
+#   看**内容签名**（发送者+正文）—— H5 重绘骗不过它。
+PROBE_STUCK_MAX = 2
 # 试探状态的保质期（秒）。锚点丢失后如果长时间一帧都没来（灭屏、用户拿走
 # 手机、离开会话），上一轮的试探状态不该带到现在用：真机 2026-10-26 14:16
 # 试探额度用光挂在被动「等」上，之后 42 分钟没帧；14:58 爆发的第一帧一来
@@ -1150,6 +1163,27 @@ class _Ctx:
     # 第一次「等手机翻页安定」的时刻；0 = 当前不在等待中。
     # 有了它，一边翻一边来的中间态帧只会消耗「等待时间」而不会消耗试探次数。
     align_wait_since: float = 0.0
+    # 上一轮试探帧的**内容签名**（发送者+正文）。判「手机到底翻没翻动」只能
+    # 看它：md5 里混着坐标与 H5 重绘痕迹，同一屏也能每帧都不一样（2026-10-29
+    # 真机同一屏 40 帧、md5 每帧都变 → 试探永不收敛）。
+    align_sig: str = ""
+    # 连续多少轮拿到的内容一模一样（= 翻不动）。
+    align_stuck: int = 0
+    # 本帧要下发的「累积式上翻」轮次（0 = 不下发）。
+    # 与 scroll 刻意分开：scroll 是长消息补全（上翻一屏**再翻回底部**，位置
+    # 不累积）；probe 是锚点试探（上翻一屏**停在原地**，下一轮接着往上，位置
+    # 累积）。混用一条指令就是 2026-10-29 那个「来回跳、永远找不回」的根源。
+    want_probe: int = 0
+    # 要下发「回到底部（最新）」。试探认输后先把视口开回最新处再重建基线，
+    # 否则基线建在历史中间，下面到达的新消息一条都看不见。
+    want_bottom: bool = False
+    # 已经请求过回底，等手机滚到底送来的那一帧：直接重建基线，不再试探。
+    await_bottom: bool = False
+    # 请求回底的时刻（monotonic）。手机没手势权限时回不来，靠它兜底就地重建。
+    await_bottom_at: float = 0.0
+    # 本帧的上报原因（X-Ddwx-Reason）。认「回底那一帧」（probe-bottom）只能靠它：
+    # 回底后的画面和历史中间那一屏在节点树里长得一样，没法从内容上分辨。
+    frame_reason: str = ""
     # 最近一帧「锚点健康」的画面单元（普通帧 / 基线帧 commit 后更新；
     # 补全帧不动它 —— 那是滚到半空的一帧，不代表会话底部）。
     # 基线重建前的打捞（_salvage_rebuild）拿它当参照系：当前帧与它有
@@ -1975,6 +2009,10 @@ class _Handler(BaseHTTPRequestHandler):
             note = ""
             scroll = False
             if self.ctx.parse and self.ctx.on_message is not None:
+                # 手机端自报的帧原因（tick / scroll-fill / probe-fill /
+                # probe-bottom …）。「回到底部」那一帧只能靠它认出来 ——
+                # 回底后的画面和历史中间那一屏在节点树里长得一模一样。
+                self.ctx.frame_reason = screen["reason"]
                 # 手机端上翻补全后重报的那一帧会带 reason=scroll-fill。
                 # 它必须走另一套判定 —— 见 _ingest 里的说明。
                 pending, note, scroll = self._ingest(
@@ -2042,6 +2080,17 @@ class _Handler(BaseHTTPRequestHandler):
             # 手机端见 android/.../CollectorService.maybeFillTruncated。
             if scroll:
                 body["scroll"] = True
+            # 锚点试探的另一条指令：**往上翻一屏、停在原地**（位置累积），
+            # 下一轮接着往上。与 scroll 分开是刻意的 —— scroll 会翻回底部，
+            # 位置不累积，拿来找锚点等于原地打转（2026-10-29 真机 175 次空翻）。
+            if self.ctx.want_probe:
+                body["probe"] = self.ctx.want_probe
+                self.ctx.want_probe = 0
+            # 试探认输 / 状态过期：先请手机把视口开回最新处，再拿那一帧重建
+            # 基线。不回底就重建 = 基线建在历史中间，下面的新消息永远看不见。
+            if self.ctx.want_bottom:
+                body["to_bottom"] = 1
+                self.ctx.want_bottom = False
             # 附件抓取指令：新消息里出现「附件：xxx」→ 请手机点它、等下载、
             # 把文件传回 /file。冷却期内同名不再下（卡片重渲染会反复出现）。
             # 放在 parse 块里：只解析不转的模式没有消息概念，也没有附件可言。
@@ -2229,7 +2278,8 @@ class _Handler(BaseHTTPRequestHandler):
                 # H5 帧的锚点丢失同样先试探一次（理由同下面原生帧那处）。
                 # **必须在 commit 之前**：commit 会把锚点覆盖成当前这屏，
                 # 覆盖之后就再也对不上了，试探也就白翻了。
-                verdict = self._probe_decision(frame_md5)
+                verdict = self._probe_decision(frame_md5,
+                                               self._frame_sig(frame.units))
                 if verdict == "wait":
                     # ⚠ 绝不能落到下面的 commit：commit 会把锚点覆盖成当前
                     #   这屏，之后翻回去也对不上了。
@@ -2237,9 +2287,12 @@ class _Handler(BaseHTTPRequestHandler):
                 if verdict == "probe":
                     self.ctx.align_md5 = frame_md5
                     log.warning("安卓画面解析：H5 卡片的锚点对不上 —— "
-                                "已请手机翻一屏试着找回（第 %d 次）",
+                                "已请手机往上翻一屏（累积第 %d 次，不回到原位）",
                                 self.ctx.align_tried)
-                    return [], "锚点丢失，翻一屏找", True
+                    # 第三位刻意是 False：翻页指令走 body["probe"]，
+                    # **不是** body["scroll"]（scroll 是「翻上去再翻回来」，
+                    # 位置不累积，用来找锚点等于原地打转）。
+                    return [], "锚点丢失，往上翻一屏找", False
             differ.commit(frame.units)
             self.ctx.last_good_units = list(frame.units)
             if diff.baseline:
@@ -2328,7 +2381,7 @@ class _Handler(BaseHTTPRequestHandler):
             # 翻历史或者换了群，那就重建基线、不再纠缠 —— 否则手机会在
             # 「翻上去、翻回来」之间无限来回。
             md5 = frame_md5
-            verdict = self._probe_decision(md5)
+            verdict = self._probe_decision(md5, self._frame_sig(frame.units))
             if verdict == "wait":
                 # 手机正在翻（或屏幕还没安定）：什么都不动，等下一帧。
                 # 不 commit 是关键 —— 锚点留着，翻回去才可能对上。
@@ -2337,9 +2390,10 @@ class _Handler(BaseHTTPRequestHandler):
                 # 试探时不 commit —— 锚点必须留着，否则翻回来也对不上
                 self.ctx.align_md5 = md5
                 log.warning("安卓画面解析：上一帧的锚点在本帧里找不到 —— "
-                            "已请手机翻一屏试着找回（第 %d 次）",
+                            "已请手机往上翻一屏（累积第 %d 次，不回到原位）",
                             self.ctx.align_tried)
-                return [], "锚点丢失，翻一屏找", True
+                # 同 H5 分支：走 body["probe"]，不走 body["scroll"]。
+                return [], "锚点丢失，往上翻一屏找", False
             differ.commit(frame.units)          # 认输了，基线重建到当前画面
             self.ctx.last_good_units = list(frame.units)
             log.warning("安卓画面解析：上一帧的锚点在本帧里找不到（翻历史／换群／"
@@ -2605,56 +2659,118 @@ class _Handler(BaseHTTPRequestHandler):
                         "%d 条疑似新消息（交攒齐层去重）", len(kept))
         return kept
 
-    def _probe_decision(self, frame_md5: str) -> str:
+    @staticmethod
+    def _frame_sig(units) -> str:
+        """一帧的**内容签名**：发送者 + 正文的指纹。
+
+        为什么不直接用帧 md5：md5 里混着节点坐标、H5 卡片的重绘痕迹、时间戳
+        渲染差异 —— 同一屏内容也能每帧都不一样。2026-10-29 真机就是这么栽的：
+        手机在 H5 卡片中间反复上翻，40 帧的字节数都是 180558/180567（同一屏），
+        但 md5 每帧都变，于是「屏幕在动 → 继续翻」判据永远成立，一口气探了
+        175 次，锚点一次也没找回。内容签名只由「谁说了什么」决定，重绘骗不过。
+        """
+        h = hashlib.md5()
+        for u in units or []:
+            h.update((getattr(u, "sender", "") or "").encode("utf-8", "replace"))
+            h.update(b"\x1f")
+            h.update((getattr(u, "content", "") or "").encode("utf-8", "replace"))
+            h.update(b"\x1e")
+        return h.hexdigest()
+
+    def _probe_decision(self, frame_md5: str, sig: str = "") -> str:
         """锚点对不上时怎么处置：``probe`` / ``wait`` / ``give_up``。
 
-        - ``probe``   请手机翻一屏（调用方要还原样把指令带出去）；
+        - ``probe``   请手机**往上翻一屏并停在原地**（累积，位置不还原）；
         - ``wait``    **什么都不做**：既不 commit、也不发指令，等下一帧；
-        - ``give_up`` 认输，调用方 commit 重建基线。
+        - ``give_up`` 认输，调用方 commit 重建基线（并已请求手机回到底部）。
 
         ⚠ 「等」必须是独立状态。旧实现只有「翻」和「认输」两态，冷却期内
           来的新帧（手机刚翻完送回的第一帧，恰好落在冷却期里）被直接判成
           认输 —— 长卡片挤掉锚点的那种漏转就是这么来的。屏幕变了 ≠ 手机
           没在翻，恰恰相反，它说明手机正在翻。
 
+        ⚠ 判「翻没翻动」看**内容签名**而不是 md5：H5 卡片每重绘一次整批指纹
+          都变，md5 跟着变，于是「屏幕在动」永远成立、试探永远不收敛
+          （2026-10-29 真机：同一屏 40 帧、连续 175 次试探）。内容签名由
+          发送者+正文算出，重绘骗不过它。
+
         判据顺序：
+          · 已请求回底（``await_bottom``）→ give_up（这一帧就是从最新处来的）；
+          · 试探状态过期（ALIGN_STALE）→ give_up；
           · 冷却期内 → wait（翻页还没安定，中间态帧没有判断价值）；
+          · 内容跟上轮一模一样且累计到 PROBE_STUCK_MAX → give_up（翻不动）；
           · md5 跟上一次试探帧一样 → wait（屏幕一动没动，再发指令也是同一屏）；
           · 一轮翻到 ``PROBE_MAX`` → give_up；
           · 等待累计超过 ``PROBE_SETTLE_MAX`` → give_up（手机没响应/卡死兜底）；
           · 其余 → probe。
         """
         now = time.monotonic()
+        if self.ctx.await_bottom:
+            # 已经请手机「回到底部」了。**只有回底那一帧**才重建基线：
+            # 视口还停在历史中间时就地重建 = 把历史当成新起点，下面到达的
+            # 新消息永远看不见（只能等 15 分钟一轮的巡检来拉）。
+            came_from_bottom = self.ctx.frame_reason == "probe-bottom"
+            waited = now - self.ctx.await_bottom_at
+            if came_from_bottom:
+                log.info("安卓画面解析：手机已回到底部，基线重建到最新这一屏")
+                self._reset_probe()
+                return "give_up"
+            if waited >= PROBE_SETTLE_MAX:
+                log.warning("安卓画面解析：请手机回到底部后 %.0f 秒没等到回底帧"
+                            "（多半没有手势权限）—— 就地重建基线", waited)
+                self._reset_probe()
+                return "give_up"
+            return "wait"       # 还在往回滚的路上，先别动基线
         # ⚠ 试探状态会过期（见 ALIGN_STALE 注释）。过期不再翻页：锚点早已
-        #   远在好几屏之外，翻了也翻不回；直接 give_up，让调用方走
-        #   「重建基线 + 打捞」。不清这条的话，挂了 42 分钟的旧额度会在
-        #   爆发的第一帧上瞬间判 give_up，连一次翻页救援都没有。
+        #   远在好几屏之外，翻了也翻不回；直接请手机回底，拿最新那一帧重建。
         if self.ctx.align_at and (now - self.ctx.align_at) > ALIGN_STALE:
             log.warning("安卓画面解析：锚点丢失的试探状态已挂了 %.0f 秒"
-                        "（期间没有新帧）—— 不再翻页，重建基线并打捞",
+                        "（期间没有新帧）—— 不再翻页，回到底部重建基线并打捞",
                         now - self.ctx.align_at)
-            self._reset_probe()
             self.ctx.align_stale_gave_up = True
-            return "give_up"
+            self._ask_bottom()
+            return "wait"
         settled = (now - self.ctx.align_at) >= PROBE_COOLDOWN
         moved = bool(frame_md5) and frame_md5 != self.ctx.align_md5
+        same_content = bool(sig) and sig == self.ctx.align_sig
+        self.ctx.align_stuck = (self.ctx.align_stuck + 1) if same_content else 0
 
-        if not settled or not moved:
-            return self._wait_or_give_up(now, "翻页还没安定" if not settled
-                                         else "屏幕没有再变化")
+        if not settled:
+            return self._wait_or_give_up(now, "翻页还没安定")
+        if same_content and self.ctx.align_stuck > PROBE_STUCK_MAX:
+            log.warning("安卓画面解析：连翻 %d 轮，屏上内容一个字没变 —— "
+                        "翻不动了（已到列表顶／H5 卡片吃掉了滑动），"
+                        "回到底部重建基线", self.ctx.align_stuck)
+            self._ask_bottom()
+            return "wait"
+        if not moved:
+            return self._wait_or_give_up(now, "屏幕没有再变化")
 
         if self.ctx.align_tried >= PROBE_MAX:
             log.warning("安卓画面解析：一轮翻了 %d 次都没找回锚点 —— "
-                        "多半是在翻历史或换了群，不再试探，重建基线",
+                        "多半是在翻历史或换了群，不再试探，回到底部重建基线",
                         self.ctx.align_tried)
-            self._reset_probe()             # 一轮结束：额度留到下一轮
-            self.ctx.align_stale_gave_up = False
-            return "give_up"
+            self._ask_bottom()
+            return "wait"
 
         self.ctx.align_tried += 1
         self.ctx.align_at = now
+        self.ctx.align_sig = sig
+        self.ctx.want_probe = self.ctx.align_tried
         self.ctx.align_wait_since = 0.0     # 新一轮翻页，等待重新计时
         return "probe"
+
+    def _ask_bottom(self) -> None:
+        """试探认输：请手机回到底部（最新），下一帧再重建基线。
+
+        为什么必须回底：视口如果停在某张 H5 卡片中间，就地重建基线等于把
+        「历史中间那一屏」当成新起点 —— 下面到达的新消息永远看不见，只能等
+        15 分钟一轮的巡检来拉。先开回最新再建基线，才是「恢复到能继续采」。
+        """
+        self._reset_probe()                 # 先清（它会把 await_bottom 置回 False）
+        self.ctx.want_bottom = True
+        self.ctx.await_bottom = True
+        self.ctx.await_bottom_at = time.monotonic()
 
     def _wait_or_give_up(self, now: float, why: str) -> str:
         """进入/继续「等」，等超时就认输。"""
@@ -2665,10 +2781,9 @@ class _Handler(BaseHTTPRequestHandler):
         waited = now - self.ctx.align_wait_since
         if waited >= PROBE_SETTLE_MAX:
             log.warning("安卓画面解析：等了 %.0f 秒锚点仍未找回（%s）—— "
-                        "不再等，重建基线", waited, why)
-            self._reset_probe()
-            self.ctx.align_stale_gave_up = False
-            return "give_up"
+                        "不再等，回到底部重建基线", waited, why)
+            self._ask_bottom()
+            return "wait"
         return "wait"
 
     def _reset_probe(self) -> None:
@@ -2683,6 +2798,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.ctx.align_tried = 0
         self.ctx.align_at = 0.0
         self.ctx.align_md5 = ""
+        self.ctx.align_sig = ""
+        self.ctx.align_stuck = 0
+        # 「等回底」是一次性的：重建基线之后视口就在最新处，标志必须清掉，
+        # 否则之后每帧锚点丢失都会被判成「已回底」直接重建、再也不试探。
+        self.ctx.await_bottom = False
 
     def _ingest_fill(self, frame) -> tuple[list, str, bool]:
         """上翻补全帧：把「锚点上方、此前没见过」的内容挑出来。
@@ -2714,10 +2834,11 @@ class _Handler(BaseHTTPRequestHandler):
             # 不转发、也不动基线，等手机翻回来。
             return [], "补全帧对不上锚点，跳过", False
 
-        # 锚点找到了 = 试探成功（或者只是普通补全）。清零试探计数：下次真
-        # 遇到「长消息挤掉锚点」时还有翻一屏的机会。
-        if self.ctx.align_tried:
-            self.ctx.align_tried = 0
+        # ⚠ 这里原来有一句「锚点找到了就 align_tried = 0」。它只清计数、不清
+        #   align_at/align_md5，结果是：补全帧一来就把额度归零，主帧下一轮又
+        #   从 0 开始 → 日志永远是「第 1 次」，PROBE_MAX 形同虚设。清试探状态
+        #   只走 _reset_probe()（锚点确实恢复、或认输重建时），不在补全路径里
+        #   做半套。
 
         # 两边都要看，因为「上翻一屏」在两个方向上都可能是漏消息的现场：
         #

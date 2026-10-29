@@ -810,11 +810,13 @@ class TestScreenParse(GatewayCase):
                 f'package="{self.PKG}" scrollable="true" bounds="[0,200][1080,2100]">'
                 f'{body}</node>{bar}</node></hierarchy>')
 
-    def post_frame(self, xml: str):
+    def post_frame(self, xml: str, reason: str = ""):
         req = urllib.request.Request(self.url("/screen"), data=xml.encode("utf-8"),
                                      method="POST")
         req.add_header("X-Bridge-Token", self.token)
         req.add_header("Content-Type", "text/plain; charset=utf-8")
+        if reason:
+            req.add_header("X-Ddwx-Reason", reason)
         with urllib.request.urlopen(req, timeout=5) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
@@ -862,7 +864,11 @@ class TestScreenParse(GatewayCase):
         body = self.post_frame(self.screen(
             self.row("第一条", 300), self.row("第二条", 500), self.row("第三条", 700)))
         self.assertEqual(body["messages"], 0)
-        self.assertEqual(body["note"], "锚点丢失，翻一屏找")
+        # 2026-10-29：锚点试探改走 probe（只上翻、不回位），不再用 scroll
+        # （scroll 会翻回底部，位置不累积，找锚点等于原地打转）。
+        self.assertEqual(body["note"], "锚点丢失，往上翻一屏找")
+        self.assertEqual(body["probe"], 1)
+        self.assertNotIn("scroll", body)
         self.assertEqual(self.received, [])
 
     def test_broken_xml_returns_200_not_error(self):
@@ -937,12 +943,14 @@ class TestScreenParse(GatewayCase):
     # 翻回来锚点对上了，刚才漏的那条就能补出来。
 
     def test_anchor_lost_asks_phone_to_scroll_before_giving_up(self):
-        """锚点对不上时不能直接重建基线 —— 要先让手机翻一屏。"""
+        """锚点对不上时不能直接重建基线 —— 要先让手机往上翻一屏。"""
         self.post_frame(self.screen(self.row("旧消息A", 400)))
         body = self.post_frame(self.screen(
             self.row("历史1", 300), self.row("历史2", 600)))
-        self.assertTrue(body.get("scroll"), "锚点丢失却没说让手机翻一屏")
-        self.assertEqual(body["note"], "锚点丢失，翻一屏找")
+        # 2026-10-29：指令是 probe（只上翻、不回位），不是 scroll。
+        self.assertEqual(body.get("probe"), 1, "锚点丢失却没让手机往上翻")
+        self.assertNotIn("scroll", body, "scroll 会翻回底部，位置不累积")
+        self.assertEqual(body["note"], "锚点丢失，往上翻一屏找")
         self.assertEqual(self.received, [])
 
     def test_probe_hit_recovers_the_swallowed_message(self):
@@ -958,7 +966,7 @@ class TestScreenParse(GatewayCase):
         b1 = self.post_frame(self.screen(
             self.row("新消息B", 500, "签收跟单专员"),
             self.long_row("履约跟单专员", 700, 3200)))
-        self.assertIn(b1["note"], ("锚点丢失，翻一屏找", ""))
+        self.assertIn(b1["note"], ("锚点丢失，往上翻一屏找", ""))
         self.assertNotIn("新消息B", [m.content for m in self.received])
 
         # 手机翻一屏：旧消息A 重新露出，B 也在，长消息退到下面
@@ -988,7 +996,7 @@ class TestScreenParse(GatewayCase):
         self.assertEqual(self.received[-1].content, "新消息C")
 
     def test_second_miss_gives_up_and_rebuilds_baseline(self):
-        """翻满一轮还对不上（真在翻历史）→ 认输重建，别让手机来回翻。
+        """翻满一轮还对不上（真在翻历史）→ 请手机回底，在**最新处**重建基线。
 
         不认输的后果是手机在「翻上去、翻回来」之间无限循环，一条都不转发，
         表现和「锚点永久卡死」一模一样。
@@ -996,19 +1004,30 @@ class TestScreenParse(GatewayCase):
         ⚠ 2026-10-19：冷却期现在只表示「等手机翻完」，不再表示「认输」，
           所以不能再靠「同一屏连报两次」逼出认输（第二次会被判 wait）。
           这里直接把翻页额度置满，模拟「手机已经连着翻了几屏都没找回锚点」。
+
+        ⚠ 2026-10-29：认输不再「就地重建」—— 视口可能正停在某张 H5 卡片
+          中间，就地重建等于把历史当新起点，下面到达的新消息永远看不见。
+          改成先下发 ``to_bottom``，等手机回底那一帧（reason=probe-bottom）
+          再重建；那一帧之前一条历史都不许发。
         """
         self.post_frame(self.screen(self.row("旧消息A", 400)))
         b1 = self.post_frame(self.screen(self.row("历史1", 300),
                                          self.row("历史2", 600)))
-        self.assertTrue(b1.get("scroll"))
+        self.assertEqual(b1.get("probe"), 1)
         # 额度用光 + 冷却期已过 → 再对不上就是真的找不回来了
         self.source._ctx.align_tried = PROBE_MAX
         self.source._ctx.align_at = time.monotonic() - (PROBE_COOLDOWN + 0.1)
         b3 = self.post_frame(self.screen(self.row("更早的历史1", 300),
                                          self.row("更早的历史2", 600)))
-        self.assertNotIn("scroll", b3)
-        self.assertEqual(b3["note"], "锚点丢失")
-        self.assertEqual(self.received, [])
+        self.assertNotIn("probe", b3, "额度用光不许再翻")
+        self.assertEqual(b3.get("to_bottom"), 1, "认输要请手机回到底部")
+        self.assertEqual(self.received, [], "历史消息一条都不许发")
+        # 手机回到底部后送来的那一帧：基线重建到最新处（这才是新起点）
+        b3b = self.post_frame(self.screen(self.row("更早的历史1", 300),
+                                          self.row("更早的历史2", 600)),
+                              reason="probe-bottom")
+        self.assertEqual(b3b["note"], "锚点丢失")
+        self.assertNotIn("to_bottom", b3b, "回底只许请一次")
         # 基线已重建：此后新消息恢复转发
         b4 = self.post_frame(self.screen(self.row("更早的历史1", 300),
                                          self.row("其实很新的消息", 900)))
@@ -1016,18 +1035,40 @@ class TestScreenParse(GatewayCase):
         self.settle()
         self.assertEqual(self.received[-1].content, "其实很新的消息")
 
+    def test_bottom_frame_is_not_rebuilt_while_still_scrolling(self):
+        """还没回到最新（reason 不是 probe-bottom）时，绝不许就地重建基线。
+
+        就地重建的后果是把历史中间那一屏当新起点 —— 下面到达的新消息一条都
+        看不见，只能等 15 分钟一轮的巡检来拉（2026-10-29 真机现场）。
+        """
+        self.post_frame(self.screen(self.row("旧消息A", 400)))
+        self.post_frame(self.screen(self.row("历史1", 300), self.row("历史2", 600)))
+        self.source._ctx.align_tried = PROBE_MAX
+        self.source._ctx.align_at = time.monotonic() - (PROBE_COOLDOWN + 0.1)
+        b3 = self.post_frame(self.screen(self.row("更早的历史1", 300),
+                                         self.row("更早的历史2", 600)))
+        self.assertEqual(b3.get("to_bottom"), 1)
+        # 回底路上又来一帧（tick）：不 commit、不发消息
+        b4 = self.post_frame(self.screen(self.row("更早的历史1", 300),
+                                         self.row("更早的历史3", 800)),
+                             reason="tick")
+        self.assertEqual(b4["messages"], 0)
+        self.assertEqual(self.received, [])
+        self.assertTrue(self.source._ctx.await_bottom, "还在等回底那一帧")
+
     def test_probe_is_not_repeated_for_the_same_frame(self):
         """同一屏连报两次只翻一次 —— 手机原地没动，再翻是白折腾。"""
         self.post_frame(self.screen(self.row("旧消息A", 400)))
         same = self.screen(self.row("历史1", 300), self.row("历史2", 600))
-        self.assertTrue(self.post_frame(same).get("scroll"))
-        self.assertNotIn("scroll", self.post_frame(same))
+        self.assertEqual(self.post_frame(same).get("probe"), 1)
+        self.assertNotIn("probe", self.post_frame(same))
 
     def test_probe_does_not_fire_on_baseline_frame(self):
         """建基线时不许翻：刚记下的基线会被自己翻脏。"""
         body = self.post_frame(self.screen(self.row("第一条", 400)))
         self.assertEqual(body["note"], "已建立基线")
         self.assertNotIn("scroll", body)
+        self.assertNotIn("probe", body)
 
     # ---- 新卡片长在锚点**上方** ----------------------------------------
     #
@@ -1397,14 +1438,18 @@ class TestScreenParse(GatewayCase):
             self.row("完全不认识的内容1", 400, "路人甲"),
             self.row("完全不认识的内容2", 700, "路人乙"))
         first_lost = self.post_frame(lost)
-        self.assertTrue(first_lost.get("scroll"), "第一次丢锚点应当先试探")
+        self.assertEqual(first_lost.get("probe"), 1, "第一次丢锚点应当先试探")
         # 把这一轮的翻页额度用光（真机上就是连着翻了几屏都没找回锚点），
-        # 再喂一帧新的、仍对不上的画面，才会走到「认输重建」分支。
+        # 再喂一帧新的、仍对不上的画面，才会走到「认输」分支。
         # ⚠ 不能靠「同一帧连报两次」逼认输 —— 同帧现在判「等」，不认输。
         self.source._ctx.align_tried = PROBE_MAX
         self.source._ctx.align_at = time.monotonic() - (PROBE_COOLDOWN + 0.1)
-        second_lost = self.post_frame(self.screen(
+        self.post_frame(self.screen(
             self.row("完全不认识的内容3", 400, "路人丙")))
+        # 认输后先请手机回到底部（2026-10-29），回底那一帧才重建基线 ——
+        # 攒着的长消息就在这一步投出去，不能被「锚点对不上」连带作废。
+        second_lost = self.post_frame(self.screen(
+            self.row("完全不认识的内容3", 400, "路人丙")), reason="probe-bottom")
 
         self.settle()
         self.assertEqual(len(self.received), 1,

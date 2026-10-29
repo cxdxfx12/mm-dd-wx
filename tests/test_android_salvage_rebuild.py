@@ -49,7 +49,13 @@ def frame_of(units):
 
 
 class TestStaleGiveUp(unittest.TestCase):
-    """试探状态过期 → 不再翻页、直接 give_up，并允许打捞。"""
+    """试探状态过期 → 不再翻页、先请手机回底，回底那一帧再重建并允许打捞。
+
+    ⚠ 2026-10-29：过期/额度用完/等超时这几种「认输」不再直接 commit（视口可能
+      正停在历史中间，就地重建＝把历史当新起点），而是先下发 ``to_bottom``、
+      返回 ``wait``；真正 commit 发生在手机回底那一帧（reason=probe-bottom）。
+      所以下面断言的是 ``wait`` + ``want_bottom`` + ``await_bottom``。
+    """
 
     def test_stale_state_gives_up_without_probing(self):
         """挂了 42 分钟的旧额度不能带到现在用（缺陷 ① 的立身之本）。"""
@@ -57,9 +63,13 @@ class TestStaleGiveUp(unittest.TestCase):
         h.ctx.align_at = time.monotonic() - 2520.0     # 42 分钟
         h.ctx.align_md5 = "AAA"
         h.ctx.align_tried = 3
-        self.assertEqual(h._probe_decision("BBB"), "give_up")
-        self.assertTrue(h.ctx.align_stale_gave_up, "过期触发的 give_up 才许打捞")
+        self.assertEqual(h._probe_decision("BBB"), "wait")
+        self.assertTrue(h.ctx.align_stale_gave_up, "过期触发的重建才许打捞")
         self.assertEqual(h.ctx.align_tried, 0, "状态要清掉")
+        self.assertTrue(h.ctx.await_bottom, "要请手机回到底部")
+        # 回底那一帧到了才真正 commit
+        h.ctx.frame_reason = "probe-bottom"
+        self.assertEqual(h._probe_decision("CCC"), "give_up")
 
     def test_budget_exhausted_is_not_stale(self):
         """活跃翻满额度触发的 give_up **不许**打捞（翻历史保护）。"""
@@ -67,7 +77,7 @@ class TestStaleGiveUp(unittest.TestCase):
         h.ctx.align_at = time.monotonic() - 5.0
         h.ctx.align_md5 = "AAA"
         h.ctx.align_tried = G.PROBE_MAX
-        self.assertEqual(h._probe_decision("BBB"), "give_up")
+        self.assertEqual(h._probe_decision("BBB"), "wait")
         self.assertFalse(h.ctx.align_stale_gave_up)
 
     def test_wait_timeout_is_not_stale(self):
@@ -76,7 +86,7 @@ class TestStaleGiveUp(unittest.TestCase):
         h.ctx.align_at = time.monotonic() - 0.3
         h.ctx.align_md5 = "AAA"
         h.ctx.align_wait_since = time.monotonic() - (G.PROBE_SETTLE_MAX + 1)
-        self.assertEqual(h._probe_decision("BBB"), "give_up")
+        self.assertEqual(h._probe_decision("BBB"), "wait")
         self.assertFalse(h.ctx.align_stale_gave_up)
 
     def test_never_probed_is_not_stale(self):

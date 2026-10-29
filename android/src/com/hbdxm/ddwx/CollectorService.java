@@ -776,6 +776,8 @@ public class CollectorService extends AccessibilityService {
             Log.i(TAG, "上报成功 #" + posts + " 文本 " + tree.texts.size()
                     + " 字节 " + xml.length());
             maybeFillTruncated(r.body, token);
+            maybeProbeScroll(r.body, token);
+            maybeScrollBottom(r.body, token);
             maybeApplyWatch(r.body);
             maybeFetchAttachment(r.body, token);
             // ⚠ 每一帧都看有没有「立刻切群」指令，不只在心跳里看：
@@ -1043,6 +1045,80 @@ public class CollectorService extends AccessibilityService {
         t.setName("ddwx-hold");
         t.setDaemon(true);
         t.start();
+    }
+
+    // ------------------------------------------------------------ 锚点试探指令
+
+    /** 正在执行「往上翻一屏找锚点 / 回到底部」。防同一条指令被连执行两次。 */
+    private final AtomicBoolean probing = new AtomicBoolean(false);
+
+    /**
+     * 电脑侧说「锚点对不上，往上翻一屏」—— 指令 {@code probe: N}。
+     *
+     * <p>与 {@link #maybeFillTruncated} 的 {@code scroll} <b>刻意分开</b>：
+     * scroll 是长消息补全，往上翻一屏、报帧、<b>再翻回底部</b>（不回位基线就
+     * 错位）；拿它做锚点试探的后果是<b>每轮都从底部出发</b>，只能看到底部上方
+     * 那同一屏，翻 14 次等于翻 1 次 —— 2026-10-29 真机就这么空翻 175 次，
+     * 用户的原话是「不跳来回跳怎么找锚点呢」。
+     *
+     * <p>所以这里<b>只往上翻、不回位</b>：第 1 轮到底部上方 1 屏、第 2 轮再往上
+     * 1 屏……位置累积，才真的能翻到锚点所在那一屏。收尾由电脑侧下发
+     * {@code to_bottom} 一次性开回最新处。
+     */
+    private void maybeProbeScroll(String resp, String token) {
+        if (jsonInt(resp, "probe", 0) <= 0) {
+            return;
+        }
+        if (!probing.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            AccessibilityNodeInfo root = safeRoot();
+            AccessibilityNodeInfo list = root == null ? null : findScrollable(root);
+            if (list == null) {
+                lastResult += " ｜ 想往上翻找锚点，但没找到可滚动区域";
+                return;
+            }
+            if (!Scroller.canSwipe(this)) {
+                lastResult += " ｜ 系统不支持注入手势，锚点找不回来";
+                return;
+            }
+            // up=false：手指往下划 = 内容往回走 = 露出更早的消息。
+            if (!Scroller.swipe(this, list, false)) {
+                lastResult += " ｜ 锚点试探滑动被系统拒绝";
+                return;
+            }
+            Scroller.settle();
+            lastResult += " ｜ 已往上翻一屏找锚点（原地不回位）";
+            postCurrentFrame(token, "probe-fill");
+        } finally {
+            probing.set(false);
+        }
+    }
+
+    /**
+     * 电脑侧说「回到底部（最新）」—— 指令 {@code to_bottom: 1}。
+     *
+     * <p>锚点试探认输、或试探状态过期时下发：先把视口开回最新处，再让电脑侧
+     * 拿这一帧重建基线。不回底就重建 = 基线建在历史中间，之后到达的新消息
+     * 一条都看不见，只能等 15 分钟一轮的巡检来拉。
+     */
+    private void maybeScrollBottom(String resp, String token) {
+        if (jsonInt(resp, "to_bottom", 0) <= 0) {
+            return;
+        }
+        if (!probing.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            int rounds = SelfHeal.scrollChatToBottom(this);
+            Scroller.settle();
+            sentMd5 = "";          // 回底后画面必然变，清指纹让这一帧照常上报
+            lastResult += " ｜ 已回到底部（滚了 " + rounds + " 轮）";
+            postCurrentFrame(token, "probe-bottom");
+        } finally {
+            probing.set(false);
+        }
     }
 
     /** 从响应里抠 hold 的毫秒数，抠不到或离谱就用默认 800。 */
