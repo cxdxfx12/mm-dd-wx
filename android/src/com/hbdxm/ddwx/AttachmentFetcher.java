@@ -84,6 +84,31 @@ final class AttachmentFetcher {
             android.os.Build.VERSION.SDK_INT >= 30;
 
     /**
+     * 截图回调用的**常驻**线程池（0.5.34）。
+     *
+     * <p>{@code AccessibilityService.takeScreenshot} 的回调在调用方传入的
+     * Executor 上执行。0.5.33 及以前每次都现建一个
+     * {@code Executors.newSingleThreadExecutor()} 且从不 shutdown ——
+     * 抓一次附件可能截十几到几十屏（蓝字兜底、绿色下载按钮、精滚复核都调
+     * {@link #takeShot}），屏屏一个线程，线程数无上限地往上堆。线程栈默认按
+     * 1MB 估，几十屏就是几十 MB 虚拟内存，加上只增不减，跑久了必然
+     * OOM / 被 ROM 判定异常而收掉无障碍服务。
+     *
+     * <p>改成进程内复用一个：截图调用本来就串行（都在同一条抓取工作线程上），
+     * 一核足够，线程数恒为 1。daemon 是为了不拖住进程退出。
+     */
+    private static final java.util.concurrent.ExecutorService SHOT_POOL =
+            java.util.concurrent.Executors.newSingleThreadExecutor(
+                    new java.util.concurrent.ThreadFactory() {
+                        @Override
+                        public Thread newThread(Runnable r) {
+                            Thread t = new Thread(r, "ddwx-shot");
+                            t.setDaemon(true);
+                            return t;
+                        }
+                    });
+
+    /**
      * 颜色条带的门槛。真机 2026-11-01 实测（1176 宽）：
      *   · 蓝字「明细：普通件滞留催提AI代打明细」链接行 w=567、px≈7000 —— 通过；
      *   · 蓝字「复制」按钮 w=87、「内部群」标签 w=87 —— 被宽度挡掉；
@@ -1143,7 +1168,7 @@ final class AttachmentFetcher {
         final android.graphics.Bitmap[] out = new android.graphics.Bitmap[1];
         try {
             svc.takeScreenshot(android.view.Display.DEFAULT_DISPLAY,
-                    java.util.concurrent.Executors.newSingleThreadExecutor(),
+                    SHOT_POOL,
                     new AccessibilityService.TakeScreenshotCallback() {
                         @Override
                         public void onSuccess(

@@ -17,6 +17,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -123,6 +124,22 @@ public class CollectorService extends AccessibilityService {
      * 一次慢抓取（比如网络超时 12 秒）会把后续 tick 全排在它后面，定时就失去意义了。
      */
     private ExecutorService pool;
+    /**
+     * 兜底池（0.5.34）：定时器还没起来 / 刚被 stopTimer 拆掉时，抓取仍要能跑。
+     *
+     * <p>以前这里写的是「临时开一个池，抓完就关」，但代码里其实**没关** ——
+     * 每来一次就漏一条线程，且随时机重启累积。改成进程内一个常驻单线程：
+     * 它能干的事本来就是串行补一拍，不需要并发，也就没有泄漏一说。
+     */
+    private static final ExecutorService FALLBACK_POOL =
+            Executors.newSingleThreadExecutor(new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "ddwx-capture-fallback");
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
     private final AtomicBoolean busy = new AtomicBoolean(false);
 
     /**
@@ -132,6 +149,20 @@ public class CollectorService extends AccessibilityService {
      */
     private ScheduledExecutorService watchScheduler;
     private ScheduledFuture<?> watchTimer;
+    /**
+     * 巡检兜底池（0.5.34）：watchScheduler 还没建 / 刚被拆时，巡检仍要能跑一次。
+     * 与 {@link #FALLBACK_POOL} 同理 —— 以前这里是现建一个调度器且不 shutdown，
+     * 每走一次漏一条线程。改成常驻单线程，巡检本来就串行。
+     */
+    private static final ScheduledExecutorService FALLBACK_WATCH_POOL =
+            Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "ddwx-watch-fallback");
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
     private final AtomicBoolean watching = new AtomicBoolean(false);
 
     /** 本轮巡检开始的时刻（毫秒），0 = 没在跑。watching 卡死自救用。 */
@@ -474,7 +505,7 @@ public class CollectorService extends AccessibilityService {
         watchRunStartAt = nowMs;
         ScheduledExecutorService w = watchScheduler;
         if (w == null || w.isShutdown()) {
-            w = Executors.newSingleThreadScheduledExecutor();
+            w = FALLBACK_WATCH_POOL;
         }
         w.execute(new Runnable() {
             @Override
@@ -674,9 +705,9 @@ public class CollectorService extends AccessibilityService {
         }
         ExecutorService w = pool;
         if (w == null || w.isShutdown()) {
-            // 定时器还没起来（或刚被 restart 拆掉）时的兜底：临时开一个池，
-            // 抓完就关。宁可多建一个线程，也不能让「刚启动那一下」的抓取丢掉。
-            w = Executors.newSingleThreadExecutor();
+            // 定时器还没起来（或刚被 restart 拆掉）时的兜底：走常驻的单线程池。
+            // 宁可多排一拍，也不能让「刚启动那一下」的抓取丢掉。
+            w = FALLBACK_POOL;
         }
         w.execute(new Runnable() {
             @Override
