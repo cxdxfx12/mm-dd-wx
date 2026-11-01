@@ -56,3 +56,15 @@ appium-master/
 
 # 临时排障脚本与截图（不入库）
 tmpd/
+.tmp/
+
+# 手机端构建产物：每个版本 60KB 左右，由 android/build.py 重建即可，
+# 入库只会让每次发版都塞一个二进制进历史
+app/*.apk
+
+# 第三方 Android 工具（本地下载，合计 43MB，不入库）
+tools/platform-tools/
+tools/scrcpy-win64-v5.0.1/
+
+# 会话记忆与本地设置（工具生成，不属于工程内容）
+.workbuddy/
