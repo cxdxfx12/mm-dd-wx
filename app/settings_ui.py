@@ -171,7 +171,7 @@ def watch_minutes(label: str) -> int:
 # 默认值必须与 bridge/sources/android_gateway.DEFAULT_ATTACH_KEYS 一致
 # （tests/test_settings_attach_keys.py 里锁死了这一条）：那份是手机端和
 # 网关真正用的，这份只在界面上显示。
-DEFAULT_ATTACH_KEYS = ("附件：", "附件:")
+DEFAULT_ATTACH_KEYS = ("附件：", "附件:", "明细：", "明细:")
 
 
 def attach_keys_text(raw) -> str:

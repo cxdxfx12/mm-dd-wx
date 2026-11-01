@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import paths                                            # noqa: E402
+import phone_panel                                      # noqa: E402
 
 APP_DIR = paths.APP_DIR
 BASE_DIR = paths.BASE_DIR
@@ -163,8 +164,9 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1180x720")
-        self.minsize(1000, 620)
+        # 右侧多了一列「手机画面」面板（可在设置里关掉），默认宽度让出 340px
+        self.geometry("1520x780")
+        self.minsize(1180, 640)
         self.configure(bg=BG)
         self._set_taskbar_icon()
 
@@ -463,6 +465,7 @@ class App(tk.Tk):
         self.main_frame = main = tk.Frame(self, bg=BG)
         main.pack(fill="both", expand=True)
         main.columnconfigure(1, weight=1)
+        main.columnconfigure(2, weight=0)     # 手机画面列：固定宽，不抢日志的空间
         main.rowconfigure(0, weight=1)
 
         left_outer = tk.Frame(main, bg=BG)
@@ -535,7 +538,7 @@ class App(tk.Tk):
         # ---------------- 日志区 ----------------
         right = tk.Frame(main, bg=CARD, highlightbackground=BORDER,
                          highlightthickness=1)
-        right.grid(row=0, column=1, sticky="nsew", padx=(0, 14), pady=14)
+        right.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=14)
         head = tk.Frame(right, bg=CARD)
         head.pack(fill="x", padx=14, pady=(10, 6))
         tk.Label(head, text="运行日志", bg=CARD, fg=TEXT,
@@ -581,6 +584,21 @@ class App(tk.Tk):
 
         self.log_txt.bind("<Button-3>", _popup)
         self.log_txt.bind("<Control-c>", lambda e: self._copy_log_sel())
+
+        # ---------------- 手机画面（右侧第三列） ----------------
+        # 用 adb 截图取画面：screencap 是只读的，不抢无障碍通道，
+        # 和手机上的采集 App 可以同时跑（uiautomator dump 就会顶掉它）。
+        self.phone_panel = phone_panel.PhonePanel(
+            main,
+            adb_path=phone_panel.find_adb(),
+            colors=dict(bg=BG, card=CARD, border=BORDER, text=TEXT,
+                        muted=MUTED, accent=ACCENT, red=RED),
+            width=316,
+            interval=0.45,
+            on_log=self._log_phone,
+        )
+        self.phone_panel.grid(row=0, column=2, sticky="nsew",
+                              padx=(0, 14), pady=14)
 
         # ---------------- 工具栏 ----------------
         bar2 = tk.Frame(self, bg=CARD, highlightbackground=BORDER,
@@ -803,6 +821,10 @@ class App(tk.Tk):
             self._log_fh = path.open("a", encoding="utf-8", buffering=1)
         except Exception:
             self._log_fh = None
+
+    def _log_phone(self, text: str, tag: str = "tool") -> None:
+        """手机面板的日志要走主线程（它可能从后台线程调用）。"""
+        self.after(0, lambda: self._log(text, tag))
 
     def _log(self, text: str, tag: str = "info"):
         now = datetime.now().strftime("%H:%M:%S")
@@ -1958,6 +1980,11 @@ class App(tk.Tk):
     # ---------------- 关闭 ----------------
 
     def _on_close(self):
+        # 手机面板有后台线程在不停拉帧，先叫停，免得关窗时还在往画布上贴图
+        try:
+            self.phone_panel.stop()
+        except Exception:
+            pass
         # 不论在不在转发都要问一次：空闲时点「退出」原来是直接关窗，
         # 菜单里「退出」紧挨着「开始运行」，一不小心就点错，关了就没了。
         running = self.runner.alive()

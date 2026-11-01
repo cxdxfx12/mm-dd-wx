@@ -41,8 +41,11 @@ class TestAttachKeysText(unittest.TestCase):
         —— 也就是说它照常在抓。让人误以为关掉了，比不提供开关更糟。
         """
         for raw in ("", "  ", [], None, ",", "，，"):
+            # 期望值直接取界面默认常量：字眼以后再加，「多余空格」这类
+            # 逻辑不变，测试就不该跟着改一遍（之前在这条上白改过两次）。
             self.assertEqual(settings_ui.attach_keys_text(raw),
-                             "附件：,附件:", f"输入 {raw!r}")
+                             ",".join(settings_ui.DEFAULT_ATTACH_KEYS),
+                             f"输入 {raw!r}")
 
     def test_default_matches_gateway(self):
         """界面默认值必须与网关/手机端实际使用的默认值逐字相同。"""

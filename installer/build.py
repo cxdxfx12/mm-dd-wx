@@ -50,7 +50,14 @@ EXCLUDE_FILE_NAMES = {"_env.json"}       # 开发机的解释器缓存，不随�
 EXCLUDE_TOP = {"data", "installer", "dist", "build", ".workbuddy", ".git",
                "config.yaml", ".gitignore",
                "appium-master",          # 只用来参考，不参与运行
+               "tmpd",                   # 排障产物：截图、备份、一次性脚本（十几 MB）
                }
+
+# tools/ 下「不随包发」的子目录（按目录名，只在 tools 这一层匹配）。
+# tools/platform-tools 必须随包发（界面右侧手机画面靠它取帧、点击），
+# 但同一层里还躺着开发期的截图和备用的 scrcpy —— 合计 35 MB，用户一点都
+# 用不到，不进安装包。
+TOOLS_SKIP_DIRS = {"shots", "scrcpy-win64-v5.0.1"}
 
 WELCOME = r"""
 =============================================================
@@ -91,14 +98,17 @@ def want(p: Path) -> bool:
     return True
 
 
-def copy_tree(src: Path, dst: Path, top_excludes: set[str] | None = None
-              ) -> set[str]:
+def copy_tree(src: Path, dst: Path, top_excludes: set[str] | None = None,
+              skip_dirs: set[str] | None = None) -> set[str]:
     """复制目录（过滤缓存/垃圾文件），返回复制文件的相对路径集合。
 
     用 ``os.walk`` **逐层剪枝**，而不是 ``rglob`` 全量遍历后再过滤。
     区别很关键：``rglob`` 会继续钻进被排除的目录，再把里面的文件逐个搬过去，
     于是「排除 .git」只挡住了那个目录条目本身，对象库照样被完整复制
     （踩过：安装包被 .git 撑大，还会因 git 对象只读而报 PermissionError）。
+
+    ``skip_dirs`` 只在 ``src`` 的**第一层**生效（按目录名），用来剔掉
+    tools/ 下那些只对开发机有意义的子目录。
     """
     copied: set[str] = set()
     for dirpath, dirnames, filenames in os.walk(src):
@@ -108,7 +118,8 @@ def copy_tree(src: Path, dst: Path, top_excludes: set[str] | None = None
             dirnames[:] = []
             continue
         # 就地剪枝：这些子目录既不进入也不复制
-        dirnames[:] = [n for n in dirnames if n not in EXCLUDE_DIR_NAMES]
+        banned = EXCLUDE_DIR_NAMES | (skip_dirs if not rel_dir.parts and skip_dirs else set())
+        dirnames[:] = [n for n in dirnames if n not in banned]
         for name in filenames:
             p = d / name
             if not want(p):
@@ -156,7 +167,8 @@ def build_payload(app_exe: Path) -> Path:
             # 缺手势权限的版本 —— 长消息补全当场失效。源码本身留着（才几十 KB），
             # 出问题时能对着看。
             ex = {"dist"} if item.name == "android" else None
-            expected |= {f"{item.name}/{r}" for r in copy_tree(item, dst, ex)}
+            skip = TOOLS_SKIP_DIRS if item.name == "tools" else None
+            expected |= {f"{item.name}/{r}" for r in copy_tree(item, dst, ex, skip)}
         elif want(item):
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, dst)
