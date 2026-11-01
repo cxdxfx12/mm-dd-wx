@@ -114,9 +114,24 @@ class Storage:
             self._conn.commit()
             return cur.rowcount > 0
 
-    def is_duplicate(self, uid: str) -> bool:
+    def is_duplicate(self, uid: str, need_delivered: bool = False) -> bool:
+        """这条消息是不是「已经处理过了」。
+
+        ``need_delivered=True`` —— 入过库还不够，得**真的发出去过**才算重复。
+        2026-11-01 14:2x 实测踩到的坑：附件入库了、投递线程卡死没发出去，
+        之后手机重传同一份文件，网关按「文件已存在」判 duplicate、下游按
+        「uid 已入库」判重复，两头都把人挡住 —— 这条消息就永远发不出去了。
+        附件的 uid 是 ``attach-<sha1>``，同一份文件重传才会撞，加这道判据
+        等于「没发成功的可以重发，发成功过的不重复发」。
+        """
         with self._lock:
             cur = self._conn.execute("SELECT 1 FROM messages WHERE uid = ? LIMIT 1", (uid,))
+            if cur.fetchone() is None:
+                return False
+            if not need_delivered:
+                return True
+            cur = self._conn.execute(
+                "SELECT 1 FROM deliveries WHERE uid = ? AND status = 'ok' LIMIT 1", (uid,))
             return cur.fetchone() is not None
 
     def log_delivery(self, uid: str, target: str, status: str, error: str = "") -> None:

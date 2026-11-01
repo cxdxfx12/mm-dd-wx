@@ -116,14 +116,32 @@ class TestSweepRecent(unittest.TestCase):
         return G.Unit(sender=sender, content=content, ts=ts,
                       y0=500, y1=600, clipped_below=clipped_below)
 
-    def _frame(self, units):
-        return SimpleNamespace(units=units, view=(0, 200, 1080, 2100))
+    def _frame(self, units, hints=()):
+        return SimpleNamespace(units=units, view=(0, 200, 1080, 2100),
+                               hints=hints)
 
     def test_no_evidence_means_no_sweep(self):
         """屏上没有一条「见过」的 = 换了群/全新安装，一条都不能捞。"""
         h = self._h(known_uids=[])
         u = self._u("甲", "新消息", "今天 17:57")
         self.assertEqual(h._sweep_recent(self._frame([u])), [])
+
+    def test_ui_hints_substitute_for_evidence(self):
+        """没有任何已入库消息，但屏上有「不在最新处」特征（假底部）——
+        整屏都是打捞候选（2026-10-30 大江东漏消息的修复）。"""
+        now = datetime.now()
+        new = self._u("乙", "新的没见过", now.strftime("今天 %H:%M"))
+        h = self._h(known_uids=[])
+        swept = h._sweep_recent(
+            self._frame([new], hints=("99+未读徽标",)))
+        self.assertEqual([u.fp for u in swept], [new.fp])
+
+    def test_ui_hints_do_not_lift_age_guard(self):
+        """UI 特征只补「证据」，不放宽时间护栏：超龄的一律不捞。"""
+        stale = self._u("乙", "昨天的消息", "昨天 08:00")
+        h = self._h(known_uids=[])
+        self.assertEqual(h._sweep_recent(
+            self._frame([stale], hints=("查看更多/回到最新",))), [])
 
     def test_sweeps_unknown_recent_below_evidence(self):
         """证据之下的 30 分钟内新消息要捞出来 —— 这就是用户要的机制。"""
@@ -188,6 +206,122 @@ class TestAttachTimeout(unittest.TestCase):
         h.ctx.attach_orders["a.xlsx"] = time.monotonic() - 30
         G._attach_timeout_check(h.ctx)
         self.assertIn("a.xlsx", h.ctx.attach_orders)
+
+    def test_timeout_warning_carries_last_phone_status(self):
+        """告警要带手机端最后一句结论 —— 否则分不清「没收到」「点了没成」。"""
+        h = make_handler()
+        h.ctx.last_attach = "收到，这就去下载"
+        h.ctx.attach_orders["运单明细"] = \
+            time.monotonic() - (G.ATTACH_FETCH_TIMEOUT + 5)
+        with self.assertLogs(level="WARNING") as cm:
+            G._attach_timeout_check(h.ctx)
+        self.assertIn("收到，这就去下载", "\n".join(cm.output))
+
+    def test_attach_pending_exposes_waiting_orders(self):
+        """「下单了但没到」的订单要能在 /ping 上看到挂了多久（排查用）。"""
+        h = make_handler()
+        h.ctx.attach_orders["运单明细"] = time.monotonic() - 42
+        pending = G._attach_pending(h.ctx)
+        self.assertEqual(list(pending), ["运单明细"])
+        self.assertGreaterEqual(pending["运单明细"], 42)
+
+
+class TestUiHints(unittest.TestCase):
+    """「视口不在最新处」的 UI 特征识别（99+ 徽标 / 查看更多消息 / 回到最新）。"""
+
+    def _xml(self, *extra_nodes: str) -> str:
+        return frame_of(row_msg("甲", "普通消息", 300), *extra_nodes)
+
+    def test_badge_and_more_marker_detected(self):
+        f = parse_frame(self._xml(
+            '<node index="5" text="99+" class="android.widget.TextView" '
+            f'package="{PKG}" bounds="[500,900][560,940]"></node>',
+            '<node index="6" text="查看更多消息" class="android.widget.TextView" '
+            f'package="{PKG}" bounds="[400,1200][680,1260]"></node>',
+        ))
+        self.assertIn("99+未读徽标", f.hints)
+        self.assertIn("查看更多/回到最新", f.hints)
+        self.assertTrue(f.not_at_latest)
+
+    def test_text_inside_message_content_is_ignored(self):
+        """正文里恰好有「99+」/「查看更多消息」不能算屏上特征。"""
+        f = parse_frame(frame_of(
+            row_msg("甲", "本群已有 99+ 人，查看更多消息请联系管理员", 300),
+        ))
+        self.assertEqual(f.hints, ())
+        self.assertFalse(f.not_at_latest)
+
+    def test_bubble_with_exact_marker_text_is_ignored(self):
+        """有人真把「回到最新」当消息发出来（带发送者）也不能算特征。"""
+        f = parse_frame(frame_of(row_msg("甲", "回到最新", 300)))
+        self.assertEqual(f.hints, ())
+
+    def test_plain_chat_frame_has_no_hints(self):
+        f = parse_frame(self._xml())
+        self.assertEqual(f.hints, ())
+
+
+class TestFakeBottomGuard(unittest.TestCase):
+    """建基线前的「假底部」护栏（_guard_fake_bottom）。"""
+
+    def _h(self):
+        return make_handler()
+
+    def test_bails_and_asks_bottom_when_hints_present(self):
+        h = self._h()
+        frame = SimpleNamespace(units=[], hints=("99+未读徽标",))
+        self.assertTrue(h._guard_fake_bottom(frame))
+        self.assertTrue(h.ctx.want_bottom)       # 会向手机下发 to_bottom
+        self.assertTrue(h.ctx.await_bottom)
+
+    def test_second_frame_passes(self):
+        """已在等回底：不再拦（否则 H5 容器特征清不掉会死循环）。"""
+        h = self._h()
+        frame = SimpleNamespace(units=[], hints=("99+未读徽标",))
+        h._guard_fake_bottom(frame)
+        self.assertFalse(h._guard_fake_bottom(frame))
+        self.assertFalse(h.ctx.await_bottom)     # 标志一次性用掉
+
+    def test_bottom_frame_passes(self):
+        h = self._h()
+        h.ctx.frame_reason = "probe-bottom"
+        frame = SimpleNamespace(units=[], hints=("99+未读徽标",))
+        self.assertFalse(h._guard_fake_bottom(frame))
+
+    def test_no_hints_means_no_op(self):
+        h = self._h()
+        frame = SimpleNamespace(units=[], hints=())
+        self.assertFalse(h._guard_fake_bottom(frame))
+        self.assertFalse(h.ctx.want_bottom)
+
+    def test_await_bottom_timeout_sets_give_up_pass(self):
+        """回底等超时 → 认输那条路必须留放行牌，否则被自己的护栏打回。"""
+        h = self._h()
+        h.ctx.await_bottom = True
+        h.ctx.await_bottom_at = time.monotonic() - (G.PROBE_SETTLE_MAX + 5)
+        self.assertEqual(h._probe_decision("md5", "sig"), "give_up")
+        self.assertTrue(h.ctx.bottom_gave_up)
+        self.assertFalse(h.ctx.await_bottom)     # _reset_probe 清掉的
+
+    def test_give_up_pass_is_not_reblocked(self):
+        """真机 2026-10-31 09:31 死循环：认输后又被 hints 拦下 → 57 秒一轮。"""
+        h = self._h()
+        frame = SimpleNamespace(units=[], hints=("99+未读徽标",))
+        self.assertTrue(h._guard_fake_bottom(frame))    # 第一次：请回底
+        h.ctx.await_bottom_at = time.monotonic() - (G.PROBE_SETTLE_MAX + 5)
+        self.assertEqual(h._probe_decision("md5", "sig"), "give_up")
+        self.assertFalse(h._guard_fake_bottom(frame))   # 放行：就地建基线
+        self.assertFalse(h.ctx.bottom_gave_up)          # 牌一次性用掉
+        self.assertFalse(h.ctx.await_bottom)            # 不再等回底
+
+    def test_give_up_pass_does_not_stick(self):
+        """放行牌只用一次：下一次锚点丢失照常回底，不变成「永不回底」。"""
+        h = self._h()
+        frame = SimpleNamespace(units=[], hints=("99+未读徽标",))
+        h.ctx.bottom_gave_up = True
+        self.assertFalse(h._guard_fake_bottom(frame))
+        self.assertTrue(h._guard_fake_bottom(frame))    # 又要求回底了
+        self.assertTrue(h.ctx.await_bottom)
 
 
 if __name__ == "__main__":

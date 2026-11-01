@@ -177,6 +177,61 @@ NON_CHAT_MARKERS = (
     "选择要@的人", "搜索名字或群身份", "发起群聊", "选择联系人",
 )
 
+# ---------------------------------------------------------------- 视口位置特征
+#
+# 视口停在历史中间（「假底部」）时，屏上往往一条「已入库消息」都没有 ——
+# 打捞的证据护栏（_sweep_recent）会误判成「换了群 / 全新安装」而放弃，
+# 2026-10-29 大江东群的漏消息正是这么发生的（机器人 H5 容器里滚动失效，
+# 基线建在假底部）。好在钉钉自己会在屏上画「下面还有消息」的提示，这些
+# 节点特征比「屏上恰好有旧消息」可靠：
+#
+#   · 未读徽标：气泡/会话角上的「99+」「12条新消息」——下面压着没看到的消息；
+#   · 「查看更多消息」「回到最新」：列表中间的历史分隔/跳转提示。
+#
+# 文本都按**整词/包含**匹配，且先排除掉与任何消息单元正文重叠的文本，
+# 防止群友发的正文里恰好出现「99+」被当成徽标。
+UNREAD_BADGE_RE = re.compile(
+    r"^(\d{1,3}\+|\d{1,3}\s*条新消息|有\s*\d{1,3}\s*条新消息)$")
+NOT_LATEST_MARKERS = (
+    "查看更多消息", "点击查看更多消息", "回到最新", "回到最新消息",
+    "查看最新消息", "以下为新消息", "下方有新消息", "以上为历史消息",
+)
+
+
+def ui_hints(root: Node, units: list[Unit]) -> tuple[str, ...]:
+    """收集「视口不在最新处」的 UI 特征，返回命中的特征名（可能为空）。
+
+    两类特征两种排除规则：
+
+      · 未读徽标（「99+」「12条新消息」）按**整词**认，但只要与任何消息
+        正文互为包含就不认 —— 防止正文里恰好出现「99+」被当成徽标；
+      · 「查看更多消息」「回到最新」类横幅按**精确全文**认。注意横幅行
+        本身会被 ``_container_units`` 切成一条**没有发送者**的单元，所以
+        只排除「带发送者昵称的正文恰好等于该文案」的情况（真消息气泡），
+        不能一刀切排除所有单元文本 —— 否则横幅永远认不出来。
+    """
+    own_texts = [s for s in
+                 [(u.content or "") for u in units] + [(u.sender or "") for u in units]
+                 if s]
+    own_bubble = {(u.content or "").strip() for u in units if u.sender}
+    hits: list[str] = []
+    for n in walk(root):
+        t = (n.text or n.desc or "").strip()
+        if not t:
+            continue
+        if UNREAD_BADGE_RE.match(t):
+            if any(t in s or s in t for s in own_texts):
+                continue
+            if "99+未读徽标" not in hits:
+                hits.append("99+未读徽标")
+        elif t in NOT_LATEST_MARKERS:
+            if t in own_bubble:
+                continue
+            label = "查看更多/回到最新"
+            if label not in hits:
+                hits.append(label)
+    return tuple(hits)
+
 
 class ParseError(ValueError):
     """节点树不是 uiautomator 的形状 —— 让调用方给用户一句人话。"""
@@ -311,6 +366,9 @@ class Frame:
     garbled_count: int = 0
     garbled: bool = False
     warnings: list[str] = field(default_factory=list)
+    # 「视口不在最新处」的 UI 特征（99+ 未读徽标 / 查看更多消息 / 回到最新）。
+    # 非空 = 屏幕下面还压着没看到的消息（假底部），见 ``ui_hints``。
+    hints: tuple[str, ...] = ()
 
     @property
     def fps(self) -> list[str]:
@@ -319,6 +377,10 @@ class Frame:
     @property
     def is_chat(self) -> bool:
         return self.page == "chat"
+
+    @property
+    def not_at_latest(self) -> bool:
+        return bool(self.hints)
 
 
 def detect_page(root: Node) -> tuple[str, str]:
@@ -802,8 +864,8 @@ def _bubble_and_sender(node: Node) -> tuple[Node | None, str]:
     return bubble, sender
 
 
-def _table_rows(nodes: list[Node]) -> list[list[str]]:
-    """气泡里的表格节点 → 二维表（按坐标还原，不是按文档顺序）。
+def _table_rows(nodes: list[Node]) -> list[list[list[tuple]]]:
+    """气泡里的表格节点 → **若干张**二维表（按坐标还原，不是按文档顺序）。
 
     真机（2026-10-17 16:31 那张「标签履约月累计达成」卡片）：
     表格是 ``HorizontalScrollView`` 里的一堆 ``LinearLayout`` 网格，无障碍把它
@@ -813,9 +875,11 @@ def _table_rows(nodes: list[Node]) -> list[list[str]]:
     做法：先按 x 把**表格区域**挑出来（普通气泡每行一个文本节点、left 恒等；
     表格那一排有多个不同 left），再在区域内按 y 聚行、行内按 x 排序。
 
-    返回空列表 = 这不是表格，调用方保持原样。
+    返回值是「表的列表」（大多数消息只有一张）；空列表 = 这不是表格，调用方
+    保持原样。一张卡片有多张表的情形见 :func:`_grids_by_bottom`。
     """
     boxes = []
+    inverted = 0
     for n in nodes:
         left, top, right, bottom = n.bounds
         # ⚠ 表格格的真机形状是 ``[2058,659][964,770]`` —— left 是真实的列坐标
@@ -824,12 +888,26 @@ def _table_rows(nodes: list[Node]) -> list[list[str]]:
         # 列序全乱、数值对错列名）；只有「宽度」用 abs 判断。
         if abs(right - left) <= 0 or abs(bottom - top) <= 0:
             continue
+        if top > bottom:
+            # 「滚到顶」倒挂（见 _clamp_depth 的注释）：top 被钳成可视区上沿
+            # 265，**不可信**；bottom 虽然绝对值不对，却保有正确的行序 ——
+            # 2026-11-01 17:22 拦截跟单日报实锤：同一行的所有格子 bottom 完全
+            # 相同（表头 -45、数据行 54/153/252…）。行键直接用 bottom。
+            # ⚠ 绝不能 min/max 归一化：那样每个格子都变成 [-45, 265] 一样的
+            # 大区间，互相全都"重叠"，三张不相关的表会被拼成一张错位表
+            # （行名全丢、还丢两列数据，转出来的图谁也看不懂）。
+            inverted += 1
+            boxes.append((left, bottom, right, bottom, n.label.strip()))
+            continue
         t, b = min(top, bottom), max(top, bottom)
         if b - t <= 0:
             continue
         boxes.append((left, t, right, b, n.label.strip()))
     if len(boxes) < 6:
         return []
+
+    if inverted * 2 >= len(boxes):
+        return _grids_by_bottom(boxes)
 
     # 表格的一排有 ≥3 个不同 left；普通正文每行 left 都一样（真机实测全是 212）。
     if len({b[0] for b in boxes}) < 3:
@@ -919,8 +997,52 @@ def _table_rows(nodes: list[Node]) -> list[list[str]]:
     if len(grid) >= 3:
         head = grid[0]
         if sum(_numeric(c) for c in head) <= len(head) // 3:
-            return grid
-    return grid
+            return [grid]
+    return [grid]
+
+
+def _grids_by_bottom(boxes: list[tuple]) -> list[list[list[tuple]]]:
+    """倒挂帧（整条消息的 top 全被钳成可视区上沿）的表格还原。
+
+    坐标实锤（2026-11-01 17:22 拦截跟单日报真机帧）：一行里所有格子的
+    ``bottom`` 完全相同（表头 -45、数据行 54/153/252…每行 +99），``left``
+    保有真实的列坐标 —— **bottom 聚行、行内按 left 排序**，行列一次对齐。
+
+    一张卡片常常不止一张表（那张卡片就有 3 张，列数 6/7/3），而不同表的
+    列 left 集合不同（789 vs 765 这种 24px 的错位是真实存在的）——共享列
+    （left=250/548/1464 三列两张表都有）正是把多表拼成一张错位表的元凶。
+    所以相邻两行的 left 集合一旦对不上，就认为是另一张表的开始。
+    """
+    rows: list[list[tuple]] = []
+    for b in sorted(boxes, key=lambda x: (x[1], x[0])):
+        if rows and b[1] - rows[-1][-1][1] <= 8:   # 同一行：bottom 差 ≤8px
+            rows[-1].append(b)
+        else:
+            rows.append([b])
+
+    tables: list[list[list[tuple]]] = []
+    cur: list[list[tuple]] = []
+    prev_keys: tuple | None = None
+
+    def _flush() -> None:
+        if len(cur) >= 2:                        # 表头 + 至少 1 行数据
+            tables.append(cur)
+
+    for r in rows:
+        if len(r) < 3:                           # 正文/标题（left 只有 1~2 个）
+            _flush()
+            cur = []
+            prev_keys = None
+            continue
+        keys = tuple(sorted({x[0] for x in r}))
+        if cur and keys == prev_keys:
+            cur.append(r)
+            continue
+        _flush()
+        cur = [r]
+        prev_keys = keys
+    _flush()
+    return [[sorted(r, key=lambda x: x[0]) for r in t] for t in tables]
 
 
 def _render_table(grid: list[list[tuple]]) -> str:
@@ -942,25 +1064,33 @@ def _render_table(grid: list[list[tuple]]) -> str:
     return "\n".join(lines)
 
 
-def _inline_table(body_nodes: list[Node]) -> tuple[str, list[Node], int]:
-    """气泡正文 → ``(表格文本, 表格之外的正文节点, 表格首行的 y)``。
+def _inline_table(body_nodes: list[Node]) -> tuple[list[tuple[int, str]], list[Node]]:
+    """气泡正文 → ``(表格段落, 表格之外的正文节点)``。
 
-    不是表格就返回 ``("", [], 0)``。把「坐标还原」和「哪些节点算表格」放在
+    表格段落是 ``(首行y, 文本)`` 的列表 —— 一张卡片里可能有多张表（倒挂帧
+    的 ``_grids_by_bottom`` 会分开它们），每段带自己的纵向位置，调用方按 y
+    把它们插回正文流里原来的位置。
+
+    不是表格就返回 ``([], [])``。把「坐标还原」和「哪些节点算表格」放在
     一起，是因为 ``split_row`` 需要后者：一张卡片里往往是「几段正文 + 一张表
     + 几段正文」，只把整条消息换成表格会把正文全吞掉（真机 08:13 那张拦截单
     卡片就是：表格前后各有 4 段话）。
     """
-    grid = _table_rows(body_nodes)
-    if not grid:
-        return "", [], 0
-    cell_keys = {(b[0], b[1], b[4]) for row in grid for b in row}
+    grids = _table_rows(body_nodes)
+    if not grids:
+        return [], []
+    pieces: list[tuple[int, str]] = []
+    cell_keys = set()
+    for grid in grids:
+        pieces.append((min(b[1] for b in grid[0]), _render_table(grid)))
+        cell_keys |= {(b[0], b[1], b[4]) for row in grid for b in row}
     rest: list[Node] = []
     for n in body_nodes:
         left, top, right, bottom = n.bounds
         if (left, min(top, bottom), n.label.strip()) in cell_keys:
             continue                    # 这个节点是表格格，已经从 grid 还原过了
         rest.append(n)
-    return _render_table(grid), rest, min(b[1] for b in grid[0])
+    return pieces, rest
 
 
 def _clamp_depth(body_nodes: list[Node], view: tuple[int, int, int, int],
@@ -1045,13 +1175,14 @@ def split_row(row: Node) -> Unit:
     # ⚠ 表格只替换它自己那几个格子，**正文必须原样留着**：真机的卡片基本是
     # 「几段话 + 一张表 + 几段话」，早期版本直接 return 表格，结果整条消息
     # 只剩一行数据，提示语、附件说明全没了（08:13 那张拦截单卡片）。
-    table, rest, cut = _inline_table(body_nodes)
-    if table:
-        # 表格插回它原来的纵向位置：y 比表格首行小的正文在上面，其余在下面。
+    tables, rest = _inline_table(body_nodes)
+    if tables:
+        # 表格段落按 y 插回正文流原来的位置（倒挂帧里正文与表格格子用的都是
+        # bottom 坐标系，可以直接比大小；多条表格段落各自回各自的位置）。
         y_of = lambda n: min(n.bounds[1], n.bounds[3])
-        upper = [n.label for n in rest if y_of(n) < cut]
-        lower = [n.label for n in rest if y_of(n) >= cut]
-        text = "\n".join(upper + [table] + lower).strip()
+        items = [(y_of(n), n.label) for n in rest] + list(tables)
+        items.sort(key=lambda x: x[0])
+        text = "\n".join(t for _, t in items).strip()
         return Unit(sender=sender, content=text, kind="text", y0=y0, y1=y1)
 
     if all(PLACEHOLDER_RE.match(x) for x in body):
@@ -1124,6 +1255,7 @@ def parse_frame(text: str) -> Frame:
                 u.ts = seps[i][1]
     _fill_clamp_depth(units, container, frame.view)
     frame.units = units
+    frame.hints = ui_hints(root, units)
     return frame
 
 

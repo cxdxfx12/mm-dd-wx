@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import queue
 import random
+import re
 import threading
 import time
 from collections import Counter
@@ -21,7 +22,7 @@ from .notify import (DingTalkNotifier, SYSTEM_PREFIX, in_hhmm_window,
                      install_alert_handler)
 from .router import Router
 from .storage import Storage
-from .table_image import render_message, render_table, save_png
+from .table_image import render_message
 from .targets import build_target
 from .targets.base import Target
 from .xlsx_reader import read_rows
@@ -29,8 +30,171 @@ from .xlsx_reader import read_rows
 log = logging.getLogger("bridge.service")
 
 WATCHDOG_TICK = 30.0          # 看门狗巡检间隔（秒）
-RETRY_DELAY_S = 30.0          # 投递失败后的补投延迟（秒）
+RETRY_DELAY_S = 30.0          # 投递失败后的补投间隔（秒）
 RETRY_NOTE = "失败补投"        # 补投投递记录里的标记
+
+# 积压超龄不转发（用户 2026-11-01 定：「超过 30 分钟的积压不能再转发了」）。
+#
+# 手机断线/卡住一段时间再恢复时，采集端会把**当前屏上能看见的历史消息**
+# 一起补上来 —— 这本来是好事（不丢消息），但一口气十几条旧消息涌进微信群
+# 就是刷屏：群里看到的是「18:34 的晚报」在 19:20 才冒出来，还挤掉了真正
+# 当下的消息。所以按**源消息时间**而不是接收时间判：超过这个分钟数只入库
+# 留档、不投递，要补发用 forward_recent.py（那里走 force，不受此限）。
+#
+# 注意判据取自 msg_time（手机读消息头顶的时间条）。读不出时 _parse_time
+# 会退回本机时间，age≈0 —— 宁可多发一条，也不因为时间条格式变化把消息吃掉。
+MAX_BACKLOG_MIN = 30.0
+
+# 文件名整理用到的规则（2026-11-01 用户反馈「转发的原文件名太乱」）。
+#
+# 乱在两处：
+#   1. 落盘名带 12 位 sha 前缀（`6e16038a834e-查看完整月报明细（Excel）`），
+#      微信里显示的就是它 —— 一串哈希没人看得懂；
+#   2. 手机端上报的名字常带格式后缀（`...（Excel）`），既不是真扩展名，
+#      又占位置，微信里点开还是一堆括号。
+_BAD_NAME_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]')
+_FORMAT_TAG_RE = re.compile(
+    r"[（(]\s*(excel|xlsx?|xlsm|word|docx?|pdf|csv|zip|rar|7z|txt|pptx?|图片)"
+    r"\s*[）)]\s*$", re.I)
+# 格式词 → 真扩展名（只在原文件没有扩展名、或名字里的格式词与扩展名冲突时用）
+_EXT_BY_TAG = {"excel": ".xlsx", "xls": ".xls", "xlsx": ".xlsx", "xlsm": ".xlsm",
+               "word": ".docx", "doc": ".doc", "docx": ".docx", "pdf": ".pdf",
+               "csv": ".csv", "zip": ".zip", "rar": ".rar", "7z": ".7z",
+               "txt": ".txt", "ppt": ".ppt", "pptx": ".pptx", "图片": ".png"}
+# 手机端只会给这种「通用按钮名」，单靠它区分不出是哪个文件 —— 补日期时间，
+# 免得一天抓两份都叫「下载附件.xlsx」互相覆盖、也分不清谁是谁。
+_GENERIC_NAMES = {"附件", "下载附件", "下载", "明细", "明细附件", "表格", "文件",
+                  "查看附件", "点击下载", "下载文件"}
+_NAME_MAX = 80                # 微信文件名显示上限之外的自我约束（含扩展名）
+# ⚠ 别调太小：手机端抓下来的英文名形如
+#   「2026-11-01_311392_intercept_risk_center_not_arrived_1793491732445.xlsx」
+#   （74 字符）。60 的阈值会把它截成「…_179.xlsx」—— 比原样更难认。
+
+# ── 用「卡片上的名字」当文件名（2026-11-01 用户要求）──────────────────
+# 手机回传的文件名是钉钉服务端生成的英文串：
+#   2026-11-01_311392_intercept_risk_center_not_arrived_1793513190555.xlsx
+# 而群里那条消息明明写着「明细附件：拦截风险明细.xlsx」—— 用户要的是后者。
+# 上游网关把「这次抓的是哪一条附件行」记在 attach_active 里传下来，这里负责
+# 把它洗成一个能当文件名的标题。
+_EXT_TAIL_RE = re.compile(
+    r"\.(xlsx?|xlsm|csv|pdf|docx?|pptx?|zip|rar|7z|txt|png|jpe?g)$", re.I)
+# 按钮文案的动作前缀：「下载3天滞留运单明细」→「3天滞留运单明细」
+_LEAD_ACTION_RE = re.compile(
+    r"^(?:请)?(?:立即|直接|马上)?(?:下载|查看完整|查看|点击查看|点击|打开|导出|"
+    r"获取|保存|领取|查收)+")
+
+
+def _card_title(prefer: str) -> str:
+    """消息里那条附件行 → 可当文件名的标题（拿不到就返回空串）。
+
+    「明细附件：拦截风险明细.xlsx」→「拦截风险明细」
+    「下载附件」→``""``（纯按钮文案，拿来当文件名比英文串更难认）
+    """
+    s = (prefer or "").strip().strip(" :：·—|｜")
+    if not s:
+        return ""
+    # 「明细附件：xxx」这类标签，冒号后才是真名字
+    if ":" in s or "：" in s:
+        tail = re.split(r"[:：]", s)[-1].strip()
+        if tail:
+            s = tail
+    s = _LEAD_ACTION_RE.sub("", s).strip(" :：·—|｜")
+    # 「查看完整周报明细（Excel）」→ 格式后缀不是文件名的一部分
+    s = _FORMAT_TAG_RE.sub("", s).strip(" :：·—|｜")
+    s = _EXT_TAIL_RE.sub("", s).strip(" :：·—|｜")
+    if len(s) < 2:
+        return ""
+    if s.lower() in {g.lower() for g in _GENERIC_NAMES}:
+        return ""
+    return s
+
+
+def pretty_file_name(name: str, path: str, prefer: str = "") -> str:
+    """把「落盘名 + 上报名」整理成微信里好看的显示名。
+
+    `path` 是磁盘上的真实文件（可能带 sha 前缀），`name` 是手机端上报的
+    原始名，`prefer` 是**消息里那条附件行的名字**（有就优先用它，见
+    :func:`_card_title`）。返回值只用于**显示与发送**，磁盘文件名不动 ——
+    去重靠 sha，落盘名带前缀是为了「同名不同内容」不互相覆盖。
+    """
+    from pathlib import Path as _P
+
+    disk = _P(path or "")
+    ext = disk.suffix.lower()
+
+    # 1) 卡片上写着的名字最像人话，优先
+    card = _card_title(prefer)
+    if card:
+        m = _EXT_TAIL_RE.search(card)
+        card_ext = ("." + m.group(1).lower()) if m else ""
+        # 扩展名以**真实文件**为准：卡片写 .xlsx、实际下来的是 .csv 时别撒谎
+        use_ext = ext or card_ext or ".xlsx"
+        stem = (_EXT_TAIL_RE.sub("", card) if m else card).strip(" ._")
+        stem = _BAD_NAME_CHARS.sub("_", stem).strip(" ._")
+        room = max(8, _NAME_MAX - len(use_ext))
+        if len(stem) > room:
+            stem = stem[:room].rstrip(" ._-")
+        if stem:
+            return f"{stem}{use_ext}"
+
+    raw = (name or "").strip() or disk.name
+
+    # 手机端上报的名字可能本身就是带前缀的落盘名，先剥前缀
+    raw = re.sub(r"^[0-9a-f]{12}-", "", raw, flags=re.I)
+
+    stem = raw
+    tag_ext = ""
+    m = _FORMAT_TAG_RE.search(stem)
+    if m:
+        tag_ext = _EXT_BY_TAG.get(m.group(1).lower(), "")
+        stem = _FORMAT_TAG_RE.sub("", stem).strip()
+    # 「查看完整月报明细.xlsx（Excel）」这种中缀也没意义，统一处理
+    stem = re.sub(r"\.(xlsx?|xlsm|docx?|pdf|csv|zip|rar|7z|txt|pptx?)", "",
+                  stem, flags=re.I).strip()
+
+    stem = _BAD_NAME_CHARS.sub("_", stem).strip(" ._")
+    if not stem or stem.lower() in {g.lower() for g in _GENERIC_NAMES}:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M")
+        stem = f"{stem or '附件'}-{stamp}"
+
+    use_ext = ext or tag_ext or ".xlsx"
+    if not use_ext.startswith("."):
+        use_ext = "." + use_ext
+    # 留出扩展名与 1 个字符余地，长名字截断但不切碎扩展名
+    room = max(8, _NAME_MAX - len(use_ext))
+    if len(stem) > room:
+        stem = stem[:room].rstrip(" ._-")
+    return f"{stem}{use_ext}"
+
+
+def stage_media_file(path: str, display_name: str) -> str:
+    """把附件复制成一份**文件名干净**的副本，返回副本路径。
+
+    为什么要复制而不是改名：原文件是「sha 前缀 + 原名」的落盘格式，
+    去重、断点续传、人工翻找都靠它；直接把名字改掉，下次同一个文件传上来
+    会被当成新文件（路径变了）再发一遍。副本放在 `data/outbox/`，同名覆盖 ——
+    outbox 只是发送用的暂存区，不需要留历史。
+    """
+    import shutil
+    from pathlib import Path as _P
+
+    src = _P(path)
+    outbox = src.parent.parent / "outbox"
+    try:
+        outbox.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning("建 outbox 目录失败（改用原名发送）：%s", exc)
+        return str(src)
+    dst = outbox / display_name
+    try:
+        if dst.exists():
+            dst.unlink()
+        shutil.copy2(src, dst)
+        return str(dst)
+    except OSError as exc:
+        log.warning("复制附件到 outbox 失败（改用原名发送）：%s", exc)
+        return str(src)
+
 
 
 class BridgeService:
@@ -76,8 +240,14 @@ class BridgeService:
         用户既然明确点了发送，意思就是「这几条再发一次」，不该被去重挡成
         「什么都没发生」。入库仍是 INSERT OR IGNORE，投递记录照记，
         所以补发过的事实会留在库里，不会被下一次自动采集重复统计。
+
+        附件的判重比文本严一档：必须**有成功的投递记录**才算重复（见
+        ``Storage.is_duplicate`` 的说明）。文本消息入库即算处理完（可能命中
+        规则被过滤，也可能发了），附件的存在意义就是「发出去」——入库却没
+        发成功的那条，重传时必须能再发一次。
         """
-        if not force and self.storage.is_duplicate(msg.uid):
+        if not force and self.storage.is_duplicate(
+                msg.uid, need_delivered=(msg.msg_type == "file")):
             self.counter["duplicate"] += 1
             log.debug("重复消息，跳过：%s", msg.uid)
             return False
@@ -109,14 +279,38 @@ class BridgeService:
                      (msg.content or "").replace("\n", " ")[:40])
             return True
 
+        # 积压超龄不转发：手机卡住一段时间后恢复，屏上能看见的历史会被一起
+        # 补上来，一口气全发出去等于往业务群刷旧闻（用户 2026-11-01 要求）。
+        # force（人工补发）不受限 —— 那时候"发旧消息"正是用户要的。
+        age_min = self._backlog_minutes(msg)
+        if not force and age_min > MAX_BACKLOG_MIN:
+            self.counter["filtered"] += 1
+            log.info("积压超龄不转发（源消息 %s，已 %.0f 分钟，上限 %.0f）：%s",
+                     msg.time_text or "时间未知", age_min, MAX_BACKLOG_MIN,
+                     (msg.content or "").replace("\n", " ")[:40])
+            return True
+
         matched = self.router.match(msg)
         if not matched.targets:
             self.counter["filtered"] += 1
             log.info("未命中转发规则，仅入库：%s | %s", msg.company, msg.content[:30])
             return True
 
+        # 附件临时改投「文件传输助手」（用户 2026-11-01 20:26：今天补发的
+        # 发文件助手，不是以后）。只换目标、不改规则：能不能发仍由路由决定，
+        # 正文照旧进业务群。两个配置留空 = 行为完全不变。
+        # ⚠ 带截止时间：过了 attach_target_until 自动失效，免得哪天忘了关，
+        #   附件从此静默全进文件传输助手。
+        targets = list(matched.targets)
+        attach_tgt = (getattr(self.cfg.wechat, "attach_target", "") or "").strip()
+        if attach_tgt and msg.msg_type == "file" and attach_tgt not in targets \
+                and self._attach_redirect_on():
+            log.info("附件改投「%s」（原目标 %s）：%s", attach_tgt,
+                     ",".join(targets) or "-", (msg.content or "")[:30])
+            targets = [attach_tgt]
+
         text = render(msg, matched.template or DEFAULT_TEMPLATE)
-        for tgt in matched.targets:
+        for tgt in targets:
             ok = self._deliver_to_target(msg, tgt, text)
             if not ok:
                 # 瞬态失败（窗口被挡、幽灵窗、一次网络抖动）占绝大多数，
@@ -150,14 +344,47 @@ class BridgeService:
                 log.error("%s投递失败 → %s | %s", prefix, tgt, result.detail)
                 self._alert_delivery_fail(tgt, result.detail)
 
+            # ---- 附件：发**原文件** ----
+            # 用户 2026-10-31 定：附件（周报/月报/运单明细这类 xlsx）一律发原
+            # 文件，不要再渲染成长图。理由有两条，都是用户当场提的：
+            #   ① 宽表切块时会丢最左边的网点名称，长图还长得没法在微信里看；
+            #   ② 明细表要能筛选、能另存，图片一条都做不到。
+            # 文字失败时**不再发文件**：会话都打不开，文件更发不出去。
+            if result.ok and msg.msg_type == "file":
+                media = (msg.media_path or "").strip()
+                from pathlib import Path as _P
+
+                if not media or not _P(media).is_file():
+                    log.warning("附件原文件已不在，只发了提示文字：%s",
+                                media or "（未记录路径）")
+                    return result.ok
+                self._throttle()
+                try:
+                    r2 = self.target.send_file(tgt, str(media))
+                except AttributeError:
+                    log.warning("投递端不支持发文件，附件未送达：%s", tgt)
+                except Exception:                   # noqa: BLE001
+                    log.exception("附件投递异常（文字已发）")
+                else:
+                    self.storage.log_delivery(
+                        msg.uid, tgt, "ok" if r2.ok else "fail",
+                        f"附件: {r2.detail}")
+                    if r2.ok:
+                        log.info("%s附件已投递 → %s（%s）%s", prefix, tgt,
+                                 _P(media).name, tail("sent"))
+                    else:
+                        log.warning("%s附件投递失败 → %s | %s", prefix, tgt,
+                                    r2.detail)
+                return result.ok
+
             # ---- 表格转图片（文字照发，表格补一张图）----
             # 用户 2026-10-18 选定：钉钉卡片表格在微信里没有原生类型，转成
             # PNG 补发。文字失败时**不补图**（会话都打不开，图更发不出）。
             # 图片走 send_image —— 目标不支持（旧实现/其它平台）就跳过，
             # 不算失败：文字已经发到了，表格图片是锦上添花。
             if result.ok and self.cfg.wechat.table_image:
-                # 消息自带 media_path（目前唯一来源是附件转发：xlsx 渲染好的
-                # 表格图）就直接用它；没有再尝试从正文解析表格。
+                # 走到这里的只有**文本消息**（附件在原文件分支就 return 了），
+                # 表格图一律从正文现渲染。
                 png = (msg.media_path or "").strip()
                 if not png:
                     png = render_message(text, out_dir=self._table_png_dir(),
@@ -215,48 +442,105 @@ class BridgeService:
 
     # ---------- 附件转发 ----------
 
-    def handle_attachment(self, path: str, name: str, chat: str = "") -> bool:
-        """收到手机传回的附件文件 → 解析 xlsx → 渲染表格图 → 投递。
+    @staticmethod
+    def _backlog_minutes(msg: Message) -> float:
+        """源消息距今多少分钟。
+
+        ``msg_time`` 缺失、或比本机时间还晚（手机时钟快了）一律返回 0，
+        也就是**不拦** —— 这条规则的用途是挡"陈年积压"，不是做时间校验，
+        宁可用错放的阈值漏一条，也不能因为时钟问题把当下的消息全吃掉。
+        """
+        if not msg.msg_time:
+            return 0.0
+        try:
+            delta = (datetime.now() - msg.msg_time).total_seconds() / 60.0
+        except (TypeError, ValueError):
+            return 0.0
+        return delta if delta > 0 else 0.0
+
+    def _attach_redirect_on(self) -> bool:
+        """附件改投文件助手现在生效吗（看 ``attach_target_until``）。
+
+        ``until`` 留空 = 没有截止时间（临时大扫除时可以这么用，但要清楚
+        它会一直生效，直到有人把配置清掉）。
+        时间串解析不了也**判失效**：配置写错了宁可按老路发业务群，
+        不能让附件因为一个错字全部改道。
+        """
+        until = (getattr(self.cfg.wechat, "attach_target_until", "") or "").strip()
+        if not until:
+            return True
+        try:
+            deadline = datetime.fromisoformat(until)
+        except (TypeError, ValueError):
+            log.warning("attach_target_until 解析不了（%s），按失效处理", until)
+            return False
+        if datetime.now() <= deadline:
+            return True
+        log.info("附件改投已过期（截止 %s），改回业务群", until)
+        return False
+
+    def handle_attachment(self, path: str, name: str, chat: str = "",
+                          wanted: str = "", msg_time=None) -> bool:
+        """收到手机传回的附件文件 → 投递**原文件**（用户 2026-10-31 定）。
 
         链路的最后一环：网关 ``/file`` 已做过 sha1 去重（同一份文件只会进到
         这里一次），这里的防重复靠 uid（raw_id = ``attach-<sha1>``）入库判重
         —— 它跨重启有效，比内存集合可靠。
 
-        解析失败**不重试也不报错**：附件渲染是锦上添花，为它打断正常转发
-        节奏不值得。日志里留一行就够了。
+        ``wanted`` 是**消息里那条附件行的名字**（网关的 ``attach_active``，
+        如「明细附件：拦截风险明细.xlsx」）。文件名优先用它 —— 手机回传的
+        英文串（``2026-11-01_311392_intercept_risk_center_not_arrived_…``）
+        在微信里没人看得懂（2026-11-01 用户要求）。
+
+        为什么不再渲染表格图：宽表切块会丢左边的网点名称，转成图之后既不能
+        筛选也不能另存，明细表（周报 108 行 × 22 列）更是长到没法看。原文件
+        发过去，微信里能直接打开/另存，信息一点不丢。
+
+        解析 xlsx **只为了在提示文字里写清行数**，解析失败也照发原文件 ——
+        pdf/docx/图片类附件本来就解析不了，因为解析不了就整份丢掉太亏。
         """
         import hashlib
 
         try:
-            rows = read_rows(path)
-        except Exception as exc:                    # noqa: BLE001
-            log.warning("附件 %s 解析失败（跳过转发）：%s", name, exc)
-            return False
-        if len(rows) < 2:
-            log.warning("附件 %s 只有表头没有数据（跳过转发）", name)
-            return False
-        head, data_rows = rows[0], rows[1:]
-        try:
             with open(path, "rb") as f:
                 data = f.read()
         except OSError as exc:
-            log.warning("附件 %s 读不回来：%s", path, exc)
+            log.warning("附件 %s 读不回来（跳过转发）：%s", path, exc)
+            return False
+        if not data:
+            log.warning("附件 %s 是空文件（跳过转发）", name)
             return False
         sha = hashlib.sha1(data).hexdigest()
+
+        # 行数只是提示语的修饰，取不到就不写 —— 绝不能因为解析失败丢附件。
+        summary = ""
         try:
-            img = render_table(head, data_rows, title=name)
-            png = save_png(img, self._table_png_dir(), key=f"attach-{sha}") \
-                if img is not None else None
-        except Exception:                           # noqa: BLE001
-            log.exception("附件 %s 渲染表格图失败（只发文字）", name)
-            png = None
+            rows = read_rows(path)
+            if len(rows) >= 2:
+                summary = f"（{len(rows) - 1} 行）"
+            else:
+                log.info("附件 %s 只有表头没有数据，仍按原文件转发", name)
+        except Exception as exc:                    # noqa: BLE001
+            log.info("附件 %s 不是可解析的表格（照发原文件）：%s", name, exc)
+
+        # 微信里显示的是**磁盘文件名**，不整理就等于把 sha 前缀和「（Excel）」
+        # 一起发过去。这里改成干净副本，原文件保持前缀不动（去重靠它）。
+        display = pretty_file_name(name, path, prefer=wanted)
+        media = stage_media_file(path, display)
+
         msg = Message(source="dingtalk", chat_name=chat or "",
                       sender_name="附件",
-                      content=f"【附件】{name}（{len(data_rows)} 行）",
+                      content=f"【附件】{display}{summary}",
                       msg_type="file",
                       # ⚠ 必须转 str：media_path 会被 sqlite 原样绑定，
                       # Path 对象在这里就是 ProgrammingError。
-                      media_path=str(png) if png else "",
+                      media_path=str(media),
+                      # 源消息时间：网关按附件行所在消息的时间条换算过来。
+                      # 有了它，附件才跟正文一样受「积压超龄只入库不转发」
+                      # 约束（2026-11-01 20:4x：正文拦得住、附件这条路是漏的
+                      # —— 附件 msg_time 天生为空，年龄永远算 0）。
+                      # None = 判断不出（读不出时刻 / 人工补抓），照常转发。
+                      msg_time=msg_time,
                       raw_id=f"attach-{sha}")
         return self.handle(msg)
 

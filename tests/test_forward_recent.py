@@ -49,7 +49,8 @@ def msg(seq: int, **kw) -> Message:
     base = dict(
         chat_id="c1", chat_name="钉钉群", sender_id="u1", sender_name="张三",
         company="示例科技", content=f"第 {seq} 条", msg_type="text",
-        msg_time=datetime(2026, 10, 16, 9, 0) + timedelta(minutes=seq),
+        msg_time=(datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+                 + timedelta(seconds=seq)),
         raw_id=f"r{seq}",
     )
     base.update(kw)

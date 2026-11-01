@@ -49,7 +49,7 @@ def msg(chat="【数字质控】浙江杭州萧山区大江东公司", content="
     return Message(
         chat_id="c1", chat_name=chat, sender_id="u1", sender_name="张三",
         company="申通快递", content=content, msg_type="text",
-        msg_time=datetime(2026, 10, 16, 14, 20), raw_id=f"r-{chat}-{content}",
+        msg_time=datetime.now(), raw_id=f"r-{chat}-{content}",
     )
 
 

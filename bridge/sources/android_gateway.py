@@ -59,7 +59,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -90,6 +90,11 @@ SCREEN_LOG_EVERY = 30
 # 连续这么多帧都认不出「聊天页」→ 升到 WARNING（会触发钉钉告警）。
 # 认不出意味着一条都不转发，属于「程序在跑但静默失效」，必须让人知道。
 UNKNOWN_PAGE_ALERT_AFTER = 3
+# 连续认不出聊天页达到告警阈值时，自动下发一次「切回目标群」（watch_now）。
+# 光告警解决不了「拉回来」：2026-10-31 17:50 附件抓完后手机停在电脑侧认不出
+# 的页面，告警响了 5 分钟没人管，最后靠人手动切回。冷却防的是「钉钉真改版、
+# 永远认不出」时每 3 帧就抢一次用户前台 —— 10 分钟一次是能接受的骚扰上限。
+UNKNOWN_PAGE_AUTO_WATCH_COOLDOWN_S = 600.0
 # ── 「电脑侧主动要一帧」（2026-10-27 真机踩到）────────────────────────
 # 手机端「画面 md5 没变就不给电脑发」（省流量，设计如此）。于是出现一个死锁：
 # **电脑重启 / 刚装好时手上没有基线，而手机画面恰好没变 —— 手机觉得没新东西，
@@ -112,12 +117,22 @@ NEAR_DUP_WINDOW = 600.0
 # 覆盖一张卡片的可见期；真正的「同一份文件不重发」由收到文件后的 sha1 去重
 # 负责（content 变了 → 新文件 → 新 sha1 → 照收）。
 ATTACH_COOLDOWN = 600.0
+# 附件抓取失败后的退避（秒）：超时说明手机端这一趟没成功（页面被点走、
+# 弹窗没人点、下载确认没接），卡片还在屏上就会下一帧立刻重派 —— 只会连成
+# 一串 20 秒空等。3 分钟内不自动重派；手动补抓不受限。
+ATTACH_FAIL_BACKOFF = 180.0
+# 「最近见过的附件名」记忆窗口（秒）。用途只有一个：文件传回来时给它起个
+# 人看得懂的名字（2026-11-01 用户要求「上面附件叫什么就用什么」）。自动抓取
+# 时 `attach_active` 就是那一条；用户**手动点**链接时没有 active 单，只能靠
+# 这份记忆按扩展名对上。窗口取 10 分钟：一条卡片从出现到被人点开通常在这个
+# 范围内，再长的历史名字套到新文件上就纯属猜了。
+ATTACH_NAME_WINDOW = 600.0
 # 卡片正文里的附件行。两种实测形态：
 #   「附件：运单明细」（当日签卡片，不带扩展名 —— 点它照样会下载）
 #   「明细附件：拦截风险明细.xlsx」（拦截卡片，带扩展名）
 # 触发字眼 2026-10-27 起可配置（dingtalk.attach_keys，行首前缀、纯文本），
 # 这里只放默认值；_attach_re() 按配置现拼正则。
-DEFAULT_ATTACH_KEYS = ["附件：", "附件:"]
+DEFAULT_ATTACH_KEYS = ["附件：", "附件:", "明细：", "明细:"]
 
 # 「手机那边附件没抓成」的措辞特征（见 AttachmentFetcher.lastStatus 的各个分支）。
 # 只有命中这些词才升级成 WARNING —— 成功的结论（「已上传 xxx.xlsx」）不值得
@@ -142,9 +157,16 @@ def _clean_attach_keys(raw) -> list:
 
 
 def _attach_re(keys: list) -> "re.Pattern":
-    """触发字眼 → 行首匹配正则。字眼是纯文本，必须 re.escape。"""
+    """触发字眼 → 行首匹配正则。字眼是纯文本，必须 re.escape。
+
+    字眼后面允许跟冒号：配了「明细附件」这种不带冒号的键时，正文是
+    「明细附件：拦截风险明细.xlsx」—— 只吃空白的话捕获组会把冒号一起吞进
+    文件名（2026-11-01 14:3x 实测「：拦截风险明细.xlsx」），手机端拿这个
+    名字去屏上找必然找不到。
+    """
     return re.compile(
-        r"^(?:明细)?(?:%s)\s*(\S[^\n]{0,40})$" % "|".join(re.escape(k) for k in keys),
+        r"^(?:明细)?(?:%s)[\s：:]*(\S[^\n]{0,40})$"
+        % "|".join(re.escape(k) for k in keys),
         re.M)
 # 锚点对不上时「请手机翻一屏试着找回」的节流参数。
 #   · PROBE_COOLDOWN：发完翻页指令后，至少等这么久才算「屏幕安定」。手机翻上去
@@ -1068,27 +1090,390 @@ _FORMAT_ONLY_RE = re.compile(
     r"^[（(【\[]?\s*(?:excel|xlsx?|xlsm|word|docx?|pdf|csv|zip|rar|7z|txt|pptx?"
     r"|图片|文件)\s*[）)】\]]?$", re.I)
 
+# 名字**中间夹着**格式标记的行尾（「查看完整履约失败明细（Excel）」）。
+#
+# 2026-11-01 18:06 用户在群里看到晚报卡片、正文转过来了、附件却没来。原因不是
+# 没认出这行，而是**认出来的名字短了一截**：
+#
+#     行原文：查看完整履约失败明细（Excel）
+#     键「查看完整」命中 → 捕获组只剩：履约失败明细（Excel）
+#
+# 名字少了「查看完整」四个字，手机端 `contains(name)` 照样能中，但电脑侧日志/
+# 去重/补发都以这个残缺名做键，且同屏还有「查看完整月报明细（Excel）」时手机端
+# 的 fallback 分支很容易点错行。更根本的是：**屏上可点的就是整行**，名字取整行
+# 才与真机一致 —— 与 `_FORMAT_ONLY_RE` 同一个处理方式。
+_FORMAT_IN_NAME_RE = re.compile(
+    r"[（(【\[]\s*(?:excel|xlsx?|xlsm|word|docx?|pdf|csv|zip|rar|7z|txt|pptx?"
+    r"|图片|文件)\s*[）)】\]]", re.I)
 
-def _attach_name(content: str, keys: list) -> str:
-    """从消息正文里抠附件名；没有附件行返回空串。
+# 「行内含」判据里允许出现在字眼两侧的分隔符（单个字符即算边界）。
+# 刻意**不含**汉字/字母/数字：正文里「请下载附件查看」这种叙述句左邻「请」
+# 右邻「查」，都不在类里 → 不会被误认成按钮文案。
+_INLINE_SEP_CLS = r"\s｜|、，,。；;：:（）()\[\]【】“”\"'·—"
+
+# ── 整行就是文件名（2026-11-01 17:22 实锤）────────────────────────────
+#
+# 拦截跟单日报的卡片底部直接写着：
+#
+#     附件
+#     未及时转出明细.xlsx
+#
+# 这行既不以上述任何前缀开头（不是「附件：xxx」），也没有「下载/查看」动词
+# （万能字眼要求名词+动作），于是**从来没下过单** —— 用户在群里看到正文转过
+# 来了、附件永远不来。判据收得很窄，只认「整行就是一个文件名」：允许中文/
+# 字母/数字/括号/连字符，长度 ≤60，且以文档扩展名收尾；正文里提到文件名的
+# 长句子（带空格、逗号、句号）不会被误判。
+_DOC_EXT_RE = re.compile(
+    r"\.(xlsx|xlsm|xls|csv|docx|doc|pdf|zip|rar|7z|txt|pptx|ppt)$", re.I)
+_FILE_LINE_RE = re.compile(
+    r"^[\w\u4e00-\u9fa5（）()\[\]【】\-—_.·＋+&＆]{1,60}"
+    r"\.(?:xlsx|xlsm|xls|csv|docx|doc|pdf|zip|rar|7z|txt|pptx|ppt)$", re.I)
+
+# ── 万能字眼（2026-11-01 用户：「加个万能的字眼，附件、excel、明细都下载」）──
+#
+# 只认「短行 + 名词 + 动作」三件套，不是「正文里出现『明细』二字就抓」：
+#   · 短行（≤16 字）：屏幕上可点的按钮/链接就是这么短；超长的多半是说明句；
+#   · 名词：附件/明细/表格/excel… 说明「有个文件」；
+#   · 动作：下载/查看/获取… 说明「这行是让你去拿文件的」。
+# 反例（都不抓，正是想要的）：
+#   「明细如下」           只名词无动作
+#   「点击查看详情」       只动作无名词
+#   「所有超过2天积压数据我已经整理成Excel附件，请立即催签！」  超长且带句读
+# 名字取**整行原文**：手机端就是按这段文字在屏上 find 节点并点它的 bounds。
+AUTO_ATTACH_NOUNS = ("附件", "明细", "表格", "清单", "报表", "名单", "汇总表",
+                     "excel", "xlsx", "xls", "csv")
+AUTO_ATTACH_ACTIONS = ("下载", "查看", "获取", "导出", "保存", "点击", "打开",
+                       "领取", "查收")
+AUTO_LINE_MAX = 12
+# 句读符号 = 说明句而非按钮：按钮文案不会以「。」「！」收尾
+_AUTO_STOP_CHARS = "。！？!?"
+# 祈使/说明句的常见开头或连接词。真实按钮文案不会写「请…」，
+# 但正文里到处是「请立即催签」「如需下载请点击」—— 2026-11-01 自己踩到：
+# 「请下载附件查看今天的明细」一度被判成按钮（12 字、名词动作都齐）。
+_AUTO_SENTENCE_WORDS = ("请", "如需", "如果", "若", "可以", "需要", "以下", "如下",
+                        "详见", "注意", "提醒")
+
+
+# ── 带「明细」字眼的行（2026-11-01 用户：「只要带明细字眼的都点开转发原文件」）──
+#
+# 背景：钉钉这些卡片里，「明细」两个字出现在三种完全不同的行上：
+#
+#     附件：运单明细                         ← 真附件行（老规则已覆盖）
+#     查看完整履约失败明细（Excel）           ← 卡片底部按钮（老规则靠「查看完整」）
+#     履约失败明细（10票）                    ← **表格标题**，点了什么都不会发生
+#     今日巡检发现异常，麻烦你结合下方明细判断一下…   ← 叙述句
+#
+# 用户要的是"带明细的都点一遍，能下就下"。所以这几行**全部进候选**，但按
+# "像不像按钮"排序：真附件行在前、表格标题在后。手机端拿到的是一个候选链，
+# 逐个点、**拿到文件就停** —— 标题点空了只是白等几秒，不会把垃圾当成附件。
+# 叙述句排除掉：它既不可点、又长，排进去纯属浪费时间。
+_MINGXI_WORD = "明细"
+# 候选行的长度上限。按钮文案都短；超长的是说明句（真机最长的是 33 字的
+# 「今日巡检发现异常，麻烦你结合下方明细判断一下…」）。
+_MINGXI_LINE_MAX = 30
+# 句读：带逗号/句号的多半是说明句或「（33票，仅展示前30条）」这种统计头。
+_MINGXI_STOP_CHARS = "。！？!?，,、；;"
+# 祈使/说明句的常见词（与 _AUTO_SENTENCE_WORDS 同一思路，另加「麻烦/结合」）。
+_MINGXI_STOP_WORDS = ("请", "麻烦", "如下", "详见", "结合", "需要", "如需", "如果",
+                      "若", "注意", "提醒", "以下")
+# 动作词：带这些词的「明细」行更像按钮，排前面。
+_MINGXI_ACTIONS = ("下载", "查看", "导出", "获取", "打开", "点击", "领取", "查看完整")
+
+
+def _mingxi_lines(content: str) -> list:
+    """正文里**像按钮**的「明细」行（按出现顺序、去重）。"""
+    out: list = []
+    for ln in (content or "").splitlines():
+        s = ln.strip()
+        if not s or _MINGXI_WORD not in s or len(s) > _MINGXI_LINE_MAX:
+            continue
+        if any(c in s for c in _MINGXI_STOP_CHARS):
+            continue
+        if any(w in s for w in _MINGXI_STOP_WORDS):
+            continue
+        if s not in out:
+            out.append(s)
+    return out
+
+
+def _attach_cands(content: str, keys: list, auto: bool = True,
+                  limit: int = 6) -> list:
+    """这次抓取要手机**依次尝试**的行（下标 0 最像附件）。
+
+    设计意图：附件行到底长什么样，钉钉每种卡片都不一样，靠规则枚举永远
+    会漏一种。与其在电脑侧猜死，不如把「像附件的行」排个序交给手机端：
+    点第一行 → 等一小会儿 → 没文件就点下一行 → 拿到文件就收工。这样
+    「带明细的表格标题」「查看完整…（Excel）」混在一张卡里也能命中。
+    """
+    names = _attach_names(content, keys, auto)
+    cands: list = []
+
+    def push(n: str) -> None:
+        n = (n or "").strip()
+        if n and n not in cands:
+            cands.append(n)
+
+    # ① 老规则认出来的（真附件行）—— 最可信，排最前。
+    for n in names:
+        push(n)
+    # ② 「明细」行：带动作词的先（「查看完整…」），纯标题的后。
+    #    已经是「附件：xxx」形态的别再整行收一遍 —— 「明细：普通件滞留催提
+    #    AI代打明细」这种行，名字已经是「普通件滞留催提AI代打明细」，整行
+    #    再加进去只会在手机端白点一次同一行。
+    def redundant(line: str) -> bool:
+        return any(n in line for n in cands)
+
+    ming = _mingxi_lines(content)
+    for n in [x for x in ming if any(a in x for a in _MINGXI_ACTIONS)]:
+        if not redundant(n):
+            push(n)
+    for n in ming:
+        if not redundant(n):
+            push(n)
+    return cands[:limit]
+
+
+def _fetch_keys_for(ctx, name: str) -> str:
+    """下发给手机的「找行字眼」：配置里的通用前缀 + **这次命中行自己的名字**。
+
+    手机端找屏上的附件行用的是 ``startsWith(字眼)``，而「未及时转出明细.xlsx」
+    这种纯文件名不以任何前缀开头 —— 只发配置字眼的话，电脑这边认出了名字、
+    手机那边永远点不到那一行（2026-11-01 17:22 拦截跟单日报实锤：正文转发
+    成功、附件永远不来）。把命中名去掉扩展名一起下发，那一行的开头就正好
+    对得上，无需为此再发一版 APK。
+
+    ⚠ 2026-11-01 18:0x 补：**没有文档扩展名的名字也要下发**。
+    「查看完整履约失败明细（Excel）」这种卡片按钮名字里没有 ``.xlsx``，
+    旧实现走到 ``if m:`` 就直接跳过了 —— 万一哪天配置里少了「查看完整」
+    这个字眼，手机端就又只能靠 fallback 瞎点一行。名字本身就是屏上文本，
+    ``startsWith(名字)`` 必然命中自己，所以无脑补进去最稳。
+    """
+    keys = list(getattr(ctx, "attach_keys", []) or [])
+    stem = (name or "").strip().strip(" :：·—|｜")
+    if not stem:
+        return ",".join(keys)
+    m = _DOC_EXT_RE.search(stem)
+    head = (stem[:m.start()] if m else stem).strip(" :：·—|｜")
+    # len>=3：太短的（「（Excel）」这种纯格式标记）补进去毫无意义还可能误配。
+    if len(head) >= 3 and head not in keys:
+        keys.append(head)
+    return ",".join(keys)
+
+
+def _attach_names(content: str, keys: list, auto: bool = True) -> list:
+    """把消息正文里**所有**附件行都抠出来（按出现顺序、去重）。
+
+    为什么要「所有」：服务诊断专员的滞留卡片一张里就有 4~5 条，形如
+
+        明细：下载3天滞留运单明细
+        明细：下载5天滞留运单明细
+        明细：下载7天滞留运单明细
+        明细：下载14天滞留运单明细
+
+    旧实现只取第一条（``_attach_name``），于是每张卡只能抓到 1 个文件，
+    其余几条永远不会被点 —— 表现出「附件只来了一部分」。
+    """
+    out: list = []
+    lines = [ln.strip() for ln in (content or "").splitlines()]
+
+    # 0) 整行就是文件名（「未及时转出明细.xlsx」）—— 见 _FILE_LINE_RE 注释。
+    #    放最前面：这种行不需要猜，它本身就是附件按钮上写着的字。
+    for ln in lines:
+        if ln and _FILE_LINE_RE.match(ln) and ln not in out:
+            out.append(ln)
+    if out:
+        return out
+
+    for m in _attach_re(_clean_attach_keys(keys)).finditer(content or ""):
+        name = m.group(1).strip()
+        # 见 _FORMAT_ONLY_RE / _FORMAT_IN_NAME_RE 注释：键吃掉了按钮文案的前缀时，
+        # 名字要退回**整行原文**，否则「查看完整履约失败明细（Excel）」会变成
+        # 「履约失败明细（Excel）」—— 屏上根本没有以它开头的一行。
+        if _FORMAT_ONLY_RE.match(name) or _FORMAT_IN_NAME_RE.search(name):
+            name = m.group(0).strip()
+        if name and name not in out:
+            out.append(name)
+    if out:
+        return out
+    # 卡片按钮有时不带格式后缀，整行就是短语本身（「查看完整月报明细」）。
+    # 只认 ≥4 字的键按整行全等命中 —— 「附件：」这种标签不算按钮。
+    for k in _clean_attach_keys(keys):
+        if len(k) >= 4 and k in lines and k not in out:
+            out.append(k)
+    if out:
+        return out
+    # 3) 兜底：按钮文案被 OCR/卡片拼接**夹在长行中间**。
+    #
+    # 2026-11-01 12:08 实锤的一条积压异常提醒：
+    #
+    #     @所有人积压异常提醒: 下载附件 ｜ 承包区编码: 311242 ｜ 承包区名称: 浙江萧山菜鸟服务点 ｜ …
+    #
+    # 行首匹配（`_attach_re`）要求行以字眼开头 —— 这行以「@所有人积压异常提醒:」
+    # 开头；整行全等更不中。于是「下载附件」这个按钮**从来没下过单**，用户在群里
+    # 看到的是正文转发成功、附件永远不来。
+    #
+    # 判据刻意收得很窄，避免把叙述句误当按钮：
+    #   · 键必须 ≥4 字（与整行规则同一门槛，「附件：」这种标签不参与）；
+    #   · 键的**左右都必须是分隔符**（行首/行尾/空白/｜/标点）。这样
+    #     「请下载附件查看」不命中（左「请」右「查」都是汉字），
+    #     「下载附件 ｜」命中（右边是分隔符）。
+    #   · 命中的名字就是**键本身**：屏幕上可点的就是这几个字，手机端
+    #     按 contains 找得到。
+    for k in _clean_attach_keys(keys):
+        if len(k) < 4 or k in out:
+            continue
+        pat = re.compile(r"(?:^|[%s])(%s)(?=$|[%s])"
+                         % (_INLINE_SEP_CLS, re.escape(k), _INLINE_SEP_CLS),
+                         re.M)
+        if pat.search(content or ""):
+            out.append(k)
+    if out or not auto:
+        return out
+    # 4) 万能字眼：短行里同时出现「名词 + 动作」就当附件按钮（规则见常量注释）。
+    #    这一步在最后：前面任何一条命中了就不再往下猜，避免把真名字换成一整行。
+    for ln in lines:
+        if not (2 <= len(ln) <= AUTO_LINE_MAX):
+            continue
+        if any(c in ln for c in _AUTO_STOP_CHARS):
+            continue
+        if any(w in ln for w in _AUTO_SENTENCE_WORDS):
+            continue
+        low = ln.lower()
+        if not any(n in low for n in AUTO_ATTACH_NOUNS):
+            continue
+        if not any(a in ln for a in AUTO_ATTACH_ACTIONS):
+            continue
+        name = ln.strip(" :：·—|｜")
+        if name and name not in out:
+            out.append(name)
+    if out or not auto:
+        return out
+    # 5) 用户 2026-11-01：「只要带明细字眼的都点开转发原文件」。
+    #    走到这里说明前面所有规则都没命中 —— 而正文里明明有「明细」。
+    #    典型是「📦 猫超件明细（12 票）」这种把按钮写成标题形态的卡片：
+    #    它既不是「附件：xxx」，也没有下载/查看这类动作词，老规则全放过了，
+    #    结果整张卡的附件从来没下过单。既然用户要求"带明细就点"，就把它
+    #    当最后一档候选收进来；点空了由手机端的候选链兜着（见 _attach_cands）。
+    for ln in _mingxi_lines(content):
+        if ln not in out:
+            out.append(ln)
+    return out
+
+
+def _attach_name(content: str, keys: list, auto: bool = True) -> str:
+    """从消息正文里抠**第一个**附件名；没有附件行返回空串。
 
     两种命中形态（真机都见过）：
       · 「附件：运单明细」 → 名字取键后的真名字「运单明细」；
       · 「查看完整月报明细（Excel）」 → 键后只剩格式标记，名字取**整行**。
     """
-    m = _attach_re(_clean_attach_keys(keys)).search(content or "")
-    if not m:
-        # 卡片按钮有时不带格式后缀，整行就是短语本身（「查看完整月报明细」）。
-        # 只认 ≥4 字的键按整行全等命中 —— 「附件：」这种标签不算按钮。
-        lines = [ln.strip() for ln in (content or "").splitlines()]
-        for k in _clean_attach_keys(keys):
-            if len(k) >= 4 and k in lines:
-                return k
-        return ""
-    name = m.group(1).strip()
-    if _FORMAT_ONLY_RE.match(name):
-        return m.group(0).strip()
-    return name
+    names = _attach_names(content, keys, auto)
+    return names[0] if names else ""
+
+
+def _remember_attach_name(ctx: "_Ctx", name: str, now: float | None = None) -> None:
+    """把卡片上看到的附件行名字记进 `attach_recent`（同名只刷新时间）。"""
+    if not name:
+        return
+    recent = getattr(ctx, "attach_recent", None)
+    if recent is None:                 # 老 ctx（测试里手搓的）没有这份记忆
+        return
+    now = time.monotonic() if now is None else now
+    for i, (n, _ts) in enumerate(recent):
+        if n == name:
+            recent[i] = (name, now)
+            return
+    recent.append((name, now))
+
+
+def _display_name_for_file(ctx: "_Ctx", phone_name: str) -> str:
+    """文件传回来时该叫什么名字（空 = 没把握，让下游按手机原名整理）。
+
+    优先「正在抓的那一条」（``attach_active``，自动抓取时一定有）；用户**手动
+    点**链接时没有 active 单，就按扩展名在最近见过的附件行里找 —— 但**只有
+    唯一候选**才采用：名字和内容对不上比英文名更误导人（2026-11-01 判断）。
+    """
+    active = (getattr(ctx, "attach_active", "") or "").strip()
+    if active:
+        return active
+    ext = os.path.splitext(phone_name or "")[1].lower()
+    now = time.monotonic()
+    cands = {n for n, ts in getattr(ctx, "attach_recent", [])
+             if now - ts <= ATTACH_NAME_WINDOW
+             and os.path.splitext(n)[1].lower() in ("", ext)}
+    return cands.pop() if len(cands) == 1 else ""
+
+
+def _cb_wants_wanted(cb) -> bool:
+    """下游回调吃不吃第 4 个参数（wanted 名字）。老接线/老测试只有 3 个。"""
+    try:
+        import inspect
+
+        params = [p for p in inspect.signature(cb).parameters.values()
+                  if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        return len(params) >= 4
+    except (TypeError, ValueError):
+        return False
+
+
+def _cb_wants_src(cb) -> bool:
+    """下游回调吃不吃第 5 个参数（源消息时间 msg_time）。
+
+    跟 ``_cb_wants_wanted`` 同一套兼容思路：``handle_attachment`` 加了
+    ``msg_time`` 之后老接线（3/4 参）还得能跑，新接线才拿到时间。
+    """
+    try:
+        import inspect
+
+        params = [p for p in inspect.signature(cb).parameters.values()
+                  if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        return len(params) >= 5
+    except (TypeError, ValueError):
+        return False
+
+
+def _take_attach_src_time(ctx: "_Ctx", *names) -> "datetime | None":
+    """附件对应的**源消息**时间；判断不出返回 None。
+
+    为什么需要：附件回到电脑侧时是一条凭 sha1 拼出来的 Message，``msg_time``
+    天生为空 —— 而「积压超龄只入库不转发」按 msg_time 算年龄。不带上源时间
+    的话年龄永远是 0，两小时前那张卡片的明细照样会刷进群。
+
+    键可能对不上（候选链里手机点的是另一行），所以按 ``names`` 依次找，
+    找到就把所有候选键一起清掉 —— 不清会出**隔天误拦**：同一个附件名明天
+    还会出现，残留的旧时间条会让新附件被算成「一天前」。
+
+    三个源都取不到时间、或时间条读不出绝对时刻（「星期一」「昨天」裸的）
+    一律返回 None = 不拦。这套规则是挡陈年积压，不是做时间校验，宁可漏一条。
+    """
+    ts = ""
+    hit = ""
+    for key in names:
+        if key and key in ctx.attach_src_ts:
+            ts = ctx.attach_src_ts.get(key) or ""
+            hit = key
+            break
+    for key in names:                     # 顺手清干净，避免隔天误判
+        if key:
+            ctx.attach_src_ts.pop(key, None)
+    # 人工补抓（/attach-now）是人主动要的补发，不受积压闸门限制。
+    manual = getattr(ctx, "attach_manual", None)
+    if manual:
+        for key in names:
+            if key and key in manual:
+                manual.discard(key)
+                log.info("附件「%s」是人工补抓，跳过积压年龄判定", key)
+                return None
+    if not ts:
+        return None
+    try:
+        from .android_parse import unit_age_seconds
+    except ImportError:                   # 极端情况（拆分导入期）
+        return None
+    age = unit_age_seconds(ts)
+    if age is None:
+        return None
+    return datetime.now() - timedelta(seconds=age)
 
 
 def _attach_timeout_check(ctx: "_Ctx") -> None:
@@ -1106,18 +1491,55 @@ def _attach_timeout_check(ctx: "_Ctx") -> None:
         if now - at < ATTACH_FETCH_TIMEOUT:
             continue
         del ctx.attach_orders[name]
+        ctx.attach_fail_at[name] = now        # 退避期内不许自动重派
+        if getattr(ctx, "attach_active", "") == name:
+            # 这条彻底失败了也得放行，否则队列里后面的明细永远轮不到。
+            ctx.attach_active = ""
         if ctx.attach_file_at and ctx.attach_file_at > at:
             continue            # 期间收到过文件：链路正常，冷却自然结束
         log.warning("附件抓取超时：下单「%s」已 %.0f 秒没收到文件"
-                    "（手机端多半没找到附件行 / UC 下载失败）—— "
-                    "已释放冷却，卡片再次出现会重新下单", name, now - at)
+                    "（手机端最近结论：%s）—— 已释放冷却，"
+                    "卡片再次出现会重新下单",
+                    name, now - at,
+                    ctx.last_attach or "手机从未回报过任何结论")
+
+    # ⚠ 2026-11-01 实锤的另一种卡法：``attach_active`` 与 ``attach_orders``
+    # **脱钩** —— active 里的名字在 orders 里没有键（``/attach-now`` 清冷却
+    # 后塞队列、或上一轮已被删），上面的循环遍历的是 orders，根本轮不到它，
+    # 于是 active 永远挂着：队列进不来、重试报「正在抓」。这里对 active
+    # 单独兜底：只要它超过超时（或 orders 里没有它的下单时刻），一律放行。
+    active = getattr(ctx, "attach_active", "")
+    if active:
+        at = ctx.attach_orders.get(active)
+        if at is None or now - at >= ATTACH_FETCH_TIMEOUT:
+            ctx.attach_orders.pop(active, None)
+            ctx.attach_fail_at[active] = now      # 同上：退避，别立刻重派
+            ctx.attach_active = ""
+            log.warning("附件抓取超时（active 兜底）：「%s」没有在 %d 秒内"
+                        "拿到文件 —— 已释放，可重新下单", active,
+                        int(ATTACH_FETCH_TIMEOUT))
+
+
+def _attach_pending(ctx: "_Ctx") -> dict:
+    """还没拿到文件的附件订单：名字 → 已等秒数（排查用）。
+
+    2026-10-31 那天日志里只有「发现附件」一行，手机端一个字都没回，分不清
+    是「没收到指令」「收到了没点」「点了没下载」还是「下载了没传回来」。
+    把这个字段挂到 /ping 上，订单挂了多久一眼可见。
+    """
+    now = time.monotonic()
+    return {n: round(now - at, 1) for n, at in ctx.attach_orders.items()}
 
 
 def _order_attach(ctx: "_Ctx", pending: list) -> str:
-    """扫描本帧新单元里的附件行，返回要下发的附件名（没有则空串）。
+    """扫描本帧新单元里的附件行，返回**这一次**要下发的附件名（没有则空串）。
+
+    一帧可能扫出好几个名字（一张滞留卡片就有 4~5 条「明细：…」），手机
+    同一时刻只能抓一个，所以先进队列 ``ctx.attach_queue``，一次只放一个
+    出去；上一个抓到文件（``/file`` 到达）或超时释放之后，下一帧再取下一个。
 
     冷却记在 ``ctx.attach_orders``（名字 → monotonic）：卡片重渲染会让
-    同一条附件行在几十帧里反复出现，冷却期内不重复下单。
+    同一条附件行在几十帧里反复出现，冷却期内不重复入队。
 
     总开关 ``ctx.attach_enabled`` 也在这里判 —— 关掉时连冷却都不记，
     重新打开后卡片再出现能立刻抓，不必等 10 分钟冷却过去。
@@ -1126,15 +1548,41 @@ def _order_attach(ctx: "_Ctx", pending: list) -> str:
         return ""
     _attach_timeout_check(ctx)
     now = time.monotonic()
+
+    # 1) 先把本帧看到的附件行全部收进队列（已在抓/冷却中的跳过）
+    auto = bool(getattr(ctx, "attach_auto", True))
     for u in pending:
-        name = _attach_name(u.content, ctx.attach_keys)
-        if not name:
-            continue
-        if now - ctx.attach_orders.get(name, 0.0) < ATTACH_COOLDOWN:
-            continue
-        ctx.attach_orders[name] = now
-        return name
-    return ""
+        content = getattr(u, "content", "")
+        names = _attach_names(content, ctx.attach_keys, auto)
+        for name in names:
+            _remember_attach_name(ctx, name, now)
+            if name == ctx.attach_active or name in ctx.attach_queue:
+                continue
+            if now - ctx.attach_orders.get(name, 0.0) < ATTACH_COOLDOWN:
+                continue
+            # 上一趟刚超时：退避期别自动重派，否则卡片在屏上就是无限循环
+            if now - getattr(ctx, "attach_fail_at", {}).get(name, 0.0) < ATTACH_FAIL_BACKOFF:
+                continue
+            ctx.attach_queue.append(name)
+            # 记下这条消息的时间条：附件回到电脑侧要靠它算「多少分钟前」，
+            # 否则附件永远算 0 分钟、拦不住积压（见 attach_src_ts 的说明）。
+            ctx.attach_src_ts.setdefault(name, getattr(u, "ts", "") or "")
+            # 候选链（含「明细」行）随队列一起记着，下发时带给手机。
+            cands = _attach_cands(content, ctx.attach_keys, auto)
+            if len(getattr(ctx, "attach_cands", {}) or {}) > 32:
+                ctx.attach_cands.clear()          # 只在异常长跑时才涨，保险起见
+            ctx.attach_cands[name] = cands or [name]
+
+    # 2) 上一条还没结束就不发新的：手机端同一时刻只跑一个抓取任务，
+    #    并发下发会被它当场丢掉，那条订单就白白进了冷却（=永远抓不到）。
+    if ctx.attach_active:
+        return ""
+    if not ctx.attach_queue:
+        return ""
+    name = ctx.attach_queue.pop(0)
+    ctx.attach_orders[name] = now
+    ctx.attach_active = name
+    return name
 
 
 @dataclass
@@ -1204,15 +1652,49 @@ class _Ctx:
     # 名字冷却挡「这一分钟内别再点」，sha1 挡「这份文件别再发」。
     attach_orders: dict = field(default_factory=dict)     # 附件名 -> monotonic
     attach_seen: dict = field(default_factory=dict)       # sha1 -> True
+    # 最近在卡片里见过的附件行名字 (name, monotonic)，新的在后（最多 16 条）。
+    # 只服务于「文件传回来时叫什么」—— 见 `_display_name_for_file`。
+    attach_recent: deque = field(default_factory=lambda: deque(maxlen=16))
     # 最近一次收到附件文件的时刻（monotonic）。附件超时告警（_attach_timeout_
     # check）用它区分「已收到，冷却正常结束」和「超时没收到，要告警放行」。
     attach_file_at: float = 0.0
+    # 正在抓的那个附件名（空 = 当前没有在跑）。手机同一时刻只抓一个，队列
+    # 里的下一个要等它结束才放行 —— 见 `_order_attach`。
+    attach_active: str = ""
+    # 排队等着抓的附件名（一张滞留卡就有 4~5 条「明细：…」）。
+    attach_queue: list = field(default_factory=list)
+    # 附件名 → 「这次要手机依次尝试的行」（见 `_attach_cands`）。
+    # 用户 2026-11-01：「只要带明细字眼的都点开转发原文件」—— 一张卡里既有
+    # 「查看完整…（Excel）」按钮、又有「履约失败明细（10票）」这种标题时，
+    # 电脑侧排不出绝对正确的顺序，干脆把候选链下发给手机挨个试。
+    attach_cands: dict = field(default_factory=dict)
+    # 附件行所在**消息的时间条原文**（附件名 -> "今天 08:13"）。
+    #
+    # 存在的理由：附件回到电脑侧时是一条凭 sha1 拼出来的 Message，`msg_time`
+    # 天生为空 —— 而「积压超龄只入库不转发」正是按 msg_time 算年龄的。不带上
+    # 源时间的话年龄永远是 0，两小时前那张卡片的明细照样会刷进微信群
+    # （2026-11-01 20:4x 查出来：正文拦得住，附件这条路漏）。
+    #
+    # 用 setdefault 保第一次：卡片重渲染时这条消息会在几十帧里反复出现，
+    # 第一次看到的那个时间条才最接近消息真实时刻。
+    attach_src_ts: dict = field(default_factory=dict)
+    # 人工 /attach-now 点过的名字。这些是**人主动要的补发**，不受 30 分钟
+    # 积压闸门限制（跟 forward_recent.py 的 force 一个道理：那时候"发旧的"
+    # 正是用户要的）。用完即弃，避免这套豁免漏到同名自动单上。
+    attach_manual: set = field(default_factory=set)
+    # 失败退避：附件名 -> 最近一次超时的 monotonic。超时释放冷却后卡片还在
+    # 屏上，下一帧会立刻重新下单 —— 2026-11-01 14:14~14:18 就这么连着重派了
+    # 三次，每次 20 秒、来回跳 UC，日志刷满还干扰了用户。退避期内不许自动
+    # 重派（手动 /attach-now 不受限）。
+    attach_fail_at: dict = field(default_factory=dict)
     # 触发字眼（dingtalk.attach_keys）：下单时随 fetch_attach 一起下发给手机，
     # 手机端按同样的字眼找屏上的附件行 —— 两边必须一致，改配置两端同时生效。
     attach_keys: list = field(
         default_factory=lambda: list(DEFAULT_ATTACH_KEYS))
     # 总开关（dingtalk.attach_enabled）：关掉就完全不下发抓取指令。
     attach_enabled: bool = True
+    # 万能字眼（dingtalk.attach_auto）：短行里「名词+动作」都算附件按钮。
+    attach_auto: bool = True
     # 附件落盘目录与下游回调（service.handle_attachment）。空 = 不收文件。
     files_dir: str = ""
     on_file = None
@@ -1220,6 +1702,13 @@ class _Ctx:
     # 重建才允许打捞 —— 活跃浏览（翻历史 / 换群）时的重建绝不能捞，否则
     # 用户翻哪屏就把哪屏灌进微信群。
     align_stale_gave_up: bool = False
+    # 回底彻底没等到帧（手机没手势权限 / 卡死）时的「就地建基线」放行牌。
+    # 没有它就是死循环：_probe_decision 认输前 _reset_probe() 会把
+    # await_bottom 清掉，紧接着 _guard_fake_bottom 又看到屏上 99+ 徽标
+    # → 再请回底 → 基线永远建不上，_sweep_recent 也永远轮不到跑。
+    # 2026-10-31 09:31 真机：57 秒一轮，连着两轮都被自己打回。
+    # 一次性用掉：下一次锚点丢失照常重新试探 / 回底。
+    bottom_gave_up: bool = False
     # ── 「先攒后发」缓冲 ───────────────────────────────────────────
     # 钉钉机器人的 H5 卡片是分批渲染的，这一帧看到的往往只是半成品。
     # 早期用「扣住等重报帧指纹一致」，但 H5 卡片每重绘一次整批指纹都变，
@@ -1314,6 +1803,9 @@ class _Ctx:
     last_skip_note: str = ""
     # 连续多少帧认不出聊天页。只数「认不出来」，明确的 @ 面板/群信息不计。
     skip_streak: int = 0
+    # 上一次「认不出聊天页 → 自动下发切回指令」的时刻（time.monotonic，
+    # 0 = 从未）。冷却见 UNKNOWN_PAGE_AUTO_WATCH_COOLDOWN_S。
+    last_auto_watch_at: float = 0.0
     # ---- 在线状态（失联告警用）----
     # 最后一次收到手机上报的时刻（time.monotonic）。0 = 至今一次都没收到。
     last_seen: float = 0.0
@@ -1492,6 +1984,32 @@ class _Handler(BaseHTTPRequestHandler):
         left = until - time.monotonic()
         return left if left > 0 else 0.0
 
+    def _auto_watch_unknown_page(self) -> None:
+        """连续认不出聊天页时，自动请手机跑一轮巡检把钉钉切回目标群。
+
+        指令走现成的 watch_now 通道（心跳响应带下去，手机当场跑 SelfHeal，
+        走搜索框回群那条成熟老路）。冷却防的是「钉钉真改版、永远认不出」时
+        每 3 帧抢一次用户前台。只在恰好达到告警阈值的那个瞬间调用（由调用方
+        ``skip_streak == UNKNOWN_PAGE_ALERT_AFTER`` 保证），天然不重复。
+
+        ⚠ 调用点在 ``_ingest`` 里，而 ``_ingest`` 是在 ``/screen`` 的
+        ``ctx.lock`` **里面**跑的（帧要按到达顺序喂给 FrameDiffer）。所以这里
+        绝不能调 ``_queue_watch_now``（它自己也拿这把非重入锁 —— 会原地死锁，
+        2026-10-31 回归测试第一个抓到），而是在已持锁的前提下直接递增序号。
+        """
+        ctx = self.ctx
+        now = time.monotonic()
+        if now - ctx.last_auto_watch_at < UNKNOWN_PAGE_AUTO_WATCH_COOLDOWN_S:
+            return
+        if not ctx.watch_group:
+            return                    # 手机不知道切到哪个群，发了也白发
+        ctx.last_auto_watch_at = now
+        ctx.watch_now_seq += 1
+        log.warning("连续 %d 帧认不出聊天页，已自动下发「切回目标群」指令"
+                    "（第 %d 次，冷却 %.0f 秒）",
+                    UNKNOWN_PAGE_ALERT_AFTER, ctx.watch_now_seq,
+                    UNKNOWN_PAGE_AUTO_WATCH_COOLDOWN_S)
+
     def _queue_watch_now(self) -> str:
         """挂一条「立刻切回目标群」的指令，返回一句给人看的话。
 
@@ -1510,6 +2028,49 @@ class _Handler(BaseHTTPRequestHandler):
         log.info("收到「切到钉钉群」指令（第 %d 次）：等手机下次心跳带下去", seq)
         return (f"已排队：手机会在 1～60 秒内切到「{ctx.watch_group}」"
                 f"（手机自己会戳醒心跳，通常几秒内就能切）")
+
+    def _queue_attach_now(self, name: str) -> tuple[str, bool]:
+        """手工把一个附件名塞进抓取队列，返回 `(给人看的话, 是否受理)`。
+
+        与 `_order_attach` 共用同一份状态，所以要按它的规矩来：
+          · 清掉这个名字的冷却，否则 10 分钟内的重试会被 `ATTACH_COOLDOWN`
+            直接吞掉（表现成「点了没反应」）；
+          · 不越过 `attach_active` —— 手机端并发下发会被当场丢弃，那条订单
+            白白进冷却，等于永远抓不到；
+          · 关掉附件总开关（``attach_enabled``）时直接拒绝并说明，别让指令
+            排进队列后永远不消化。
+        """
+        ctx = self.ctx
+        name = (name or "").strip()
+        if not name:
+            return ("没给附件名：用 ?name=下载附件 指定屏幕上那个按钮/附件行的文字",
+                    False)
+        if not getattr(ctx, "attach_enabled", True):
+            return ("附件抓取总开关是关的（设置里「抓取附件」未勾选），"
+                    "队列不会消化 —— 先打开再试", False)
+        with ctx.lock:
+            if name == ctx.attach_active:
+                return (f"「{name}」正在抓（已下单 {ctx.attach_orders.get(name, 0):.0f}"
+                        f"），别重复下"), False
+            if name in ctx.attach_queue:
+                return (f"「{name}」已在队列第 {ctx.attach_queue.index(name) + 1} 位",
+                        False)
+            ctx.attach_orders.pop(name, None)
+            ctx.attach_queue.append(name)
+            # 人工要的单不受 30 分钟积压闸门限制（见 _Ctx.attach_manual）。
+            ctx.attach_manual.add(name)
+            pos = len(ctx.attach_queue) + (1 if ctx.attach_active else 0)
+            # 受单后**立刻要一帧**：手机静止时自己不刷帧（实测 age 能挂到
+            # 7 分钟以上），而派单只发生在「收到帧」的那一刻 —— 不主动
+            # 要帧，这单就在队列里干等到天荒地老（2026-11-01 实锤：三分钟
+            # 全程无帧、无派单、无点击）。
+            now = time.monotonic()
+            ctx.frame_req = max(int(now), ctx.frame_req + 1)
+            ctx.frame_req_at = now
+        log.info("手工补抓附件「%s」（队列第 %d 位）：等手机下次心跳/抓帧取走",
+                 name, pos)
+        return (f"已受理：手机会在 1～60 秒内去点「{name}」并回传文件"
+                f"（队列第 {pos} 位）"), True
 
     # --- 断连：不该在日志里变成红色 traceback ---
 
@@ -1557,9 +2118,30 @@ class _Handler(BaseHTTPRequestHandler):
                                    (self.ctx.token or "").encode("utf-8"))
 
     def _reject_auth(self) -> None:
+        # 先把请求体读掉再回 401：不回完就 close，客户端还在写 body，
+        # 内核直接给 RST —— 客户端看到的是 ConnectionAbortedError，
+        # 而不是这句「token 不对」（手机 App 上就是「连接被重置」，
+        # 排障时最容易被带偏；2026-10-31 全量测试偶发挂在同一条上）。
+        self._drain_body()
         self._reply(401, {"ok": False, "error": "token 不对",
                           "hint": "请求头带上 X-Bridge-Token，值与本机 "
                                   "config.yaml 的 dingtalk.gateway_token 一致"})
+
+    def _drain_body(self) -> None:
+        """把 Content-Length 指的请求体读掉（最多 64KB），读不到就算了。
+
+        只为让「拒绝」是个干净的响应，不做任何解析。
+        """
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return
+        if n <= 0:
+            return
+        try:
+            self.rfile.read(min(n, 65536))
+        except Exception:                              # noqa: BLE001
+            pass
 
     # --- 端点 ---
 
@@ -1602,6 +2184,13 @@ class _Handler(BaseHTTPRequestHandler):
                           "probe": self.ctx.last_probe,
                           # 手机端附件抓取的最近一句结论（空 = 还没抓过 / 旧 APK）。
                           "attach": self.ctx.last_attach or "(还没抓过附件)",
+                          # 还没拿到文件的附件订单：名字 → 已等秒数。
+                          # 有它在，「下单了但手机没反应」和「根本没下单」一眼分开。
+                          "attach_pending": _attach_pending(self.ctx),
+                          # 正在抓的那个 + 排队待抓的（多明细卡片会排队，
+                          # 队列长时间不减 = 手机卡在某一条上了）。
+                          "attach_active": self.ctx.attach_active,
+                          "attach_queue": list(self.ctx.attach_queue),
                           # 心跳里到底带没带巡检状态。看这一项就能分清
                           # 「手机没报」和「报了但巡检没跑」。
                           "watch_header": self.ctx.watch_header,
@@ -1684,7 +2273,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:                                # noqa: N802
         path = self._path()
         if path not in ("/", "/messages", "/screen", "/ping", "/watch-now",
-                        "/watch-pause", "/file"):
+                        "/watch-pause", "/attach-now", "/file"):
             self._reply(404, {"ok": False, "error": "未知路径"})
             return
         if not self._auth_ok():
@@ -1742,6 +2331,36 @@ class _Handler(BaseHTTPRequestHandler):
                                           > self.ctx.watch_now_served)})
             return
 
+        if path == "/attach-now":
+            # 手工补抓一个附件（运维接口）。存在的理由：附件字眼是**事后**
+            # 才被发现有遗漏的（2026-11-01 12:08「下载附件」夹在长行中间），
+            # 那条消息早已入库、被 differ 当成已知，修好解析也不会重放。
+            # 有了它就不用「删库重放」或「再改代码重启」——直接点一下手机去抓。
+            #
+            # 只做「塞进队列」：手机同一时刻只能跑一个抓取任务，真正的下发
+            # 仍由 `_order_attach` 在下一帧统一调度（并发下发会被手机丢弃）。
+            try:
+                an_len = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                an_len = 0
+            self._drain(an_len)
+            q = parse_qs(urlparse(self.path).query)
+            name = (q.get("name") or [""])[0].strip()
+            # 可选：手工指定候选链（"A||B||C"）。不指定时手机只点这一行 ——
+            # 手工补抓的场景里，人已经看准了屏上那一行是哪条。
+            cands = [x.strip() for x in (q.get("cands") or [""])[0].split("||") if x.strip()]
+            if cands:
+                self.ctx.attach_cands[name] = cands
+            msg, ok = self._queue_attach_now(name)
+            ctx = self.ctx
+            self._reply(200 if ok else 400, {
+                "ok": ok, "message": msg, "name": name,
+                "attach_enabled": bool(getattr(ctx, "attach_enabled", True)),
+                "attach_active": ctx.attach_active,
+                "attach_queue": list(ctx.attach_queue),
+            })
+            return
+
         if path == "/ping":
             # 手机端的**心跳**。它存在的唯一理由，是让电脑侧能区分
             # 「手机好好的，只是群里没人说话」和「手机端已经死了」——
@@ -1782,9 +2401,18 @@ class _Handler(BaseHTTPRequestHandler):
                            attach=attach)
             # 失败了当场说一句（只在新结论时打，否则每 60 秒刷一遍同样的字）。
             # 成功不用打：正常链路后面本来就有「收到手机附件」那行。
+            #
+            # ⚠ 2026-11-01 14:09 误报：worker 重启把 last_attach 清空了，手机
+            # 端 lastStatus 还是上一轮（12:31 手动实验）的「屏上找不到附件行
+            # （下载附件）」，重启后第一次心跳就被当成**新**故障告了警，用户
+            # 以为又出问题了。判据补一条：当前没有在抓的单、也没有排队的单，
+            # 那这个结论一定是陈旧的（手机不会替一个不存在的订单干活）。
             if attach and attach != prev_attach and any(
                     k in attach for k in _ATTACH_BAD_WORDS):
-                log.warning("手机那边附件没抓成：%s", attach)
+                if self.ctx.attach_active or self.ctx.attach_queue:
+                    log.warning("手机那边附件没抓成：%s", attach)
+                else:
+                    log.info("手机端附件结论（陈旧，当前没有在抓的单）：%s", attach)
             hb = {"ok": True, "source": "android",
                   "chat_name": self.ctx.chat_name,
                   "last_seen": self.ctx.last_seen_wall,
@@ -1809,6 +2437,24 @@ class _Handler(BaseHTTPRequestHandler):
             if self.ctx.watch_now_seq > self.ctx.watch_now_served:
                 self.ctx.watch_now_served = self.ctx.watch_now_seq
                 hb["watch_now"] = 1
+            # 附件单也搭心跳的回程车下发。
+            #
+            # ⚠ 2026-11-01 16:4x 的死锁，必须这么修：派单原本只在 ``/screen``
+            # 的响应里做，手机端也只读帧响应（CollectorService.maybeFetchAttachment）。
+            # 而手机一旦停在「附件下载后的预览页」，那一页界面不变就不报帧 ——
+            # 于是「不报帧 → 取不到单 → 没人触发 AttachmentFetcher.restoreToChat
+            # 退出预览页 → 继续不报帧」，原地锁死。现象就是：屏幕上明明白白
+            # 停着那个页面，程序一动不动，**用户只能手动点左上角「返回」**。
+            # 心跳是手机唯一规律发出的请求（60 秒一次），把单挂在这条路上，
+            # 通道就永远断不了：哪怕一帧都收不到，60 秒内也能把手机拉回来。
+            attach_hb = _order_attach(self.ctx, [])
+            if attach_hb:
+                hb["fetch_attach"] = attach_hb
+                hb["fetch_keys"] = _fetch_keys_for(self.ctx, attach_hb)
+                cands_hb = (getattr(self.ctx, "attach_cands", {}) or {}).get(attach_hb) or [attach_hb]
+                hb["fetch_cands"] = "||".join(cands_hb)
+                log.info("附件「%s」随心跳下发（画面帧通道可能已经停摆；候选 %d 个）",
+                         attach_hb, len(cands_hb))
             self._reply(200, hb)
             return
 
@@ -1907,6 +2553,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         name = str(meta.get("name") or "").strip()
         chat = str(meta.get("chat") or "").strip()
+        if not chat:
+            # 手机端拿不到会话名时这里就是空串。空 chat 会让附件的 Message
+            # 匹配不上任何转发规则 → 只入库、不进微信（2026-10-31 17:50
+            # 「查看完整月报明细（Excel）」就是这么被吞的，日志只留一行
+            # 「未命中转发规则」）。网关自己知道在盯哪个群，用它对上。
+            chat = self.ctx.watch_group or ""
         sha = str(meta.get("sha1") or "").strip().lower()
         data_b64 = str(meta.get("data") or "")
         if not name or not sha or not data_b64:
@@ -1945,21 +2597,55 @@ class _Handler(BaseHTTPRequestHandler):
                 f.write(data)
             os.replace(tmp, path)          # 先写临时名再改名：中断不留半个文件
 
-        fresh = not duplicate and sha not in self.ctx.attach_seen
+        # 「要不要交给下游」只看**本进程内**有没有见过这个 sha。
+        # 磁盘上已有同名文件 ≠ 已经发成功了：2026-11-01 14:2x 实测，文件落盘
+        # 之后投递线程卡死，手机重传同一份文件时被这里按「文件已存在」挡成
+        # duplicate，消息就再也发不出去。真正的「发过没有」由 service 按
+        # deliveries 表判定（Storage.is_duplicate(need_delivered=True)）。
+        # attach_seen 只留作统计/诊断（进程内见过哪些 sha），不再参与决策。
         self.ctx.attach_seen[sha] = True
         # 附件超时告警的「已收到」标记：哪怕这份文件不是当次下单的那份
         # （名字对不上），也说明链路活着，不该在冷却上再叠一次告警。
         self.ctx.attach_file_at = time.monotonic()
+        # 文件在微信里叫什么：优先「正在抓的那条附件行」的名字（用户看得懂的
+        # 中文名），取完再清 active —— 顺序反了就只能拿到手机那串英文名。
+        wanted = _display_name_for_file(self.ctx, name)
+        # 候选链（用户 2026-11-01「带明细都点」）带来的新情况：手机可能点的
+        # **不是** attach_active 那一行，而是候选链里的下一行。这时手机报上来
+        # 的 name 才是「真正下到这个文件的那一行」，用它当显示名才对得上内容
+        # —— 否则「履约失败明细（10票）」这个表格标题会被印到别的文件头上。
+        chain = (getattr(self.ctx, "attach_cands", {}) or {}).get(
+            self.ctx.attach_active) or []
+        if name and name != wanted and name in chain:
+            wanted = name
+        # 这一个抓到了 → 放行队列里的下一个（多明细卡片靠它往下走）。
+        # 取源消息时间要在清 active **之前**：这条单对应的消息时间条记在
+        # attach_src_ts 里，键可能是 active 名、手机报的行名、或显示名。
+        src_time = _take_attach_src_time(self.ctx, self.ctx.attach_active,
+                                         name, wanted)
+        self.ctx.attach_active = ""
         cb = self.ctx.on_file
-        if cb is not None and fresh:
+        # ⚠ attach_seen **不能**拿来挡回调（2026-11-01 14:46~14:53 实锤）：
+        #   它在回调前就标记 sha，而第一次回调完全可能「没发成功」（目标群
+        #   名对不上 → 未命中规则，仅入库）。之后手机每重传一次都被
+        #   fresh=False 拦成「重复跳过」—— 这份文件就永远发不出去了。
+        #   「发成功过没有」由下游按 deliveries 表精确判定
+        #   （Storage.is_duplicate(need_delivered=True)），这里只负责转交。
+        if cb is not None:
             try:
-                cb(path, name, chat)
+                if _cb_wants_src(cb):
+                    cb(path, name, chat, wanted, src_time)
+                elif _cb_wants_wanted(cb):
+                    cb(path, name, chat, wanted)
+                else:
+                    cb(path, name, chat)
             except Exception:                          # noqa: BLE001
                 log.exception("附件下游处理失败：%s", name)
 
         log.info("收到手机附件「%s」（%d 字节%s）→ %s", name, len(data),
-                 "，重复跳过" if duplicate or not fresh else "", path)
-        self._reply(200, {"ok": True, "duplicate": duplicate or not fresh})
+                 "，磁盘已有同名文件（是否重发由投递记录判定）" if duplicate else "",
+                 path)
+        self._reply(200, {"ok": True, "duplicate": duplicate})
 
     def _post_screen(self, raw: bytes, length: int) -> None:
         """收一帧节点树。只做「存下来 + 记元信息」，不解析 —— 解析是采集端的事。"""
@@ -2037,6 +2723,11 @@ class _Handler(BaseHTTPRequestHandler):
         # 占着锁会把 GET /screen 和手机的下一次上报一起卡住。
         emitted = self._emit(pending)
 
+        # 附件订单超时必须**每帧**查。原来只在「下一张卡片出现时」顺手查一次，
+        # 抓失败就永远静默 —— 2026-10-31 15:18 下单「运单明细」后手机端零动作，
+        # 日志里连一条「超时」都没有，用户只看到「附件没发出去」。每帧查 = 必留痕。
+        _attach_timeout_check(self.ctx)
+
         body = {"ok": True, "bytes": length, "count": count,
                 "md5": screen["md5"]}
         # 自动巡检指令：每一帧都带，手机端见 applyWatch（幂等，值没变不动调度器）。
@@ -2094,14 +2785,21 @@ class _Handler(BaseHTTPRequestHandler):
             # 附件抓取指令：新消息里出现「附件：xxx」→ 请手机点它、等下载、
             # 把文件传回 /file。冷却期内同名不再下（卡片重渲染会反复出现）。
             # 放在 parse 块里：只解析不转的模式没有消息概念，也没有附件可言。
-            if pending:
-                attach = _order_attach(self.ctx, pending)
-                if attach:
-                    body["fetch_attach"] = attach
-                    # 字眼一起下发：手机端按它找屏上的附件行。
-                    body["fetch_keys"] = ",".join(self.ctx.attach_keys)
-                    log.info("发现附件「%s」，已下发抓取指令%s", attach,
-                             tail("attach_order"))
+            # ⚠ 不能只在 `if pending:` 里调：一张卡片有多条明细时要排队逐个
+            #   抓，队列的推进得靠**后面没有新消息的那些帧**（上一个抓到文件
+            #   后，下一帧才放行下一个）。
+            attach = _order_attach(self.ctx, pending)
+            if attach:
+                body["fetch_attach"] = attach
+                # 字眼一起下发：手机端按它找屏上的附件行。
+                body["fetch_keys"] = _fetch_keys_for(self.ctx, attach)
+                # 候选链（用户 2026-11-01：带「明细」的行都要点一遍）。
+                # 用 "||" 分隔：行里可能带逗号（「仅展示前30条」）。
+                cands = (getattr(self.ctx, "attach_cands", {}) or {}).get(attach) or [attach]
+                body["fetch_cands"] = "||".join(cands)
+                log.info("发现附件「%s」，已下发抓取指令%s（候选 %d 个：%s；队列还剩 %d 个）",
+                         attach, tail("attach_order"), len(cands), " → ".join(cands),
+                         len(self.ctx.attach_queue))
         self._reply(200, body)
 
     # --- 画面解析（仅 dingtalk.android_parse = true）---
@@ -2151,6 +2849,10 @@ class _Handler(BaseHTTPRequestHandler):
                         "现在一条消息都不会转发。用 tools/android_capture.py "
                         "抓一帧看 page_reason", self.ctx.skip_streak, frame.page_reason)
                     self.ctx.last_skip_note = note
+                    # 告警只是「让人知道」，手机还停在别的页面上没人拉。
+                    # 2026-10-31 17:50：附件抓完后手机停在认不出的页面，
+                    # 告警响了 5 分钟，最后靠用户手动切回 —— 不能再靠人。
+                    self._auto_watch_unknown_page()
             return [], note, False
 
         self.ctx.skip_streak = 0
@@ -2278,21 +2980,43 @@ class _Handler(BaseHTTPRequestHandler):
                 # H5 帧的锚点丢失同样先试探一次（理由同下面原生帧那处）。
                 # **必须在 commit 之前**：commit 会把锚点覆盖成当前这屏，
                 # 覆盖之后就再也对不上了，试探也就白翻了。
-                verdict = self._probe_decision(frame_md5,
-                                               self._frame_sig(frame.units))
-                if verdict == "wait":
-                    # ⚠ 绝不能落到下面的 commit：commit 会把锚点覆盖成当前
-                    #   这屏，之后翻回去也对不上了。
-                    return [], "锚点丢失，等手机翻页安定", False
-                if verdict == "probe":
-                    self.ctx.align_md5 = frame_md5
-                    log.warning("安卓画面解析：H5 卡片的锚点对不上 —— "
-                                "已请手机往上翻一屏（累积第 %d 次，不回到原位）",
-                                self.ctx.align_tried)
-                    # 第三位刻意是 False：翻页指令走 body["probe"]，
-                    # **不是** body["scroll"]（scroll 是「翻上去再翻回来」，
-                    # 位置不累积，用来找锚点等于原地打转）。
-                    return [], "锚点丢失，往上翻一屏找", False
+                #
+                # ⚠ 2026-10-31（用户第二次说「有时还是上下快速跳动找锚点」）：
+                #   当天日志 H5 锚点对不上 51 次、原生帧只有 3 次 —— 跳动几乎
+                #   全部来自这条分支。H5 卡片的节点指纹每重绘一次就整批变，
+                #   「锚点找不到」多半不是视口翻了页，而是同一条卡片换了形态；
+                #   往上翻既找不回那条锚点（下一帧照样对不上，一路翻到 14 次），
+                #   用户看到的就是屏幕上下乱跳。
+                #   跳过翻页的条件（两条都要满足，宁严不宽）：
+                #     · 屏上没有任何「不在最新处」特征（frame.hints 空）；
+                #     · 屏上仍有**已知消息**做证据 —— 保证重建后的打捞层
+                #       （_salvage_rebuild / _sweep_recent）能把这一屏的真新
+                #       消息捡回来，而不是把它们登记成历史。
+                if (not getattr(frame, "hints", ())
+                        and not self.ctx.await_bottom
+                        and self._has_known_unit(frame)):
+                    log.info("安卓画面解析：H5 锚点对不上，但视口就在最新处"
+                             "（屏上有已知消息做证据）—— 不翻页，就地重建基线")
+                    # 走打捞：这一屏的真新消息不能随基线吞掉。
+                    self.ctx.align_stale_gave_up = True
+                else:
+                    verdict = self._probe_decision(frame_md5,
+                                                   self._frame_sig(frame.units))
+                    if verdict == "wait":
+                        # ⚠ 绝不能落到下面的 commit：commit 会把锚点覆盖成当前
+                        #   这屏，之后翻回去也对不上了。
+                        return [], "锚点丢失，等手机翻页安定", False
+                    if verdict == "probe":
+                        self.ctx.align_md5 = frame_md5
+                        log.warning("安卓画面解析：H5 卡片的锚点对不上 —— "
+                                    "已请手机往上翻一屏（累积第 %d 次，不回到原位）",
+                                    self.ctx.align_tried)
+                        # 第三位刻意是 False：翻页指令走 body["probe"]，
+                        # **不是** body["scroll"]（scroll 是「翻上去再翻回来」，
+                        # 位置不累积，用来找锚点等于原地打转）。
+                        return [], "锚点丢失，往上翻一屏找", False
+            if self._guard_fake_bottom(frame):
+                return [], "视口不在最新处（假底部），已请手机回底再建基线", False
             differ.commit(frame.units)
             self.ctx.last_good_units = list(frame.units)
             if diff.baseline:
@@ -2305,6 +3029,9 @@ class _Handler(BaseHTTPRequestHandler):
                     return s
                 return [], "已建立基线", False
             log.warning("安卓画面解析：锚点丢失，基线已重建到当前画面")
+            # 一轮结束，试探状态必须一起清（否则下一帧丢失会立刻命中「过期」
+            # 分支、白跳过一次翻页找回）。align_stale_gave_up 不在复位范围内。
+            self._reset_probe()
             salvaged = (self._salvage_rebuild(frame)
                         if self.ctx.align_stale_gave_up else [])
             # 打捞窗口只在重建这一次：不复位的话，之后任何重建都会带上打捞，
@@ -2321,6 +3048,8 @@ class _Handler(BaseHTTPRequestHandler):
             return [], "锚点丢失", False
 
         if diff.baseline:
+            if self._guard_fake_bottom(frame):
+                return [], "视口不在最新处（假底部），已请手机回底再建基线", False
             differ.commit(frame.units)          # peek 之后必须自己推进锚点
             self.ctx.last_good_units = list(frame.units)
             log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
@@ -2352,18 +3081,36 @@ class _Handler(BaseHTTPRequestHandler):
             if s:
                 swept_out, swept_note, swept_want = s
             why = needs_scroll(frame)
+            sus = []
             if why:
                 sus, _ = self._long_suspects(frame.units, frame)
-                if sus:
-                    log.info("安卓画面解析：基线帧里有一条长消息没显示全（%s）"
-                             "—— 请手机补全一次，补到的完整版只记录不转发"
-                             "（它在基线里，多半已经发过）", why)
-                    self._remember_long(sus[-1], why,
-                                        top_cut=min(sus[-1].y0, sus[-1].y1)
-                                        < frame.view[1] - 12)
-                    self.ctx.long_baseline = True
-                    return swept_out, (swept_note or
-                                       "基线里的长消息，只补全不转发"), True
+            # ── 钉钉把越界 bounds 夹回视口内 → 长卡片「看起来」完整 ──
+            # clipped_units 认不出这种形状（y0 恰好等于视口顶）。真机
+            # 2026-11-01 15:43：程序重启建基线，屏上正卡着一张没转发过的
+            # 长卡片，基线把它吞了 → 用户只能手动翻手机（原话）。
+            # 判据刻意保守，见 _tall_bottom_suspect。
+            tall = None
+            if not sus:
+                tall = self._tall_bottom_suspect(frame)
+                if tall is not None:
+                    why = (f"最底一条 {len(tall.content)} 字、从视口顶铺到底"
+                           "—— 疑似比屏幕高的卡片")
+            if why and (sus or tall is not None):
+                target = sus[-1] if sus else tall
+                seen = self._delivered_before(target)
+                log.info("安卓画面解析：基线帧里有一条疑似没显示全的长消息"
+                         "（%s）—— 请手机补全一次（%s）", why,
+                         "投递过，补全只记录" if seen else "从没投过，补全后照常转发")
+                self._remember_long(target, why,
+                                    top_cut=min(target.y0, target.y1)
+                                    < frame.view[1] - 12)
+                # 「只记录不转发」只适用于**发过的**历史；重启/掉线那一刻
+                # 屏上的新卡片从来没投过，补全后必须照常进群（2026-11-01）。
+                self.ctx.long_baseline = seen
+                return swept_out, (swept_note or
+                                   ("基线里的长消息，只补全不转发" if seen
+                                    else "基线长消息未投递过，补全后转发")), True
+            if why:
                 log.info("安卓画面解析：当前屏有消息没显示全（%s）", why)
             if swept_out:
                 return swept_out, swept_note, swept_want
@@ -2537,6 +3284,63 @@ class _Handler(BaseHTTPRequestHandler):
         """打捞的「已投递」判据 —— 委托模块级 `known_hit`，别各写一份。"""
         return known_hit(sender, content, known)
 
+    def _has_known_unit(self, frame) -> bool:
+        """屏上还有没有「已知消息」（上一正常帧见过，或已投递过）。
+
+        H5 锚点对不上时就地重建基线的**安全前提**：屏上至少要有一条已知
+        消息，证明这是同一个会话、且重建后的打捞层有证据可依（只捞证据
+        之下 = 底部进来的新消息）。一条都没有 = 换了群 / 整屏全新，宁可
+        老老实实翻页找锚点，也不能把整屏当基线登记成历史。
+        """
+        known = self.ctx.delivered_texts
+        good = {u.fp for u in (self.ctx.last_good_units or [])}
+        for u in (frame.units or []):
+            if u.fp in good or self._known_hit(u.sender, u.content, known):
+                return True
+        return False
+
+    def _guard_fake_bottom(self, frame) -> bool:
+        """建基线前的「假底部」护栏：视口不在最新处就先请手机回底。
+
+        返回 True = 本帧已被拦下（不要 commit 基线）。
+
+        2026-10-29 大江东群漏消息的根因：机器人 H5 容器里所有滚动手段
+        失效，基线被建在「假底部」—— 视口停在历史中间就把屏上一切登记
+        成已知历史，压在底下的真新消息之后只会出现在锚点**上方**，
+        永远不会被转发。屏上有 99+ 未读徽标、「查看更多消息」「回到最新」
+        这类节点特征（frame.hints，见 android_parse.ui_hints）时，先请
+        手机回到底部（want_bottom → to_bottom），等回底帧再建基线。
+
+        已在等回底（await_bottom）或这一帧就是回底帧（probe-bottom）时
+        不再拦 —— 否则 H5 容器特征清不掉时会死循环；此时按现状建基线
+        （有限让步），打捞层（_sweep_recent）会把屏上 30 分钟内的真新
+        消息捞出来。
+        回底彻底等不到时（手机没手势权限，_probe_decision 超时认输）靠
+        ``ctx.bottom_gave_up`` 一次性放行：认输前 _reset_probe 已经把
+        await_bottom 清掉，不放行就是「认输 → 被拦 → 再回底」的 57 秒
+        一轮死循环，基线永远建不上、一条消息都转不出去（2026-10-31）。
+        """
+        if getattr(self.ctx, "bottom_gave_up", False):
+            # 回底已经彻底等不到：再拦就是死循环（基线建不上 = 一条不转）。
+            # 放行就地建基线，屏上内容交给打捞层 —— hints 命中时
+            # _sweep_recent 整屏都是候选。
+            self.ctx.bottom_gave_up = False
+            self.ctx.await_bottom = False
+            log.warning("安卓画面解析：回底帧始终没来（多半没有手势权限）—— "
+                        "就地在当前屏建基线，屏上内容按打捞候选处理")
+            return False
+        if not getattr(frame, "hints", ()):
+            return False
+        if self.ctx.await_bottom or self.ctx.frame_reason == "probe-bottom":
+            # 回底帧到了（或已在等）：标志一次性用掉，按现状建基线。
+            self.ctx.await_bottom = False
+            return False
+        log.warning("安卓画面解析：屏上有「不在最新处」特征（%s）—— "
+                    "不建基线，先请手机回到底部",
+                    "、".join(frame.hints))
+        self._ask_bottom()
+        return True
+
     def _sweep_recent(self, frame) -> list:
         """基线（首帧 / 重建）时把屏上「30 分钟内且从没见过」的消息捞出来。
 
@@ -2546,7 +3350,10 @@ class _Handler(BaseHTTPRequestHandler):
         forward_recent.py 都补不回来。打捞判据层层收窄：
 
           · 同会话证据：屏上至少有一条「入库过 / 投过」的单元，且只捞
-            **证据之下**的单元（新消息只会从底部进来）。一条证据都没有
+            **证据之下**的单元（新消息只会从底部进来）。一条证据都没有时
+            还有第二类证据：屏上的「99+ 未读徽标 / 查看更多消息 / 回到最新」
+            UI 特征（frame.hints，2026-10-30 假底部事故后加）—— 它们同样
+            证明「视口不在最新处」，此时整屏都是打捞候选；两类证据都没有
             = 换了群 / 全新安装，宁可不捞 —— 把别的群的消息打进目标群
             是事故；
           · 时间判据：单元头顶时间条必须读得出绝对时刻（「今天 17:57」）
@@ -2581,12 +3388,23 @@ class _Handler(BaseHTTPRequestHandler):
         for i, u in enumerate(units):
             if u.fp in good_fps or _is_known(u):
                 evidence = i
+        hints = tuple(getattr(frame, "hints", ()) or ())
         if evidence < 0:
-            return []                     # 没有同会话证据，宁可不捞
+            if not hints:
+                return []                 # 两类证据都没有，宁可不捞
+            # UI 特征兜底（2026-10-30 假底部事故）：屏上没有任何已入库消息，
+            # 但有「99+ 未读徽标 / 查看更多消息 / 回到最新」类节点 —— 视口
+            # 不在最新处，整屏都是基线没盖住的候选。时间/去重/夹断护栏照旧。
+            log.warning("安卓画面解析：屏上没有已入库消息，但发现「不在最新处」"
+                        "特征（%s）—— 整屏按打捞候选处理",
+                        "、".join(hints))
+            cand = list(units)
+        else:
+            cand = list(units[evidence + 1:])
         bad = {id(u) for u in clipped_units(frame)}   # 被夹的交给补全通道
         now = datetime.now()
         kept = []
-        for u in units[evidence + 1:]:
+        for u in cand:
             if id(u) in bad:
                 continue
             age = unit_age_seconds(u.ts, now)
@@ -2719,6 +3537,9 @@ class _Handler(BaseHTTPRequestHandler):
                 log.warning("安卓画面解析：请手机回到底部后 %.0f 秒没等到回底帧"
                             "（多半没有手势权限）—— 就地重建基线", waited)
                 self._reset_probe()
+                # 放行牌：_reset_probe() 刚把 await_bottom 清掉，不标记的话
+                # 调用方的 _guard_fake_bottom 会再拦一次，认输等于白认。
+                self.ctx.bottom_gave_up = True
                 return "give_up"
             return "wait"       # 还在往回滚的路上，先别动基线
         # ⚠ 试探状态会过期（见 ALIGN_STALE 注释）。过期不再翻页：锚点早已
@@ -2896,6 +3717,53 @@ class _Handler(BaseHTTPRequestHandler):
         if dropped:
             frame.units = keep
         return dropped
+
+    def _delivered_before(self, unit) -> bool:
+        """这条消息投递过没有（按正常路径的 uid 查持久去重表）。
+
+        没有判重依据（dup_check 未接）时按「投过」处理 —— 保守：宁可少发，
+        也不能把一条历史灌进微信群。
+        """
+        check = self.ctx.dup_check
+        if check is None:
+            return True
+        try:
+            return bool(check(f"android:{unit.fp}:1"))
+        except Exception:                              # noqa: BLE001
+            log.exception("dup_check 失败，按「投过」处理（宁可不发）")
+            return True
+
+    def _tall_bottom_suspect(self, frame):
+        """最底那条「从视口顶铺到底、又没投过」的消息 —— 疑似比屏幕高的卡片。
+
+        ── 为什么 clipped_units 认不出它 ────────────────────────────
+        钉钉把越界的 bounds **夹回视口内**，于是这张卡片「看起来」端端正正
+        待在屏里（y0 == 视口顶，①②③ 全不命中）。真机 2026-11-01 15:43：
+        程序重启建基线时屏上正卡着一张没转发过的长卡片，基线把它吞掉，
+        用户只能手动翻手机才补回来。
+
+        判据刻意保守 —— 这个判定错了就会白翻屏，甚至把上一条消息拼进正文：
+          · 只看**最底下**那条（新消息只从底部进来）；
+          · 顶边贴视口上沿（±24px），且高度 ≥ 60% 视口高；
+          · 正文 ≥ 120 字（短内容一屏必然装得下，不可能是「被切的长文」）；
+          · **从未投递过**（`_delivered_before`）—— 发过的历史不值得为它翻屏。
+        """
+        units = frame.units or []
+        if not units:
+            return None
+        u = units[-1]
+        top, bottom = frame.view[1], frame.view[3]
+        vh = max(1, bottom - top)
+        y0, y1 = min(u.y0, u.y1), max(u.y0, u.y1)
+        if y0 > top + 24:                # 顶边没贴边 = 上沿可见，没被切
+            return None
+        if (y1 - y0) < vh * 0.6 and y1 < bottom - 24:
+            return None                  # 高度与贴底都不占，不像长卡片
+        if len(u.content or "") < 120:
+            return None
+        if self._delivered_before(u):
+            return None
+        return u
 
     def _long_suspects(self, units: list, frame) -> tuple[list, list]:
         """把本帧新消息分成「疑似被切掉的长消息」和「其余」。
@@ -3206,6 +4074,9 @@ class AndroidGatewaySource(Source):
         self.attach_keys = _clean_attach_keys(getattr(dt, "attach_keys", None))
         # 总开关：关掉就不下发 fetch_attach（手机端不用知道这个键）。
         self.attach_enabled = bool(getattr(dt, "attach_enabled", True))
+        # 万能字眼：短行里「名词（附件/明细/Excel…）+ 动作（下载/查看…）」
+        # 就当作附件按钮。默认开 —— 用户的诉求是「别漏」。
+        self.attach_auto = bool(getattr(dt, "attach_auto", True))
         # 附件落盘目录：跟数据库同目录下的 attachments/（service 侧能找到）。
         try:
             base = Path(cfg.resolve(cfg.storage.db_path)).parent
@@ -3261,6 +4132,7 @@ class AndroidGatewaySource(Source):
                    watch_group=self.watch_group, watch_min=self.watch_min,
                    attach_keys=self.attach_keys,
                    attach_enabled=self.attach_enabled,
+                   attach_auto=self.attach_auto,
                    differ=FrameDiffer() if self.parse else None)
         ctx.dup_check = dup_check
         # 附件抓取链路：目录 + 下游回调。任一缺失都只是「收不了附件」，

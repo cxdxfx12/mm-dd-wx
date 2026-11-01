@@ -558,7 +558,7 @@ class TestServiceAlerts(unittest.TestCase):
         from bridge.models import Message
         return Message(chat_id="c1", chat_name=self.CHAT, sender_id="u1",
                        sender_name="张三", company="申通快递", content=content,
-                       msg_type="text", msg_time=datetime(2026, 10, 16, 14, 20),
+                       msg_type="text", msg_time=datetime.now(),
                        raw_id=f"r-{content}")
 
     def _service(self, notify: NotifyConfig, fail: bool = False):

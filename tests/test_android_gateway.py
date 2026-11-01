@@ -725,10 +725,13 @@ class TestEndToEnd(unittest.TestCase):
             return json.loads(resp.read().decode("utf-8"))
 
     def test_message_lands_in_db_and_target(self):
+        # 时间必须是「当下」：service 层会把超过 MAX_BACKLOG_MIN 的积压消息
+        # 拦住不转发（用户 2026-11-01 要求），写死旧日期这条用例就永远不过了。
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         body = self.post_to({"messages": [{
             "sender": "签收跟单专员 机器人",
             "content": "@所有人【客户声音履约风险提醒】374票",
-            "time": "2026-10-16 20:31:00",
+            "time": now_text,
         }]})
         self.assertEqual(body["accepted"], 1)
 
@@ -762,14 +765,26 @@ class TestEndToEnd(unittest.TestCase):
         ]})
         self.assertEqual(len(self.target.sent), 2)
 
-    def test_cross_day_not_filtered_by_gateway(self):
-        """网关不做时间过滤 —— 手机离线一夜后补报的消息不能被当历史丢掉。"""
+    def test_cross_day_accepted_but_not_forwarded(self):
+        """跨天补报：网关**收**下，业务层**不转发**（2026-11-01 起）。
+
+        这条的分层责任要说清，两边都别越界：
+        - 网关不做时间过滤 —— 手机离线一夜后补报的消息不能被网关当历史丢掉，
+          否则消息彻底消失，事后连留档都没有（`accepted == 1`、入库成功）；
+        - 但 service 层按「积压超龄」拦投递 —— 用户 2026-11-01 明确要求
+          「超过 30 分钟的积压不能再转发了」，一夜前的消息显然超龄。
+
+        以前的断言是 `sent == 1`，那是「不丢就发」的旧策略；现在改成
+        「先收下、留档，再决定要不要打扰群里」，否则手机会在恢复瞬间
+        把整屏旧消息灌进微信群。
+        """
         body = self.post_to({"messages": [{
             "sender": "播报助手", "content": "昨天漏报的", "seq": 1,
             "time": "2026-10-15 23:50:00",
         }]})
-        self.assertEqual(body["accepted"], 1)
-        self.assertEqual(len(self.target.sent), 1)
+        self.assertEqual(body["accepted"], 1)      # 网关不丢
+        self.assertEqual(len(self.target.sent), 0)  # 业务层不打扰
+        self.assertEqual(self.svc.storage.query(limit=5)[0]["content"], "昨天漏报的")
 
 
 class TestScreenParse(GatewayCase):
@@ -932,6 +947,45 @@ class TestScreenParse(GatewayCase):
         """
         body = self.post_frame(self.screen(
             self.row("普通件滞留7天 96票", 400, "签收跟单专员")))
+        self.assertEqual(body["note"], "已建立基线")
+        self.assertNotIn("scroll", body)
+
+    # ---- 基线吞掉「没投过的长卡片」的兜底（2026-11-01 用户原话：
+    #      「最后一条消息又是我手动翻手机才转发的，最好彻底解决一下」）----
+    def test_baseline_tall_undelivered_card_triggers_fill(self):
+        """重启建基线时屏上正卡着「没转发过的长卡片」→ 请求补全、补完要转发。
+
+        钉钉会把越界 bounds 夹回视口内，这种卡片 clipped_units 认不出
+        （y0 恰好等于视口顶）—— 2026-11-01 15:43 真机，基线把它吞了，
+        用户只能手动翻手机。现在这种形状必须请手机补全，且因为从没投过，
+        补完照常进群（long_baseline=False）。
+        """
+        self.source._ctx.dup_check = lambda uid: False      # 从没投过
+        long_text = "当日签履约情况，" + "详细数据如下，" * 30   # ≥120 字
+        node = (f'<node text="{long_text}" class="android.widget.TextView" '
+                f'package="{self.PKG}" bounds="[80,200][1000,2000]"></node>')
+        body = self.post_frame(self.screen(node))
+        self.assertIn("scroll", body, "撑满视口且没投过的长卡片必须请求补全")
+        self.assertFalse(self.source._ctx.long_baseline,
+                         "没投过的卡片补全后要照常转发")
+        self.assertIn("补全", body["note"])
+
+    def test_baseline_tall_delivered_card_stays_quiet(self):
+        """同形状、但已经投递过 → 不翻屏（历史不值得为它滚动）。"""
+        self.source._ctx.dup_check = lambda uid: True       # 投过
+        long_text = "当日签履约情况，" + "详细数据如下，" * 30
+        node = (f'<node text="{long_text}" class="android.widget.TextView" '
+                f'package="{self.PKG}" bounds="[80,200][1000,2000]"></node>')
+        body = self.post_frame(self.screen(node))
+        self.assertEqual(body["note"], "已建立基线")
+        self.assertNotIn("scroll", body)
+
+    def test_baseline_short_bottom_card_not_suspect(self):
+        """短内容 + 没贴顶 → 不是长卡片嫌疑，照旧不滚（防常态滚动）。"""
+        self.source._ctx.dup_check = lambda uid: False
+        node = ('<node text="短消息" class="android.widget.TextView" '
+                f'package="{self.PKG}" bounds="[80,700][1000,820]"></node>')
+        body = self.post_frame(self.screen(node))
         self.assertEqual(body["note"], "已建立基线")
         self.assertNotIn("scroll", body)
 

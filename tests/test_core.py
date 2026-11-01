@@ -38,7 +38,7 @@ def msg(**kw) -> Message:
     base = dict(
         chat_id="c1", chat_name="供应商群", sender_id="u1", sender_name="张三",
         company="示例科技有限公司", content="测试内容", msg_type="text",
-        msg_time=datetime(2026, 10, 15, 9, 30), raw_id="r1",
+        msg_time=datetime.now().replace(microsecond=0), raw_id="r1",
     )
     base.update(kw)
     return Message(**base)
@@ -145,7 +145,8 @@ class TestFormatter(unittest.TestCase):
         self.assertIn("你好", text)
 
     def test_render_custom_template(self):
-        text = render(msg(content="你好"), "{sender}|{content}|{time}")
+        text = render(msg(content="你好", msg_time=datetime(2026, 10, 15, 9, 30)),
+                      "{sender}|{content}|{time}")
         self.assertEqual(text, "张三|你好|09:30")
 
     def test_render_bad_placeholder_raises(self):
