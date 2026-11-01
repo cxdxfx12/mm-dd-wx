@@ -40,6 +40,7 @@ for _p in (str(APP_DIR), str(BASE_DIR)):
 # 版本号**只有一个来源**：bridge/__init__.py。
 # 安装包里的版本也由 installer/build.py 从同一处注入，别在这个文件里写死。
 from bridge import __version__ as APP_VERSION          # noqa: E402
+from bridge import janitor                             # noqa: E402
 
 
 def _notify_robots(n: dict) -> list[str]:
@@ -359,6 +360,10 @@ class App(tk.Tk):
         m_tool.add_separator()
         m_tool.add_command(label="打开数据目录", command=self._open_data_dir)
         m_tool.add_command(label="打开日志目录", command=self._open_log_dir)
+        m_tool.add_separator()
+        # 用户 2026-11-01 提的需求：项目自己攒下来的垃圾（表格图 35MB、日志、
+        # 调试转储）要能一键清掉，而不是让他去 data 目录里手动挑。
+        m_tool.add_command(label="清理本地垃圾…", command=self.clean_local_junk)
         bar.add_cascade(label="工具", menu=m_tool)
 
         m_help = tk.Menu(bar, tearoff=0)
@@ -874,6 +879,63 @@ class App(tk.Tk):
         d = paths.data_dir()
         d.mkdir(parents=True, exist_ok=True)
         self._open_path(d)
+
+    def clean_local_junk(self):
+        """工具 → 清理本地垃圾：先列出清单，用户点头才删。
+
+        为什么非要先预览：这个功能删的是人家磁盘上的文件，不给看清单就等于
+        请人闭眼签字。清单里连「不会动什么」也一起写上 —— 用户真正怕的不是
+        删不干净，是**多删**（收下来的附件、还没发出去的 outbox 都在同一层）。
+
+        只删 data/ 下白名单里的东西，规则与保护名单都在 bridge/janitor.py，
+        那边有 16 个用例钉着。这里只负责问一句、然后照办。
+        """
+        data = paths.data_dir()
+        try:
+            plan = janitor.scan(data)
+        except Exception as exc:                      # noqa: BLE001
+            err = str(exc)
+            self.after(0, lambda: messagebox.showerror(
+                "清理本地垃圾", f"扫描失败：{err}", parent=self))
+            return
+
+        keep = janitor.DEFAULT_KEEP_DAYS
+        if plan.total_count == 0:
+            messagebox.showinfo(
+                "清理本地垃圾",
+                f"没有需要清理的文件。\n\n"
+                f"表格图片、运行日志、调试转储都只清 {keep} 天以前的；\n"
+                f"配置备份保留 {janitor.BACKUP_KEEP_DAYS} 天。",
+                parent=self)
+            return
+
+        body = (
+            f"将删除下列 {keep} 天以前（配置备份 "
+            f"{janitor.BACKUP_KEEP_DAYS} 天以前）的文件：\n\n"
+            + "\n".join(janitor.summary_lines(plan))
+            + "\n\n不会动：消息数据库、收到的附件、待发送队列、config.yaml。\n\n"
+            "确定清理吗？"
+        )
+        if not messagebox.askyesno("清理本地垃圾", body, parent=self):
+            return
+
+        try:
+            res = janitor.execute(plan)
+        except Exception as exc:                      # noqa: BLE001
+            err = str(exc)
+            self.after(0, lambda: messagebox.showerror(
+                "清理本地垃圾", f"清理失败：{err}", parent=self))
+            return
+
+        freed = janitor.human_size(res.freed)
+        msg = f"已删除 {res.deleted} 个文件，释放 {freed}。"
+        if res.failed:
+            names = "\n".join(f"· {p.name}" for p, _why in res.failed[:6])
+            more = "" if len(res.failed) <= 6 else f"\n……共 {len(res.failed)} 个"
+            msg += ("\n\n有文件没删掉（多半正被后台程序占用，下次再清即可）：\n"
+                    + names + more)
+        messagebox.showinfo("清理本地垃圾", msg, parent=self)
+        self._log(f"清理本地垃圾：删除 {res.deleted} 个文件，释放 {freed}")
 
     # ================================================== 工作进程事件
 
