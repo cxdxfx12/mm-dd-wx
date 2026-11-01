@@ -23,8 +23,8 @@
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.hbdxm.ddwx"
-    android:versionCode="33"
-    android:versionName="0.5.20">
+    android:versionCode="46"
+    android:versionName="0.5.33">
     <!-- ⚠ 这两个值是**真正进包**的（aapt2 以清单为准，build.py 里的
          version-code / version-name 参数对它不起作用 —— 2026-10-20 实测确认）。
          所以改版本号时必须**同时**改三处，少一处就会出现「文件名 0.4.1、
@@ -40,6 +40,12 @@
     <!-- 前台保活服务（常驻通知）。没有它，华为/小米会在内存紧张时把整个应用
          连同无障碍服务一起回收，而回收之后不会自己回来。 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- 灭屏续采用的 CPU 唤醒锁（PARTIAL_WAKE_LOCK）。
+         ⚠ 前台服务只抬高进程优先级，**不阻止 CPU 休眠** —— 两者常被混为一谈。
+         没有这条权限时 newWakeLock 会直接抛 SecurityException，采集端就退回
+         「手机一待机就静默、必须有人翻一下才恢复」的老毛病
+         （2026-11-01 真机：16:08 最后一帧、16:22 最后心跳，之后 13 分钟空白）。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Android 13+ 显示常驻通知要用户授权（不授也能跑，只是看不到状态） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 设置页的「允许后台常驻」按钮用它申请电池优化白名单 -->

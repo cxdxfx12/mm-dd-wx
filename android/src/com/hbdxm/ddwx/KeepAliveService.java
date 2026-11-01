@@ -11,6 +11,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.util.Log;
 
 /**
@@ -38,8 +39,19 @@ public class KeepAliveService extends Service {
     /** 检查间隔。30 秒足够快，又不至于让待机耗电明显变差。 */
     private static final long CHECK_MS = 30000L;
 
+    /**
+     * 唤醒锁单次时长。带超时而不是无限期 acquire，两个理由：
+     * ① Android 把「没有超时的 WakeLock」当作滥用信号；
+     * ② 万一本服务被系统干掉而 onDestroy 没跑到，锁最多多耗 10 分钟就自己放开，
+     *    不会变成永久漏电。每 30 秒的检查里会续期，实际效果是持续持有。
+     */
+    private static final long LOCK_TIMEOUT_MS = 10 * 60 * 1000L;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean wasAlive = true;
+    private PowerManager.WakeLock wakeLock;
+    /** 供常驻通知显示当前是否在「灭屏续采」状态。 */
+    private static volatile boolean holdingLock = false;
 
     private final Runnable check = new Runnable() {
         @Override
@@ -49,6 +61,9 @@ public class KeepAliveService extends Service {
                 wasAlive = alive;
                 Log.w(TAG, alive ? "无障碍服务已恢复" : "无障碍服务已断开");
             }
+            // 顺手续期唤醒锁：超时释放后这里会重新拿到，等于「一直持有」，
+            // 但任何时刻都有上限，不会永久漏电。
+            acquireWakeLock();
             updateNotice(alive);
             handler.postDelayed(this, CHECK_MS);
         }
@@ -89,6 +104,9 @@ public class KeepAliveService extends Service {
         // 必须立刻 startForeground：Android 8+ 用 startForegroundService 起的服务
         // 若 5 秒内没有 startForeground，系统会抛 ANR 级异常把应用干掉。
         startForeground(NOTI_ID, build(KeepAliveService.this, true));
+        // 前台服务只抬高进程优先级，**管不住 CPU 休眠** —— 灭屏后 CPU 一进
+        // suspend，定时抓帧和心跳的回调就集体停摆。要真的一直上报，必须持锁。
+        acquireWakeLock();
         handler.postDelayed(check, CHECK_MS);
     }
 
@@ -106,6 +124,7 @@ public class KeepAliveService extends Service {
     @Override
     public void onDestroy() {
         handler.removeCallbacks(check);
+        releaseWakeLock();
         // 前台服务的常驻通知不会随 stopService 自动消失，必须自己撤。
         try {
             NotificationManager nm =
@@ -117,6 +136,65 @@ public class KeepAliveService extends Service {
             Log.w(TAG, "撤常驻通知失败：" + t);
         }
         super.onDestroy();
+    }
+
+    // ------------------------------------------------------------------ 唤醒锁
+
+    /**
+     * 申请 CPU 唤醒锁（只保 CPU 不休眠，不亮屏、不点屏）。
+     *
+     * <p><b>为什么非它不可</b>：采集全靠「定时抓帧 + 心跳」两条定时回调
+     * （{@link CollectorService} 的 {@code ScheduledExecutorService} 和心跳线程）。
+     * 手机一待机，CPU 进 suspend，这些回调就集体停摆 —— 手机没掉线、钉钉里也真
+     * 有新消息，电脑侧却一个字都收不到。2026-11-01 真机实测：最后一帧 16:08:51、
+     * 最后一次心跳 16:22:28，之后 13 分钟一片空白；人一碰手机，积压的帧和指令
+     * 一次性涌上来 —— 用户看到的就是「我必须翻一下手机它才转发」。
+     *
+     * <p>前台服务 <b>不等于</b> 不休眠：它只把进程的 oom_adj 调高、降低被回收
+     * 的概率，对 CPU 电源状态没有任何约束。这两件事以前被混为一谈，所以
+     * 「有常驻通知」和「真的还在上报」可以同时不成立。
+     */
+    private void acquireWakeLock() {
+        try {
+            if (!Prefs.keepAwake(this)) {
+                holdingLock = false;
+                return;
+            }
+            if (wakeLock == null) {
+                PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                if (pm == null) {
+                    Log.w(TAG, "拿不到 PowerManager，灭屏续采不可用");
+                    holdingLock = false;
+                    return;
+                }
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ddwx:keepalive");
+                // 不计数：多次 acquire 只算一次，避免续期把计数越堆越高、
+                // 最后 release 一次放不掉。
+                wakeLock.setReferenceCounted(false);
+            }
+            if (!wakeLock.isHeld()) {
+                wakeLock.acquire(LOCK_TIMEOUT_MS);
+                Log.i(TAG, "已持有 CPU 唤醒锁 —— 灭屏后仍按时上报（每 "
+                        + (LOCK_TIMEOUT_MS / 1000) + " 秒自动续期）");
+            }
+            holdingLock = true;
+        } catch (Throwable t) {
+            holdingLock = false;
+            Log.w(TAG, "唤醒锁申请失败：" + t);
+        }
+    }
+
+    private void releaseWakeLock() {
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) {
+                wakeLock.release();
+                Log.i(TAG, "已释放 CPU 唤醒锁");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "释放唤醒锁失败：" + t);
+        } finally {
+            holdingLock = false;
+        }
     }
 
     // ------------------------------------------------------------------ 通知
@@ -139,9 +217,12 @@ public class KeepAliveService extends Service {
                 pendingFlags());
 
         String title = alive ? "采集端运行中" : "⚠ 采集已停止";
+        // 「灭屏续采」写进通知文案：用户一眼能看出这台机器现在会不会在待机时
+        // 静默。没有这一行时，「有常驻通知」和「其实已经不上报了」长得一模一样。
         String text = alive
                 ? ("已上报 " + CollectorService.posts + " 条 · 心跳 "
-                   + CollectorService.lastHeartbeat)
+                   + CollectorService.lastHeartbeat
+                   + (holdingLock ? " · 灭屏续采中" : " · 灭屏即静默"))
                 : "无障碍服务被系统关闭了，现在一条消息都不会转发。点这里重新开启。";
 
         Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O

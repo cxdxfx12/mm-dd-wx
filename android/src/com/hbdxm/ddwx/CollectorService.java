@@ -162,6 +162,8 @@ public class CollectorService extends AccessibilityService {
 
     /** 上一次成功上报的 md5。只有它变了才发，避免网络白跑。 */
     private volatile String sentMd5 = "";
+    /** 电脑端要帧还没真正发出去的编号。0 = 没有欠着的帧（见心跳处理）。 */
+    private volatile int pendingWantFrame = 0;
 
     /** 「瞎了」诊断帧的节流：同一原因 2 分钟内只报一次（见 reportBlind）。 */
     private static final long BLIND_REPORT_MS = 120000L;
@@ -638,11 +640,29 @@ public class CollectorService extends AccessibilityService {
         int wantFrame = jsonInt(r.body, "want_frame", 0);
         if (wantFrame > 0 && wantFrame > Prefs.frameReq(this)) {
             Prefs.setFrameReq(this, wantFrame);
+            pendingWantFrame = wantFrame;
             sentMd5 = "";
             Log.i(TAG, "电脑端请求重发一帧（#" + wantFrame + "），已清画面指纹");
             lastResult = "电脑端要一帧，重发当前画面";
             captureAndSend("pc-frame-req");
+        } else if (pendingWantFrame > 0) {
+            // 上次要的帧还没真正发出去（抓取线程忙 / 静止没触发事件）。每拍
+            // 心跳补一发，直到帧真的发出去 —— 否则电脑侧「等一帧派附件单」
+            // 会干等到天荒地老（2026-11-01 15:47 实锤：补抓单挂了 3 分钟，
+            // 手机静止不刷帧，指令一直取不走）。
+            captureAndSend("pc-frame-req-retry");
         }
+
+        // 附件单也走心跳这条路（电脑端现在会把 fetch_attach 挂进心跳回包）。
+        //
+        // ⚠ 2026-11-01 16:4x 的死锁，必须在心跳里补这一句：取单原本只在**帧
+        // 响应**里做（见 captureAndSend 里那串 maybeXxx），而手机一旦停在
+        // 「附件下载后的预览页」，那一页界面不变就不报帧 ——
+        // 「不报帧 → 取不到单 → 没人触发 AttachmentFetcher.restoreToChat 退出
+        // 预览页 → 继续不报帧」，原地锁死。用户看到的就是：屏幕上明明停着
+        // 那个页面，程序一动不动，**只能自己点左上角「返回」**（2026-11-01
+        // 用户原话）。心跳 60 秒必发一次，挂在这条路上通道就永远断不了。
+        maybeFetchAttachment(r.body, token);
     }
 
     // ------------------------------------------------------------------ 抓取
@@ -663,6 +683,11 @@ public class CollectorService extends AccessibilityService {
             public void run() {
                 try {
                     doCapture(reason);
+                    // 「电脑要的帧」真正跑完一轮才销账 —— 中途 busy 被拒 /
+                    // 抛异常时保持 pending，下一拍心跳再补（见心跳处理）。
+                    if (reason != null && reason.startsWith("pc-frame-req")) {
+                        pendingWantFrame = 0;
+                    }
                 } catch (Throwable t) {
                     failures++;
                     lastResult = "内部错误：" + t;
@@ -834,7 +859,23 @@ public class CollectorService extends AccessibilityService {
             }
         }
         Log.i(TAG, "收到附件抓取指令：" + name + "，字眼 " + keys);
-        AttachmentFetcher.fetch(this, token, name, keys);
+        // 候选链（用户 2026-11-01：「只要带明细字眼的都点开转发原文件」）。
+        // 电脑侧把"像附件的行"排好序一起下发，这里按顺序逐个点 —— 真按钮
+        // 通常排第一，拿到文件就停；表格标题排在后面，轮不到它。
+        List<String> cands = new ArrayList<>();
+        String candRaw = jsonString(resp, "fetch_cands");
+        if (!TextUtils.isEmpty(candRaw)) {
+            for (String c : candRaw.split("\\|\\|")) {
+                c = c.trim();
+                if (!c.isEmpty() && !cands.contains(c)) {
+                    cands.add(c);
+                }
+            }
+        }
+        if (cands.size() > 1) {
+            Log.i(TAG, "候选 " + cands.size() + " 个，按序尝试：" + cands);
+        }
+        AttachmentFetcher.fetch(this, token, name, keys, cands);
     }
 
     /**
@@ -847,8 +888,20 @@ public class CollectorService extends AccessibilityService {
         pokeHeartbeat();
     }
 
-    /** 给 AttachmentFetcher 用的巡检兜底入口（跑一轮「拉回目标群」）。 */
+    /**
+     * 给 {@link AttachmentFetcher} 用的巡检兜底入口（跑一轮「拉回目标群」）。
+     *
+     * <p>⚠ 必须先清 {@code attachBusy} 再跑：调用时机是抓取流程**已经结束**
+     * （恢复失败要兜底），而抓取线程的 {@code finally} 要等本调用返回后才
+     * 清标志 —— 直接调 {@link #runWatchNow} 会撞上「附件抓取中，巡检本轮
+     * 让路」（宽限期 90 秒），兜底变空头支票。2026-10-31 17:50 真机：附件
+     * 上传完成后手机停在电脑侧认不出的页面，兜底没跑、定时巡检还有几分钟
+     * 才到点，用户手动切回才恢复 —— 中间 5 分钟一条消息都没转。
+     * {@code finally} 里再 {@code set(false)} 是幂等的，无副作用。
+     */
     public void runWatchNowPublic(String why) {
+        attachBusy.set(false);
+        attachBusySince = 0L;
         runWatchNow(why);
     }
 

@@ -20,6 +20,7 @@
     android:accessibilityFlags="flagDefault|flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
     android:canRetrieveWindowContent="true"
     android:canPerformGestures="true"
+    android:canTakeScreenshot="true"
     android:description="@string/service_desc"
     android:notificationTimeout="200"
     android:packageNames="com.alibaba.android.rimet" />

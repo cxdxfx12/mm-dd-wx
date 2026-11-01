@@ -32,6 +32,15 @@ final class Prefs {
      * 节流就是靠这个），不记住的话每次心跳都要重发一整屏节点树 —— 那是几百 KB。
      */
     private static final String K_FRAME_REQ = "pc_frame_req_at";
+    /**
+     * 灭屏后是否继续上报（持有 CPU 唤醒锁）。
+     *
+     * <p>默认<b>开</b>。理由见 {@link KeepAliveService#acquireWakeLock()}：关掉它
+     * 就等于回到「手机一待机就静默、得有人翻一下才恢复」的老毛病，而那正是
+     * 用户反复投诉的那件事。代价是待机耗电变高，所以留一个开关给不想付这个
+     * 代价的人。
+     */
+    private static final String K_KEEP_AWAKE = "keep_awake";
 
     /** 钉钉安卓包名。 */
     static final String DINGTALK_PKG = "com.alibaba.android.rimet";
@@ -80,6 +89,19 @@ final class Prefs {
 
     static boolean snapshot(Context c) {
         return of(c).getBoolean(K_SNAPSHOT, true);
+    }
+
+    /**
+     * 灭屏后是否继续上报。默认开 —— 采集机是专用设备，「待机就哑」比「多耗一点电」
+     * 严重得多（2026-11-01 真机：16:08 最后一帧、16:22 最后一次心跳，之后整机静默
+     * 13 分钟，人在电脑前等消息，手机上什么都没发生）。
+     */
+    static boolean keepAwake(Context c) {
+        return of(c).getBoolean(K_KEEP_AWAKE, true);
+    }
+
+    static void setKeepAwake(Context c, boolean on) {
+        of(c).edit().putBoolean(K_KEEP_AWAKE, on).apply();
     }
 
     // ------------------------------------------------------------ 自动巡检

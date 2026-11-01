@@ -74,6 +74,15 @@ final class SelfHeal {
     /** 单点点击的手指时长。太短会被当 tap 抖动，40ms 足够稳。 */
     private static final long TAP_MS = 40L;
 
+    /**
+     * 读不到标题栏时最多退几层。3 层够覆盖「群聊 → H5 卡片详情 → 附件预览」
+     * 这种叠法，又不会一口气把用户正在看的会话退掉。
+     */
+    private static final int TITLE_BLIND_BACKS = 3;
+
+    /** 按一次返回后等界面退完。与 AttachmentFetcher.restoreToChat 的节奏一致。 */
+    private static final long BACK_SETTLE_MS = 900L;
+
     /** 搜索入口在图标的 content-desc / text 里的候选写法（钉钉各版本不一致）。 */
     private static final String[] SEARCH_ENTRY_LABELS = {
             "搜索", "搜索聊天", "搜索消息", "搜一搜", "Search",
@@ -184,16 +193,25 @@ final class SelfHeal {
                 }
             }
 
-            // ② 读标题栏。读不到时**不当作「不在群里」** —— 可能是页面还在画。
-            //    多等一次再读，还读不到就放弃，绝不盲目往下点搜索：
-            //    在聊天页里乱搜索会把用户正看的会话顶掉。
+            // ② 读标题栏。读不到时**不当作「不在群里」** —— 可能是页面还在画，
+            //    也可能停在了**压根没有标题栏的页面**上。后者是 2026-11-01
+            //    用户指出的实情：「钉钉要点最左上的按钮才能返回聊天页，因为
+            //    下载了附件后切回就停留在那」。附件预览页 / H5 全屏页 / UC
+            //    下载页都是这种形态 —— 整棵树只剩「返回」「更多」两个节点，
+            //    readTitle 必然返回空。旧代码在这里直接 fail，于是巡检每 15
+            //    分钟来一次、每次都失败，手机就永远停在预览页，**只能人工点
+            //    一次左上角返回**。现在改成：读不到就先退一层再看，退穿为止。
             String title = readTitle(svc);
-            if (TextUtils.isEmpty(title)) {
-                sleep(1200L);
+            for (int backN = 0; TextUtils.isEmpty(title) && backN < TITLE_BLIND_BACKS; backN++) {
+                Log.i(TAG, "读不到标题栏（第 " + (backN + 1) + " 次），先退一层再看 —— "
+                        + "多半是停在附件预览页/全屏页上");
+                back(svc);
+                sleep(BACK_SETTLE_MS);
                 title = readTitle(svc);
-                if (TextUtils.isEmpty(title)) {
-                    return fail("读不到钉钉标题栏（页面还在加载？）");
-                }
+            }
+            if (TextUtils.isEmpty(title)) {
+                return fail("读不到钉钉标题栏（连退 " + TITLE_BLIND_BACKS
+                        + " 层仍然不是聊天页，可能有别的应用盖在上面）");
             }
             if (norm(title).equals(want)) {
                 // ⚠「标题对」≠「在最新处」（2026-10-28 真机事故）：视口可能停在
