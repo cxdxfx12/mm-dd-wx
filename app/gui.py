@@ -1972,8 +1972,13 @@ class App(tk.Tk):
                 self.after(0, lambda: (self._log(f"已导出到：{path}", "sys"),
                                        self._open_path(Path(path).parent)))
             except Exception as exc:
+                # ⚠ 不能把 exc 直接带进 lambda：Python 3 的 ``except ... as exc``
+                #   在块结束时 del 掉这个名字，而 lambda 是 after() 回调时才执行
+                #   —— 那时 exc 已不存在，抛的是 NameError，用户看到的是
+                #   「导出失败」弹出前先崩一个无提示的异常。先求值成字符串。
+                err = str(exc)
                 self.after(0, lambda: messagebox.showerror(
-                    "导出失败", str(exc), parent=self))
+                    "导出失败", err, parent=self))
 
         threading.Thread(target=work, daemon=True).start()
 

@@ -1490,7 +1490,12 @@ def _attach_timeout_check(ctx: "_Ctx") -> None:
     for name, at in list(ctx.attach_orders.items()):
         if now - at < ATTACH_FETCH_TIMEOUT:
             continue
-        del ctx.attach_orders[name]
+        # ⚠ 必须 pop 而不是 del：本函数每帧都被调用（见 _post_screen 末尾），
+        #   而帧请求由 ThreadingHTTPServer 并发处理 —— 两个线程拿到同一份
+        #   list() 快照时，后到的那个 del 会抛 KeyError，把整帧处理打成 500
+        #   （手机据此重发，反而让并发更凶）。已被别人删掉就安静跳过。
+        if ctx.attach_orders.pop(name, None) is None:
+            continue
         ctx.attach_fail_at[name] = now        # 退避期内不许自动重派
         if getattr(ctx, "attach_active", "") == name:
             # 这条彻底失败了也得放行，否则队列里后面的明细永远轮不到。
