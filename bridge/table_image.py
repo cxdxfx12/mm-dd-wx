@@ -57,6 +57,11 @@ MIN_COL_W = 60          # 单列最窄；比这窄就不该出现在图里了
 # 重复是对的 —— 第 2 块单独截出来也要能看懂是哪条数据。
 KEY_COLS = 2
 
+# 转置渲染的行数上限。数据行不多时「每行一张竖表」最清晰（2026-10-31 用户
+# 选定）；行数一多（几十行的 xlsx 明细）逐行转置就是几千像素的长卷，那种
+# 还是横向切块、每块重复键列更紧凑。
+TRANSPOSE_MAX_ROWS = 12
+
 # 配色（浅色，微信里不论深浅主题都看得清 —— 图片本身自带白底）
 FG = (32, 32, 32)
 FG_DIM = (96, 96, 96)
@@ -159,15 +164,69 @@ def split_labelled(text: str) -> tuple[list[str], list[list[str]]]:
     return head, rows
 
 
+def _strip_labels(raw: list[list[str]]) -> tuple[list[str], list[list[str]]]:
+    """裸表格行的「去标签」补救：逐列找 ``键: 值`` 的公共列名。
+
+    ## 为什么需要（2026-11-01 用户报「朱俞锋怎么每一行都有」）
+
+    真机上签收播报卡片退化成一行文字后，**第一行也是数据行**：
+
+        播报正文… ｜ 小件员姓名: 朱俞锋 ｜ 所属承包区: 菜鸟服务点 ｜ 票数: 1,996
+        播报正文… ｜ 小件员姓名: 盛振华 ｜ 所属承包区: 菜鸟服务点 ｜ 票数: 1,008
+
+    旧的兜底把第一行直接当表头（``head=raw[0]``），朱俞锋的信息就成了
+    「列名」，转置渲染后**每一块都重复一遍第一个人的数据**。这里先逐列
+    剥标签：某列几乎所有行都带同一个列名，就把它提为表头、剩下的当数值。
+
+    只有「整列同名」才认 —— 叙事列（播报正文各不相同）不会被误剥。
+    剥不出任何列名时返回空，调用方退回旧逻辑（首行当表头）。
+    """
+    if not raw:
+        return [], []
+    ncol = max(len(r) for r in raw)
+    head: list[str] = []
+    for i in range(ncol):
+        labels = []
+        for r in raw:
+            m = _LABEL_RE.match(r[i] if i < len(r) else "")
+            if m:
+                labels.append(m.group(1).strip())
+        # 这一列**每一行**都得带同一个列名才认 —— 叙事列（播报正文各不
+        # 相同、或缺标签）会被这个条件挡住，退回旧逻辑更安全。
+        if len(labels) == len(raw) and len(set(labels)) == 1:
+            head.append(labels[0])
+        else:
+            head.append("")
+    if not any(head):
+        return [], []
+    rows = []
+    for r in raw:
+        vals = []
+        for i in range(ncol):
+            c = r[i] if i < len(r) else ""
+            m = _LABEL_RE.match(c)
+            # 只剥「和本列表头同名」的标签，防误伤碰巧带冒号的数据
+            if m and head[i] and m.group(1).strip() == head[i]:
+                vals.append(m.group(2).strip())
+            else:
+                vals.append(c)
+        rows.append(vals)
+    return head, rows
+
+
 def table_of(text: str) -> tuple[list[str], list[list[str]]]:
     """从消息正文里取出 (表头, 数据行)。没有表格返回 ``([], [])``。"""
     head, rows = split_labelled(text)
     if head and rows:
         return head, rows
     # 兜底：正文里是「裸表格」（没有列名前缀，直接一格一行拼成的行）。
-    # 真机上周报的退化形态就是这一种。
+    # 真机上周报的退化形态就是这一种。先试剥标签（见 _strip_labels），
+    # 剥不出再退回首行当表头。
     raw = parse_rows(text)
     if len(raw) >= 2:
+        stripped = _strip_labels(raw)
+        if any(stripped[0]):
+            return stripped
         return raw[0], raw[1:]
     if raw:
         return [""] * len(raw[0]), raw
@@ -210,12 +269,48 @@ def render_table(head: list[str], rows: list[list[str]],
         return _render_block(head, rows, all_cols=list(range(ncol)),
                              title=title, max_w=max_w, part=(0, 1))
 
+    # 宽表且数据行不多 → 整表转置：每个实体（第一列，通常是网点/单号）独占
+    # 一块「指标 | 数值」两列竖表。2026-10-31 用户拍板「能不能把横表转换成
+    # 竖表转发」—— 横向切块的每段只剩 2~4 列数值，跨段根本对不上是哪一行，
+    # 手机上竖着读也比横着找列自然。
+    if len(rows) <= TRANSPOSE_MAX_ROWS:
+        return _render_transposed(head, rows, title=title, max_w=max_w)
+
     # 多块：每块自带表头（+ 重复键列），纵向拼接成一张长图。
+    # 行数太多时不能转置（几十行 × 每行一块 = 几千像素长卷），还是切块紧凑。
     imgs = []
     for idx, cols in enumerate(groups):
         imgs.append(_render_block(head, rows, all_cols=cols, title=title,
                                   max_w=max_w, part=(idx, len(groups))))
     return _stack_vertical(imgs)
+
+
+def _render_transposed(head: list[str], rows: list[list[str]], *,
+                       title: str = "", max_w: int = MAX_W) -> "object | None":
+    """宽表转置：每个数据行（实体）画成一块「指标 | 数值」两列竖表。
+
+    第一列当实体名（进块标题），其余列逐个变成「指标名 → 数值」的一行。
+    永远不会因为宽度切列 —— 两列再宽也装得下；跨块对照靠标题里的实体名。
+    """
+    if not rows:
+        return None
+    n = len(rows)
+    imgs = []
+    for idx, r in enumerate(rows):
+        key_i = 0
+        key_val = r[key_i] if key_i < len(r) else ""
+        pairs = []
+        for i, name in enumerate(head):
+            if i == key_i:
+                continue
+            val = r[i] if i < len(r) else ""
+            pairs.append([name or f"第{i + 1}列", val])
+        if not pairs:
+            continue
+        t = f"{title} · {key_val}" if title else key_val
+        imgs.append(_render_block(["指标", "数值"], pairs, all_cols=[0, 1],
+                                  title=t, max_w=max_w, part=(idx, n)))
+    return _stack_vertical(imgs) if imgs else None
 
 
 def _split_columns(head: list[str], rows: list[list[str]], ncol: int,
@@ -433,18 +528,64 @@ def save_png(img, out_dir: Path | str, *, key: str = "") -> Path:
     return path
 
 
+def _table_blocks(text: str) -> list[tuple[list[str], list[list[str]]]]:
+    """正文里**所有**表格块 → ``[(表头, 数据行), ...]``。
+
+    一张卡片常常不止一张表（2026-11-01 17:22 拦截跟单日报就有 3 张：跟单
+    概况、拦截成效、未及时转出 TOP5）。旧的 ``table_of`` 命中第一块就返回，
+    后面几块永远不进图 —— 用户收到的图缺了一大半，反馈「这个图不对」。
+
+    切分依据：解析端（``android_parse._render_table``）把每条数据渲染成
+    「k: v ｜ k: v」的行，**连续的这种行就是一张表**；块与块之间隔着正文
+    （「拦截成效」这类小节标题）。
+    """
+    blocks: list[tuple[list[str], list[list[str]]]] = []
+    cur: list[str] = []
+
+    def _flush() -> None:
+        if not cur:
+            return
+        head, rows = table_of("\n".join(cur))
+        if rows:
+            blocks.append((head, rows))
+        cur.clear()
+
+    for ln in (text or "").splitlines():
+        if "｜" in ln and ":" in ln:
+            cur.append(ln)
+        else:
+            _flush()
+    _flush()
+    return blocks
+
+
 def render_message(text: str, *, out_dir: Path | str, key: str = "",
                    title: str = "") -> "Path | None":
     """正文 → 表格 PNG 路径；这条消息没有表格时返回 ``None``。
 
     这是给 service 层用的单入口：解析 + 绘制 + 落盘一步到位，出任何异常都
     只记日志返回 ``None``（宁可只发文字，不能因为画图失败把整条消息丢掉）。
+
+    正文里有**多张表**时全部画进同一张长图（:func:`_table_blocks` 切块、
+    :func:`_stack_vertical` 摞起来）—— service 层的 ``media_path`` 是单值，
+    拆成多张图就得动投递结构，没必要。
     """
     try:
-        head, rows = table_of(text)
-        if not rows:
+        blocks = _table_blocks(text)
+        if not blocks:
             return None
-        img = render_table(head, rows, title=title)
+        if len(blocks) == 1:
+            head, rows = blocks[0]
+            img = render_table(head, rows, title=title)
+        else:
+            imgs = []
+            for i, (head, rows) in enumerate(blocks):
+                im = render_table(head, rows, title=title if i == 0 else "")
+                if im is not None:
+                    imgs.append(im)
+            if not imgs:
+                return None
+            img = imgs[0] if len(imgs) == 1 else _stack_vertical(imgs)
         if img is None:
             return None
         return save_png(img, out_dir, key=key or text)

@@ -58,6 +58,44 @@ class TestParse(unittest.TestCase):
         self.assertEqual(head, ["小件员名称", "票数", "单号"])
         self.assertEqual(len(rows), 2)
 
+    def test_labelled_fallback_strips_labels_instead_of_eating_row(self):
+        # 2026-11-01 真机「朱俞锋每一行都有」：退化形态里第一行也是数据行，
+        # 旧兜底把它当表头 → 转置渲染后每块都重复第一个人的信息。
+        lines = []
+        for name, area, n in [("朱俞锋", "浙江萧山菜鸟服务点", "1,996"),
+                              ("盛振华", "浙江萧山菜鸟服务点", "1,008")]:
+            lines.append(" ｜ ".join([
+                "@所有人一阶段签收进度播报：当前离一阶段考核时间约1小时",
+                f"小件员姓名: {name}", f"所属承包区: {area}",
+                f"有派未签票数: {n}"]))
+        head, rows = table_of("\n".join(lines))
+        self.assertEqual(head, ["", "小件员姓名", "所属承包区", "有派未签票数"])
+        self.assertEqual(rows[0], [
+            "@所有人一阶段签收进度播报：当前离一阶段考核时间约1小时",
+            "朱俞锋", "浙江萧山菜鸟服务点", "1,996"])
+        self.assertEqual(rows[1][1], "盛振华", "第二个人的数据不能丢")
+        # 渲染出来是「每行一个人」的正常表，朱俞锋只出现一次
+        img = render_table(head, rows)
+        self.assertIsNotNone(img)
+
+    def test_strip_labels_ignores_narrative_column(self):
+        # 叙事列（各不相同、不以短列名开头）必须原样保留，不许误剥
+        from bridge.table_image import _strip_labels
+        raw = [["播报A: 很长的正文内容别剥", "小件员姓名: 朱俞锋", "票数: 5"],
+               ["普通叙事没有冒号标签", "小件员姓名: 盛振华", "票数: 3"]]
+        head, rows = _strip_labels(raw)
+        self.assertEqual(head, ["", "小件员姓名", "票数"])
+        self.assertEqual(rows[0][0], "播报A: 很长的正文内容别剥")
+        self.assertEqual(rows[0][2], "5")
+
+    def test_bare_rows_without_any_labels_keep_old_fallback(self):
+        # 没有任何「列名:」标签的裸表格（真机周报形态）：仍退回首行当表头
+        bare = " ｜ ".join(["名称", "票数", "单号"]) + "\n" \
+            + " ｜ ".join(["周吉祥", "1票", "777454064365026"])
+        head, rows = table_of(bare)
+        self.assertEqual(head, ["名称", "票数", "单号"])
+        self.assertEqual(rows, [["周吉祥", "1票", "777454064365026"]])
+
     def test_full_message_with_prose_still_finds_the_table(self):
         # 真机卡片的形状：表格前后各有几段正文
         msg = ("@所有人 拦截单退单打印提醒\n今天还有1票没完成打印。\n"
@@ -155,6 +193,49 @@ class TestWideTableSplits(unittest.TestCase):
         rows = [["义乌", "SF9000", "处理中"]]
         self.assertEqual(len(_split_columns(head, rows, 3, 1200)), 1,
                          "3 列不该被切")
+
+
+class TestTransposedWideTable(unittest.TestCase):
+    """宽表 + 行数不多 → 转置成「每行一张竖表」（2026-10-31 用户选定）。
+
+    横向切块的每段只剩 2~4 列数值，跨段对不上是哪一行；手机上竖着读比
+    横着找列自然。行数太多（xlsx 明细）不能转置 —— 会拉成几千像素长卷。
+    """
+
+    def setUp(self):
+        try:
+            import PIL                     # noqa: F401
+        except ImportError:
+            self.skipTest("本机没装 Pillow，渲染测试跳过")
+
+    HEAD = ["网点名称", "健康分-标签履约打标量", "健康分-标签履约履约量",
+            "健康分-标签履约履约率", "健康分-标签履约客诉量",
+            "健康分-标签履约客诉率", "按需派送违规行为量",
+            "按需派送违规行为考核金额", "按需派送客诉量", "客户声音客诉量"]
+
+    def _rows(self, n=5):
+        return [[f"网点{i}", "1095", "1092", "99.73%", "0", "0.00%",
+                 "1", "10.00", "0", "0"] for i in range(n)]
+
+    def test_wide_few_rows_becomes_transposed(self):
+        """5 行 × 10 列 → 转置后是窄长的两列竖表（远窄于切块的 1200px）。"""
+        img = render_table(self.HEAD, self._rows(), title="履约跟单专员")
+        self.assertIsNotNone(img)
+        self.assertLess(img.size[0], 800,
+                        "转置表只有「指标|数值」两列，应该很窄")
+        self.assertGreater(img.size[1], 1500, "5 个网点 × 9 项指标应该很高")
+
+    def test_wide_many_rows_stays_split(self):
+        """几十行的明细不转置（会拉成超长卷），仍走横向切块。"""
+        img = render_table(self.HEAD, self._rows(30), title="月报明细")
+        self.assertIsNotNone(img)
+        self.assertGreater(img.size[0], 900, "切块布局每块独占全宽")
+
+    def test_transposed_direct(self):
+        from bridge.table_image import _render_transposed
+        self.assertIsNone(_render_transposed(self.HEAD, []))
+        img = _render_transposed(self.HEAD, self._rows(2), title="表")
+        self.assertIsNotNone(img)
 
 
 class TestServiceIntegration(unittest.TestCase):

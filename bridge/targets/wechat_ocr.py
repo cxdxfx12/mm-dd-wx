@@ -141,6 +141,10 @@ GMEM_MOVEABLE = 0x0002
 # 剪贴板贴图用：CF_DIB（设备无关位图）。微信输入框 Ctrl+V 认它。
 # 不用 CF_DIBV5 / PNG 格式：实测微信对 CF_DIB 的兼容最好。
 CF_DIB = 8
+# 剪贴板发文件用：CF_HDROP（一串文件路径）。往微信输入框 Ctrl+V 就等于
+# 「拖一个文件进来」，聊天里落地的是**原文件卡片**（可下载、可另存），
+# 不是截图 —— 用户 2026-10-31 明确要求附件一律发原文件。
+CF_HDROP = 15
 BI_RGB = 0
 
 MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -182,6 +186,13 @@ _LAYOUT = {
     #   盖得住标题起点；左边多扫进来的列表时间戳杂字靠 _title_matches
     #   的「目标 ⊆ 标题」包含判据兜住。
     "title": (0.40, 0.030, 0.92, 0.078),
+    # ⚠ 2026-10-31 再踩（22:02 投递「申通五星业务员培训群」失败）：
+    #   窗口被用户拉宽到 972 时，0.40×972=388 落在标题起点（实测 324）
+    #   **右边 64px**，把群名开头「申通五星」整段切掉 —— 标题栏稳定读成
+    #   「业务员培训群(85)」，_title_matches 永远不中 → 投递失败。
+    #   根因与 2026-10-20 同源：**列表是固定像素宽，标题起点不随窗口
+    #   等比移动**，比例线在宽窗口必然切字。修法：x0 封顶在固定像素
+    #   （见 TITLE_X0_MAX_PX），窄窗口（<800）仍用比例值不变。
     # 输入框点击点（相对比例）
     "input": (0.70, 0.90),
     # 发送按钮（相对比例，点不到时回落到回车）
@@ -189,6 +200,16 @@ _LAYOUT = {
     # 消息区（回读校验用）：右侧面板，不含标题栏
     "message": (0.44, 0.06, 1.00, 0.94),
 }
+
+
+# 标题栏裁剪线 x0 的固定像素上限。
+# 实测（2026-10-31，972×1332 窗口）：会话列表右缘 ~310px、标题文字起点
+# x≈324。封顶 316 = 起点左侧留 8px 余量：
+#   · 窗口 ≥ 790 宽时 x0 = 316，恰好盖住标题起点；
+#   · 窗口更窄时仍用 0.40 比例（720 宽 → 288，同样在起点左侧）；
+#   · 高 DPI 机器列表按 DIP 放大、标题起点更靠右，316 只会多扫进来
+#     一点空白/列表边缘，靠 _title_matches 的包含判据兜住，不会切字。
+TITLE_X0_MAX_PX = 316
 
 
 class _BitmapInfoHeader(ctypes.Structure):
@@ -1120,6 +1141,11 @@ class WeChatOcrTarget(Target):
         W, H = img.size
         x0, y0, x1, y1 = _LAYOUT[guide_name]
         box = (int(W * x0), int(H * y0), int(W * x1), int(H * y1))
+        if guide_name == "title":
+            # 会话列表固定像素宽、标题起点不随窗口等比移动（详见
+            # _LAYOUT["title"] 的 2026-10-31 注）：宽窗口下比例线会切掉
+            # 群名开头，这里封顶到固定像素。窄窗口取 min 后仍是比例值。
+            box = (min(box[0], TITLE_X0_MAX_PX), box[1], box[2], box[3])
         crop = img.crop(box)
         if crop.width < 20 or crop.height < 10:
             return [], box, zoom
@@ -1451,6 +1477,150 @@ class WeChatOcrTarget(Target):
         finally:
             user32.CloseClipboard()
         return True
+
+    def _put_clipboard_files(self, paths: list[str]) -> bool:
+        """把文件路径列表以 CF_HDROP 写进剪贴板（等价于在资源管理器里 Ctrl+C）。
+
+        DROPFILES 结构（20 字节头 + 路径串）：
+            pFiles(4) pt.x(4) pt.y(4) fNC(4) fWide(4) 然后是多条 UTF-16LE
+            路径，每条以 \\0 结尾，整块再以 \\0 收尾。
+
+        ⚠ fWide 必须是 1（Unicode）：写 0 微信收到的是 ANSI 路径，
+          中文文件名会乱码，粘贴表现为「没有任何反应」。
+        """
+        import struct
+
+        if not paths:
+            return False
+        blob = b""
+        for p in paths:
+            blob += str(Path(p).resolve()).encode("utf-16-le") + b"\x00\x00"
+        blob += b"\x00\x00"                     # 列表结束（双 \\0）
+        header = struct.pack("IiiII", 20, 0, 0, 0, 1)
+        data = header + blob
+
+        hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        if not hmem:
+            return False
+        p = kernel32.GlobalLock(hmem)
+        if not p:
+            kernel32.GlobalFree(hmem)
+            return False
+        try:
+            ctypes.memmove(p, data, len(data))
+        finally:
+            kernel32.GlobalUnlock(hmem)
+
+        if not user32.OpenClipboard(0):
+            kernel32.GlobalFree(hmem)
+            return False
+        try:
+            user32.EmptyClipboard()
+            if not user32.SetClipboardData(CF_HDROP, ctypes.c_void_p(hmem)):
+                kernel32.GlobalFree(hmem)       # 转移失败自己释放
+                return False
+            # 成功后所有权归系统，不再 GlobalFree
+        finally:
+            user32.CloseClipboard()
+        return True
+
+    def send_file(self, target: str, path: str) -> SendResult:
+        """把**原文件**发进会话（文件放剪贴板 → Ctrl+V → 发送）。
+
+        走的是微信自己的「粘贴文件」通路，聊天里出现的是可下载的文件卡片，
+        不是截图 —— 表格类附件（周报/月报 xlsx）用户要的是能打开的原始表格，
+        渲染成长图反而丢了列、丢了筛选能力。
+        """
+        if not target:
+            return SendResult(False, target, "目标为空")
+        f = Path(path)
+        if not f.is_file():
+            return SendResult(False, target, f"文件不存在：{path}")
+        if self.dry_run:
+            print(f"[dry-run] 发送文件到「{target}」: {path}")
+            return SendResult(True, target, "dry-run 未真实发送")
+        try:
+            return self._send_file_live(target, f)
+        except Exception as exc:               # noqa: BLE001
+            log.exception("OCR 文件投递失败")
+            return SendResult(False, target, f"{type(exc).__name__}: {exc}")
+
+    def _send_file_live(self, target: str, path: Path) -> SendResult:
+        hwnd = self._find_window()
+        if not hwnd:
+            return SendResult(False, target,
+                              "未找到微信主窗口，请确认微信已登录且在桌面上")
+        if not self._activate(hwnd):
+            return SendResult(False, target,
+                              "无法把微信窗口切到前台（可能被系统禁止抢占焦点）")
+        self._ensure_layout_safe(hwnd)
+        ok, detail = self._open_chat(hwnd, target)
+        if not ok:
+            return SendResult(False, target, detail)
+
+        before = self._grab(hwnd)              # 发之前的消息区，给校验留个底
+        if not self._click(hwnd, *_LAYOUT["input"]):
+            return SendResult(False, target, "点击输入框失败")
+        time.sleep(0.2)
+        if not self._put_clipboard_files([str(path)]):
+            return SendResult(False, target, "写入剪贴板（文件）失败")
+        time.sleep(0.1)
+        self._press(VK_V, ctrl=True)
+        # 文件比文本/图片都慢：微信要把文件读进来生成卡片缩略图，
+        # 太早回车会发出一条空消息（输入框还没挂上文件）。
+        time.sleep(0.9)
+        if not self._click(hwnd, *_LAYOUT["send_btn"]):
+            self._press(VK_RETURN)
+        time.sleep(self.send_delay)
+        if not self.verify:
+            return SendResult(True, target, "已发送文件（未校验）")
+        return self._verify_file_sent(hwnd, target, path, before)
+
+    def _verify_file_sent(self, hwnd: int, target: str, path: Path,
+                          before) -> SendResult:
+        """文件投递校验。
+
+        文件卡片不是绿色气泡（`_has_outgoing_bubble` 认不出来），OCR 认文件名
+        又常常把扩展名读花 —— 所以两级判据：
+          1) 消息区 OCR 出文件名主干（最硬的证据：卡片真的出现了）
+          2) 消息区底部像素相对发送前有变化（退一步的弱证据，挡住了
+             「文件名被 OCR 读错 → 误报失败 → 补投发两遍」这条路）
+        """
+        probe = path.stem.strip()[:8]
+        frame = None
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            frame = self._grab(hwnd)
+            if frame is not None and probe:
+                items, _box, _zoom = self._ocr_region(frame, "message", zoom=2)
+                joined = "".join((t or "").replace(" ", "")
+                                 for _b, t, c in items
+                                 if float(c or 0) >= 0.5)
+                if probe.replace(" ", "") in joined:
+                    return SendResult(True, target, "已发送文件（回读到文件名）")
+            time.sleep(0.5)
+        if frame is not None and before is not None and self._bottom_changed(
+                before, frame):
+            return SendResult(True, target, "已发送文件（检测到消息区变化）")
+        return SendResult(False, target,
+                          f"发送文件后未检测到新内容，请人工确认（{path.name}）")
+
+    @staticmethod
+    def _bottom_changed(before, after) -> bool:
+        """消息区底部 18% 是否明显变化 —— 新卡片落地的弱判据。"""
+        import numpy as np
+
+        try:
+            b = np.asarray(before.convert("L"), dtype=np.int16)
+            a = np.asarray(after.convert("L"), dtype=np.int16)
+        except Exception:                      # noqa: BLE001
+            return False
+        if b.shape != a.shape:
+            return True
+        h = b.shape[0]
+        top = int(h * 0.82)
+        diff = np.abs(a[top:] - b[top:])
+        return float((diff > 24).mean()) > 0.012
 
     def send_image(self, target: str, image_path: str) -> SendResult:
         """把一张本地图片发进会话（复制图 → Ctrl+V → 发送）。
