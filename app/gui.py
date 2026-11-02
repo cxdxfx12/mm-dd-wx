@@ -43,6 +43,93 @@ from bridge import __version__ as APP_VERSION          # noqa: E402
 from bridge import janitor                             # noqa: E402
 
 
+# 网关端口：工作进程监听它，**同一时刻只能有一个进程占用**。
+GATEWAY_PORT = 8765
+
+
+def _port_owner_pids(port: int = GATEWAY_PORT) -> list[int]:
+    """谁在 LISTEN 这个端口。没被占用时返回空列表。
+
+    只看 ``LISTENING``：TIME_WAIT / FIN_WAIT_2 是已断开的旧连接，
+    它们不挡新进程 bind，当成占用会误杀正常进程。
+    """
+    try:
+        out = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=8, creationflags=0x08000000).stdout
+    except Exception:
+        return []
+    pids: list[int] = []
+    needle = f":{port}"
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        local, state, pid_s = parts[1], parts[3].upper(), parts[4]
+        if state != "LISTENING" or not local.endswith(needle):
+            continue
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        if pid and pid not in pids:
+            pids.append(pid)
+    return pids
+
+
+def _proc_cmdline(pid: int) -> str:
+    """取进程命令行（判断是不是我们自己的 worker 用）。"""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}")'
+             ".CommandLine"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=12, creationflags=0x08000000).stdout
+    except Exception:
+        return ""
+    return (out or "").strip()
+
+
+def _reap_stale_worker(port: int = GATEWAY_PORT) -> tuple[str, str]:
+    """启动前把上一轮残留在后台的 worker 收掉。
+
+    为什么需要（2026-11-02 15:29 实锤）
+        上一轮排查时手动起过一个 worker，它没有 ``--parent-pid``，界面关掉
+        了它还在跑、一直占着 8765。用户再点「启动转发服务」，新 worker 起
+        网关时 ``WinError 10048`` 当场退出，界面只留一行「工作进程异常退出」
+        —— 看起来是「附件不转了」，实际是**整个转发根本没起来**。
+
+    只杀确认是 ``bridge_worker.py`` 的进程；端口被别的程序占着时原样报错，
+    不替用户做决定（那是别人的东西，杀了可能出更大的事）。
+    """
+    pids = _port_owner_pids(port)
+    if not pids:
+        return "free", ""
+    cmds = {pid: _proc_cmdline(pid) for pid in pids}
+    for pid, cmd in cmds.items():
+        if "bridge_worker.py" not in cmd:
+            return ("other",
+                    f"端口 {port} 被别的程序占用（PID {pid}）：\n"
+                    f"{cmd[:200] or '取不到命令行'}\n\n"
+                    "请先关掉那个程序再启动。")
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
+                           capture_output=True, timeout=10,
+                           creationflags=0x08000000)
+        except Exception:
+            pass
+    for _ in range(30):                       # 最多等 6 秒
+        if not _port_owner_pids(port):
+            return "killed", ""
+        time.sleep(0.2)
+    return ("stuck",
+            f"端口 {port} 释放不掉：残留进程 {pids} 杀不掉（可能权限不足）。\n"
+            "请用任务管理器结束这些 python.exe 后重试。")
+
+
 def _notify_robots(n: dict) -> list[str]:
     """配置段 -> 已填地址的机器人清单（只用于界面上的「配了没」判断）。
 
@@ -1373,6 +1460,18 @@ class App(tk.Tk):
                     f"转发目标：{targets}\n\n确定开始吗？", parent=self):
                 return
         self._reset_counters()
+        # 上一轮残留的 worker 会一直占着 8765，新进程起网关时 WinError 10048
+        # 当场退出 —— 界面只显示「工作进程异常退出」，看着像「附件不转了」，
+        # 其实是整个转发没起来（2026-11-02 15:29 就是这么白查了一轮）。
+        how, why = _reap_stale_worker()
+        if how == "killed":
+            self.log_message(
+                f"已收掉上一轮残留在后台的转发进程（端口 {GATEWAY_PORT} 已释放）")
+        elif how in ("other", "stuck"):
+            self.state = "idle"
+            self._refresh_state()
+            messagebox.showerror("启动失败", why, parent=self)
+            return
         argv_live = self._worker_argv(
             "--live", "--config", str(CONFIG_PATH),
             "--stop-file", str(self._stop_file()),
