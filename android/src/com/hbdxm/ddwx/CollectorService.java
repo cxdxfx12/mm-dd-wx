@@ -802,6 +802,12 @@ public class CollectorService extends AccessibilityService {
             return;
         }
 
+        // 群里的「复制」是考核数据（用户 2026-11-02：都要点一下，但不用粘贴）：
+        // 看到就点，点完钉钉自己弹个人 toast，界面文字一个字都不变。
+        // ⚠ 必须放在 md5 比对**之前** —— 点完画面内容没变，md5 一模一样，
+        //   放后面就永远走不到这一步，等于没加。
+        CopyTapper.tapNew(this, root, attachBusy.get());
+
         String xml = tree.xml.toString();
         String md5 = md5(xml);
         if (md5.equals(sentMd5)) {
