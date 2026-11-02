@@ -431,6 +431,19 @@ class TestFileEndpoint(GatewayCase):
         self.got: list = []
         self.source._ctx.on_file = lambda p, n, c: self.got.append((p, n, c))
 
+    def _wait_got(self, n: int, timeout: float = 3.0) -> None:
+        """等后台投递线程把回调送到。
+
+        2026-11-02 起 /file 的回调是**异步**的（同步执行曾把手机上传拖到
+        30 秒超时）—— 响应回来时回调可能还没跑，断言前必须等。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if len(self.got) >= n:
+                return
+            time.sleep(0.02)
+        self.fail(f"3 秒内只等到 {len(self.got)}/{n} 次回调")
+
     def _post_file(self, name: str, data: bytes, sha: str | None = None,
                    token: str | None = TOKEN, chat: str = "数字质控"):
         payload = {"name": name, "sha1": sha or hashlib.sha1(data).hexdigest(),
@@ -453,6 +466,7 @@ class TestFileEndpoint(GatewayCase):
         self.assertEqual(code, 200)
         self.assertTrue(body["ok"])
         self.assertFalse(body["duplicate"])
+        self._wait_got(1)
         self.assertEqual(len(self.got), 1)
         path, name, chat = self.got[0]
         self.assertEqual(name, "运单明细.xlsx")
@@ -470,6 +484,9 @@ class TestFileEndpoint(GatewayCase):
         code, body = self._post_file(phone, data)
         self.assertEqual(code, 200)
         self.assertTrue(body["ok"])
+        deadline = time.time() + 3
+        while time.time() < deadline and not got4:
+            time.sleep(0.02)
         self.assertEqual(got4, [(phone, "拦截风险明细.xlsx")])
 
     def test_empty_chat_falls_back_to_watch_group(self):
@@ -483,7 +500,7 @@ class TestFileEndpoint(GatewayCase):
         code, body = self._post_file("周报明细.xlsx", data, chat="")
         self.assertEqual(code, 200)
         self.assertTrue(body["ok"])
-        self.assertEqual(len(self.got), 1)
+        self._wait_got(1)
         self.assertEqual(self.got[0][2], "数字质控")     # watch_group 兜底
 
     def test_bad_sha_rejected(self):
@@ -506,9 +523,11 @@ class TestFileEndpoint(GatewayCase):
         """
         data = _mini_xlsx([["a"], ["b"]])
         self._post_file("same.xlsx", data)
+        self._wait_got(1)                      # 等第一份投完，inflight 才清
         code, body = self._post_file("same.xlsx", data)
         self.assertEqual(code, 200)
         self.assertTrue(body["duplicate"])
+        self._wait_got(2)
         self.assertEqual(len(self.got), 2)
 
     def test_path_traversal_neutralised(self):
@@ -521,7 +540,94 @@ class TestFileEndpoint(GatewayCase):
         listed = os.listdir(self.files)
         self.assertEqual(len(listed), 1)
         self.assertNotIn("..", listed[0])
+        self._wait_got(1)
         self.assertTrue(self.got[0][0].startswith(self.files))
+
+
+class TestFileAsyncDelivery(GatewayCase):
+    """回调异步化（2026-11-02 16:39 事故）。
+
+    以前 ``/file`` 在 HTTP 线程里**同步**跑 handle_attachment，投递微信要点
+    十几下、动辄 20~40 秒；手机端上传 30 秒等不到响应就记「上传失败」——
+    实际 PC 侧 1 秒后投成了。15:32、16:39 两次都这么被误报。
+
+    钉三件事：响应先回、回调在后台线程执行、在途重传不重发。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.files = tempfile.mkdtemp(prefix="ddwx-files-")
+        self.source._ctx.files_dir = self.files
+
+    def _post_file(self, name: str, data: bytes):
+        payload = {"name": name, "sha1": hashlib.sha1(data).hexdigest(),
+                   "data": base64.b64encode(data).decode("ascii"),
+                   "chat": "数字质控"}
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(self.url("/file"), data=body,
+                                     method="POST")
+        req.add_header("X-Bridge-Token", TOKEN)
+        start = time.monotonic()
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            out = resp.status, json.loads(resp.read().decode("utf-8"))
+        return out, time.monotonic() - start
+
+    def test_reply_returns_before_slow_callback(self):
+        """回调慢 3 秒，响应也必须立刻回 —— 手机端不能陪投递一起等。"""
+        gate = threading.Event()
+        self.source._ctx.on_file = lambda *a: gate.wait(5)
+        data = _mini_xlsx([["a"], ["b"]])
+        (code, body), elapsed = self._post_file("慢投递.xlsx", data)
+        self.assertEqual(code, 200)
+        self.assertTrue(body["ok"])
+        self.assertLess(elapsed, 1.0, "响应被投递拖住了（又回老路了）")
+        gate.set()                       # 放行后台线程，别把 teardown 拖死
+
+    def test_callback_runs_in_background_thread(self):
+        done = threading.Event()
+        threads: list = []
+
+        def cb(*a):
+            threads.append(threading.current_thread())
+            done.set()
+
+        self.source._ctx.on_file = cb
+        data = _mini_xlsx([["a"], ["b"]])
+        self._post_file("异步.xlsx", data)
+        self.assertTrue(done.wait(3), "回调没被执行")
+        self.assertNotEqual(threads[0], threading.current_thread())
+
+    def test_inflight_duplicate_not_recalled(self):
+        """同一份文件还在投递中，手机重传 → 不再回调，回 duplicate=true。
+
+        投递异步后 deliveries 判重有窗口（上一份还没落库），靠
+        attach_inflight 补位，不然超时重传会把一条附件发两遍。
+        """
+        gate = threading.Event()
+        calls: list = []
+        self.source._ctx.on_file = lambda *a: (calls.append(a), gate.wait(5))
+        data = _mini_xlsx([["a"], ["b"]])
+        (code1, _), _t = self._post_file("重复.xlsx", data)
+        self.assertEqual(code1, 200)
+        deadline = time.time() + 3
+        while time.time() < deadline and not calls:
+            time.sleep(0.02)
+        (code2, body2), _t2 = self._post_file("重复.xlsx", data)
+        self.assertEqual(code2, 200)
+        self.assertTrue(body2["duplicate"])
+        self.assertEqual(len(calls), 1, "在途重传又被投了一遍")
+        gate.set()
+
+    def test_inflight_cleared_after_callback(self):
+        """投递完成后 inflight 必须清掉 —— 否则下次同内容文件永远被忽略。"""
+        self.source._ctx.on_file = lambda *a: None
+        data = _mini_xlsx([["a"], ["b"]])
+        sha = hashlib.sha1(data).hexdigest()
+        self._post_file("清理.xlsx", data)
+        deadline = time.time() + 3
+        while time.time() < deadline and sha in self.source._ctx.attach_inflight:
+            time.sleep(0.02)
+        self.assertNotIn(sha, self.source._ctx.attach_inflight)
 
 
 class TestServiceHandleAttachment(unittest.TestCase):

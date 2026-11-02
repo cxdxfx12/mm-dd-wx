@@ -1657,6 +1657,11 @@ class _Ctx:
     # 名字冷却挡「这一分钟内别再点」，sha1 挡「这份文件别再发」。
     attach_orders: dict = field(default_factory=dict)     # 附件名 -> monotonic
     attach_seen: dict = field(default_factory=dict)       # sha1 -> True
+    # 投递**进行中**的文件 sha1（在后台线程跑 handle_attachment）。
+    # 手机端上传超时会重传同一份 —— 投递没落 deliveries 前 deliveries 判重
+    # 是空的，不挡一下就会把同一条附件发两遍（2026-11-02 16:39 起，回调改
+    # 异步后这个窗口真实存在了）。
+    attach_inflight: dict = field(default_factory=dict)   # sha1 -> monotonic
     # 最近在卡片里见过的附件行名字 (name, monotonic)，新的在后（最多 16 条）。
     # 只服务于「文件传回来时叫什么」—— 见 `_display_name_for_file`。
     attach_recent: deque = field(default_factory=lambda: deque(maxlen=16))
@@ -2636,21 +2641,45 @@ class _Handler(BaseHTTPRequestHandler):
         #   fresh=False 拦成「重复跳过」—— 这份文件就永远发不出去了。
         #   「发成功过没有」由下游按 deliveries 表精确判定
         #   （Storage.is_duplicate(need_delivered=True)），这里只负责转交。
-        if cb is not None:
-            try:
-                if _cb_wants_src(cb):
-                    cb(path, name, chat, wanted, src_time)
-                elif _cb_wants_wanted(cb):
-                    cb(path, name, chat, wanted)
-                else:
-                    cb(path, name, chat)
-            except Exception:                          # noqa: BLE001
-                log.exception("附件下游处理失败：%s", name)
-
         log.info("收到手机附件「%s」（%d 字节%s）→ %s", name, len(data),
                  "，磁盘已有同名文件（是否重发由投递记录判定）" if duplicate else "",
                  path)
+        # 投递挪到后台线程（2026-11-02 15:32 / 16:39 两次实锤）：以前回调同步
+        # 执行，handle_attachment 持着 _send_lock 对微信点十几下、动辄 20~40
+        # 秒 —— 手机上传完等不到响应，30 秒整就报「上传失败：超时」。16:39
+        # 那次 PC 侧其实 1 秒后就投成了，deliveries#287 ok，就差在响应没回去，
+        # 手机却把整次抓取记成失败。文件此刻已落盘、sha 已校验，先回 200 让
+        # 手机收队，投递交给线程接力。
+        if sha in self.ctx.attach_inflight:
+            # 同一份文件还在投递中（手机端超时重传）→ 回成功让它别再传，
+            # 但**不**再回调：deliveries 判重此刻还看不到上一份的结果。
+            log.info("附件「%s」上一份还在投递中（sha %s…），重传忽略",
+                     name, sha[:12])
+            self._reply(200, {"ok": True, "duplicate": True})
+            return
+        if cb is None:
+            self._reply(200, {"ok": True, "duplicate": duplicate})
+            return
+        self.ctx.attach_inflight[sha] = time.monotonic()
+        threading.Thread(target=self._deliver_attachment_bg,
+                         args=(cb, path, name, chat, wanted, src_time, sha),
+                         daemon=True, name=f"attach-{sha[:8]}").start()
         self._reply(200, {"ok": True, "duplicate": duplicate})
+
+    def _deliver_attachment_bg(self, cb, path, name, chat, wanted,
+                               src_time, sha) -> None:
+        """后台线程：把已落盘的附件交给下游投递（出错只记日志，别崩进程）。"""
+        try:
+            if _cb_wants_src(cb):
+                cb(path, name, chat, wanted, src_time)
+            elif _cb_wants_wanted(cb):
+                cb(path, name, chat, wanted)
+            else:
+                cb(path, name, chat)
+        except Exception:                              # noqa: BLE001
+            log.exception("附件下游处理失败：%s", name)
+        finally:
+            self.ctx.attach_inflight.pop(sha, None)
 
     def _post_screen(self, raw: bytes, length: int) -> None:
         """收一帧节点树。只做「存下来 + 记元信息」，不解析 —— 解析是采集端的事。"""
