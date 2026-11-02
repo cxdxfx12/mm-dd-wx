@@ -1437,24 +1437,77 @@ class App(tk.Tk):
     # ---------------- 钉钉预览 ----------------
 
     def switch_phone_group(self):
-        """让**手机**把钉钉切回目标群（用户点名的「切到钉钉群」按钮）。
+        """把手机上的钉钉切回目标群（「切到钉钉群」按钮）。
 
-        为什么走 HTTP 而不是直接调对象：真正跑转发的网关在**子进程**里，
-        本界面拿不到它的 ctx。所以只给网关留一句话，它等手机来取。
+        2026-11-02 改成 **adb 直连优先**。原因是真机现场：13:13 用户点这个
+        按钮失败，手机回报
 
-        ⚠ 用 ``127.0.0.1`` 以外的事：这台机器上系统代理可能把 loopback
-        也劫持到 502（以前踩过），所以照旧用配置里的 host。
+            失败：拉不起钉钉（系统拒绝了直接启动；最近任务里也点不开钉钉）
+            失败现场：pkg=cn.sto.sxz.core.app · title=揽件扫描
+
+        前台被另一个程序占着时，采集端是无障碍服务身份，属于「后台应用启动
+        Activity」，被华为 ROM 拦掉了 —— 这不是权限没开，是系统硬限制。
+        而 ``adb shell`` 是 shell 身份，不受这条限制：真机实测 ``monkey``
+        拉起钉钉 0.57 秒见效，还直接回到上次那个聊天页。
+
+        所以顺序反过来了：先让电脑端用 adb 自己动手（几秒出结果），
+        adb 不通（没插线 / 手机没连）才退回原来的「留话等手机来取」。
         """
-        if not self.runner.alive():
+        d = self.cfg.get("dingtalk") or {}
+        chats = [str(x).strip() for x in (d.get("chat_names") or [])
+                 if str(x).strip()]
+        if not chats:
             messagebox.showinfo(
                 "提示",
-                "转发服务没在运行。\n\n"
-                "「切到钉钉群」是让手机那边动手，得先点「开始运行」"
-                "让网关连上手机。", parent=self)
+                "还没配目标群。\n\n去「设置中心 → 钉钉」把群名填上，"
+                "手机才知道该切到哪个群。", parent=self)
             return
-        self._log("正在让手机切到钉钉群…", "sys")
-        self.btn_switch.configure(state="disabled")
+        group = chats[0]
 
+        self._log(f"正在用 adb 把手机切到「{group}」…", "sys")
+        self.btn_switch.configure(state="disabled")
+        self.statusbar.configure(text="正在用 adb 切群…")
+
+        def work():
+            ok, msg = False, ""
+            try:
+                import phone_adb
+                ok, msg = phone_adb.switch_to_group(group)
+            except Exception as exc:                  # noqa: BLE001
+                msg = f"adb 通道异常：{exc}"
+            self.after(0, lambda: self._switch_adb_done(ok, msg, group))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _switch_adb_done(self, ok: bool, msg: str, group: str):
+        """adb 直连的结果：成了就收工，没成再走老路。"""
+        if ok:
+            self._log(msg, "sys")
+            self.statusbar.configure(text="已切到钉钉群")
+            self.btn_switch.configure(state="normal")
+            return
+        # 失败原因写进日志（含"当前前台是哪个 App"），界面上只弹一次简版
+        self._log("adb 切群没成：" + msg, "warn")
+        if not self.runner.alive():
+            self.btn_switch.configure(state="normal")
+            self.statusbar.configure(text="切群失败")
+            messagebox.showwarning(
+                "切群失败",
+                msg + "\n\n转发服务也没在运行，走不了「让手机自己切」那条"
+                      "备选路 —— 先点「开始运行」。", parent=self)
+            return
+        self._log("改让手机自己试（等它下一次心跳，1～60 秒）…", "sys")
+        self._switch_via_gateway()
+
+    def _switch_via_gateway(self):
+        """老办法：给网关留一句话，等手机下一次心跳来取。
+
+        为什么不能直接调对象：真正跑转发的网关在**子进程**里，本界面拿不到
+        它的 ctx。所以只能留话。
+
+        ⚠ 用 ``127.0.0.1`` 而不是配置里的 host 以外的事：这台机器上系统
+        代理可能把 loopback 也劫持到 502（以前踩过），所以请求显式禁用代理。
+        """
         def work():
             msg, ok = "", False
             try:
