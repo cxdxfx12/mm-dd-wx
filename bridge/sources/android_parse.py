@@ -369,6 +369,12 @@ class Frame:
     # 「视口不在最新处」的 UI 特征（99+ 未读徽标 / 查看更多消息 / 回到最新）。
     # 非空 = 屏幕下面还压着没看到的消息（假底部），见 ``ui_hints``。
     hints: tuple[str, ...] = ()
+    # 聊天页顶部的群名标题（``:id/tv_title`` 的文本）。
+    # 锚点丢失时拿它当「还在不在目标群」的身份证据：基线薄（一屏只有一条）
+    # 时新卡片很容易把锚点整条挤出屏幕 —— 屏上没有已知消息、也没有未读徽标，
+    # 旧逻辑只能翻页试探（每轮 30~90 秒），新消息被活活拖到用户手动翻手机
+    # 才转发（2026-11-02 16:54 实锤）。有了群名，就地重建基线 + 整屏打捞。
+    title: str = ""
 
     @property
     def fps(self) -> list[str]:
@@ -381,6 +387,22 @@ class Frame:
     @property
     def not_at_latest(self) -> bool:
         return bool(self.hints)
+
+
+def _chat_title(nodes: list[Node]) -> str:
+    """聊天页顶部的群名（resource-id 以 ``:id/tv_title`` 结尾的第一个非空文本）。
+
+    只认这个 id：``chatting_title`` / ``rl_title`` 是消息卡片里的昵称块，
+    与顶部标题是两回事（真机 2026-11-02 dump 实证：同一棵树里两者并存，
+    昵称块 ``chatting_title`` 的 bounds 还是坏的）。找不到返回空串 ——
+    调用方把它当「没有群身份证据」处理。
+    """
+    for n in nodes:
+        if n.rid.endswith(":id/tv_title"):
+            t = (n.text or "").strip()
+            if t:
+                return t
+    return ""
 
 
 def detect_page(root: Node) -> tuple[str, str]:
@@ -1210,6 +1232,7 @@ def parse_frame(text: str) -> Frame:
     # 先判页面，再切消息：@面板/群信息这些页面同样是「带很多文本的滚动列表」，
     # 不判就会把人名、身份标签当成群消息原样发出去。
     frame.page, frame.page_reason = detect_page(root)
+    frame.title = _chat_title(all_nodes)
     if not frame.is_chat:
         frame.warnings.append(f"当前不是聊天页（{frame.page_reason}）——本帧不解析")
         return frame

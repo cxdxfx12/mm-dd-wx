@@ -3028,9 +3028,21 @@ class _Handler(BaseHTTPRequestHandler):
                 #       消息捡回来，而不是把它们登记成历史。
                 if (not getattr(frame, "hints", ())
                         and not self.ctx.await_bottom
-                        and self._has_known_unit(frame)):
-                    log.info("安卓画面解析：H5 锚点对不上，但视口就在最新处"
-                             "（屏上有已知消息做证据）—— 不翻页，就地重建基线")
+                        and (self._has_known_unit(frame)
+                             or self._frame_title_ok(frame))):
+                    if self._has_known_unit(frame):
+                        log.info("安卓画面解析：H5 锚点对不上，但视口就在最新处"
+                                 "（屏上有已知消息做证据）—— 不翻页，就地重建基线")
+                    else:
+                        # 群名证据（2026-11-02 16:54 场景）：基线薄时新卡片
+                        # 会把锚点整条挤出屏幕 —— 屏上没有已知消息、也没有
+                        # 未读徽标，旧逻辑只能翻页试探（每轮 30~90 秒），
+                        # 新消息拖到用户手动翻手机才转发。顶部群名对得上
+                        # 电脑端盯的群 = 没换群、视口没翻历史（hints 空），
+                        # 就地重建 + 整屏打捞，一帧都不用等。
+                        log.info("安卓画面解析：H5 锚点对不上，但顶部群名对上"
+                                 "「%s」且视口在最新处 —— 不翻页，就地重建基线",
+                                 getattr(frame, "title", ""))
                     # 走打捞：这一屏的真新消息不能随基线吞掉。
                     self.ctx.align_stale_gave_up = True
                 else:
@@ -3051,14 +3063,21 @@ class _Handler(BaseHTTPRequestHandler):
                         return [], "锚点丢失，往上翻一屏找", False
             if self._guard_fake_bottom(frame):
                 return [], "视口不在最新处（假底部），已请手机回底再建基线", False
+            # ⚠ 打捞必须以 **commit 前**的旧屏为参照：commit 把 last_good_units
+            #   换成当前屏之后，原生消息的稳定指纹会让屏上每一条都「作证」成
+            #   已见（evidence=最后一条 → 候选为空）—— 打捞永远捞不到原生行，
+            #   只有 H5 重绘（每帧换指纹）才侥幸走进兜底分支。这也是「程序
+            #   重启时屏上的新消息被吞」一直修不干净的根源。所以这里先留着
+            #   旧参照打捞，完事之后再指向新屏。
+            prev_good = self.ctx.last_good_units
             differ.commit(frame.units)
-            self.ctx.last_good_units = list(frame.units)
             if diff.baseline:
                 log.info("安卓画面解析：已建立基线（当前屏 %d 条），"
                          "此后只转发基线之后的新消息%s", len(frame.units),
                          tail("baseline"))
                 # 30 分钟内的真新消息不随基线吞掉（2026-10-27）
                 s = self._sweep_deliver(frame, differ)
+                self.ctx.last_good_units = list(frame.units)
                 if s:
                     return s
                 return [], "已建立基线", False
@@ -3075,6 +3094,7 @@ class _Handler(BaseHTTPRequestHandler):
             # 时间护栏，翻历史/换群时捞不出东西）。
             swept = [u for u in self._sweep_recent(frame)
                      if u.fp not in {x.fp for x in salvaged}]
+            self.ctx.last_good_units = list(frame.units)
             combined = list(salvaged) + swept
             if combined:
                 out, _note, want_more = self._finish(combined, frame, differ)
@@ -3318,6 +3338,21 @@ class _Handler(BaseHTTPRequestHandler):
         """打捞的「已投递」判据 —— 委托模块级 `known_hit`，别各写一份。"""
         return known_hit(sender, content, known)
 
+    def _frame_title_ok(self, frame) -> bool:
+        """这一帧的顶部群名能不能对上电脑端盯的群（身份证据）。
+
+        真机 2026-11-02 实证：聊天页顶部群名挂在 ``:id/tv_title``，文本
+        就是干净的群名。子串互认（不带相似度阈值）—— 标题可能带后缀
+        变体，但「包含」关系足够把【数字质控】大江东群和别的群区分开。
+        """
+        title = (getattr(frame, "title", "") or "").strip()
+        # watch_group 没配时退回 chat_name（测试桩/单群配置常见形态）。
+        watch = ((getattr(self.ctx, "watch_group", "") or "").strip()
+                 or (getattr(self.ctx, "chat_name", "") or "").strip())
+        if not title or not watch:
+            return False
+        return watch in title or title in watch
+
     def _has_known_unit(self, frame) -> bool:
         """屏上还有没有「已知消息」（上一正常帧见过，或已投递过）。
 
@@ -3424,14 +3459,25 @@ class _Handler(BaseHTTPRequestHandler):
                 evidence = i
         hints = tuple(getattr(frame, "hints", ()) or ())
         if evidence < 0:
-            if not hints:
+            if not hints and not self._frame_title_ok(frame):
                 return []                 # 两类证据都没有，宁可不捞
-            # UI 特征兜底（2026-10-30 假底部事故）：屏上没有任何已入库消息，
-            # 但有「99+ 未读徽标 / 查看更多消息 / 回到最新」类节点 —— 视口
-            # 不在最新处，整屏都是基线没盖住的候选。时间/去重/夹断护栏照旧。
-            log.warning("安卓画面解析：屏上没有已入库消息，但发现「不在最新处」"
-                        "特征（%s）—— 整屏按打捞候选处理",
-                        "、".join(hints))
+            if hints:
+                # UI 特征兜底（2026-10-30 假底部事故）：屏上没有任何已入库消息，
+                # 但有「99+ 未读徽标 / 查看更多消息 / 回到最新」类节点 —— 视口
+                # 不在最新处，整屏都是基线没盖住的候选。时间/去重/夹断护栏照旧。
+                log.warning("安卓画面解析：屏上没有已入库消息，但发现「不在最新处」"
+                            "特征（%s）—— 整屏按打捞候选处理",
+                            "、".join(hints))
+            else:
+                # 群名证据（2026-11-02 16:54）：基线薄，新卡片把锚点挤出屏幕，
+                # 屏上没有已知消息、也没有未读徽标 —— 顶部群名对得上电脑端
+                # 盯的群 = 没换群（换群时标题对不上），视口在最新处（hints
+                # 空 = 没有翻历史迹象）。整屏按候选处理：dup_check（跨重启
+                # 的持久去重）+ 30 分钟时间条 + 夹断护栏会筛掉旧消息，标题
+                # 校验挡住「把别的群灌进目标群」的事故。
+                log.warning("安卓画面解析：屏上没有已入库消息，但顶部群名对上"
+                            "「%s」（视口在最新处）—— 整屏按打捞候选处理",
+                            getattr(frame, "title", ""))
             cand = list(units)
         else:
             cand = list(units[evidence + 1:])
