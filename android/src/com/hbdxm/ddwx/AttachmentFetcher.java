@@ -65,8 +65,10 @@ final class AttachmentFetcher {
     private static final long NUDGE_SPACING_MS = 3000L;
     /** 屏上找不到附件行时，向上翻屏找的次数（每翻一次 ≈ 0.6 屏）。
      *  长卡片刚到时视口停在卡片底部，「附件：xxx」在上方 —— 2026-11-01
-     *  15:35 真机实锤「屏上找不到附件行」就是这么来的。 */
-    private static final int ATTACH_SCROLL_TRIES = 3;
+     *  15:35 真机实锤「屏上找不到附件行」就是这么来的。
+     *  0.5.37 再放宽：2026-11-02 18:37 实锤「未及时转出明细」卡在约 7 屏
+     *  历史深处（巡检刚把视口回到底部），3 屏根本够不着 —— 提到 10。 */
+    private static final int ATTACH_SCROLL_TRIES = 10;
     /** 锚点滚动（ACTION_SCROLL_*）最多几屏：它比坐标滑动可靠，可以多给几屏。 */
     private static final int ANCHOR_SCROLL_TRIES = 6;
     /** 像素级精确滚动最多几次（每次都会重新 dump 校正距离）。 */
@@ -384,7 +386,13 @@ final class AttachmentFetcher {
             }
             if (!clicked) {
                 Rect aim = (bounds != null) ? bounds : blueB;
+                aim = settleTargetIntoView(svc, aim, cand);
                 clicked = tap(svc, aim.exactCenterX(), aim.exactCenterY());
+                if (viaBlue) {
+                    blueB = aim;             // 精滚后位置变了，日志和兜底都要跟上
+                } else {
+                    bounds = aim;
+                }
             }
             if (!clicked) {
                 tried.append(cand).append("：点击被拒；");
@@ -443,20 +451,7 @@ final class AttachmentFetcher {
             //    「屏上写什么就叫什么」，这样微信里收到的文件名和钉钉对得上。
             //    蓝字兜底点中的行读不到文本，用落盘文件名最诚实。
             String displayName = viaBlue ? file.getName() : cand;
-            byte[] data;
-            try {
-                data = java.nio.file.Files.readAllBytes(file.toPath());
-            } catch (Throwable e) {
-                // 老设备没有 java.nio.file.Files（API 26 以下）——手读兜底
-                data = readBytes(file);
-            }
-            if (data == null || data.length == 0) {
-                tried.append(cand).append("：文件空；");
-                lastStatus = "文件读不出来：" + file.getName();
-                Log.w(TAG, lastStatus);
-                restoreQuietly(svc);
-                continue;
-            }
+            byte[] data = readSettled(file);
             Uploader.Result r = Uploader.postFile(
                     Prefs.host(svc), Prefs.port(svc), token,
                     displayName, sha1(data), data);
@@ -969,6 +964,59 @@ final class AttachmentFetcher {
         return null;
     }
 
+    /**
+     * 附件行贴着视口顶/底时，坐标点击会被拦住（2026-11-02 18:37 实锤：
+     * 翻屏命中后行中心 y=312，落在钉钉顶栏悬浮层/下拉刷新热区里 —— 手势
+     * 注入成功、界面无反应，白等 35 秒）。先把行精滚到视口中部再点；
+     * 滚不动就原样返回 —— 宁可维持旧行为，不引入新的卡死路径。
+     */
+    private Rect settleTargetIntoView(AccessibilityService svc, Rect aim,
+                                      String name) {
+        if (aim == null) {
+            return aim;
+        }
+        int cy = (int) aim.exactCenterY();
+        if (cy >= 360 && cy <= 1900) {
+            return aim;                    // 中部安全区，直接点
+        }
+        AccessibilityNodeInfo list = findScrollable(svc.getRootInActiveWindow());
+        if (list == null) {
+            return aim;
+        }
+        Rect lb = new Rect();
+        list.getBoundsInScreen(lb);
+        if (lb.height() <= 0) {
+            return aim;
+        }
+        int shift = (cy < 360 ? 900 : 1500) - cy;   // 手指位移≈内容位移
+        float x = lb.exactCenterX();
+        float from;
+        float to;
+        if (shift > 0) {               // 行要下移：手指自上而下划（看上方内容）
+            from = lb.top + 40;
+            to = Math.min(lb.bottom - 40, from + shift);
+        } else {                       // 行要上移：手指自下而上划（看下方内容）
+            from = lb.bottom - 40;
+            to = Math.max(lb.top + 60, from + shift);
+        }
+        if (Math.abs(to - from) < 30 || !drag(svc, x, from, x, to)) {
+            return aim;
+        }
+        Scroller.settle();
+        Rect moved = findAttachBounds(svc, name);   // 行文本重新定位
+        if (moved == null && CAN_SHOT) {
+            moved = firstBlueRow(svc);              // 退回蓝字兜底
+        }
+        if (moved != null) {
+            int ncy = (int) moved.exactCenterY();
+            Log.i(TAG, "目标行贴边(y=" + cy + ")，已精滚到 y=" + ncy + " 再点");
+            if (ncy >= 360 && ncy <= 1900) {
+                return moved;
+            }
+        }
+        return aim;
+    }
+
     /** 从 (x1,y1) 拖到 (x2,y2) 的一次手势。 */
     private boolean drag(AccessibilityService svc, float x1, float y1,
                          float x2, float y2) {
@@ -1479,8 +1527,15 @@ final class AttachmentFetcher {
             } else if (findContainsAnywhere(svc, "确定", btn)
                     && (containsText(root, "已有相同文件", 0, 0)
                         || containsText(root, "文件已存在", 0, 0)
-                        || containsText(root, "重新下载", 0, 0))) {
-                Log.i(TAG, "UC 确认重新下载，点「确定」");
+                        || containsText(root, "重新下载", 0, 0)
+                        || findContainsAnywhere(svc, "下载任务", new Rect()))) {
+                // 0.5.39：点聊天卡片的「附件：xxx.xlsx」蓝字时，钉钉直接把
+                // 下载交给 UC，UC 弹「[xxx.xlsx]下载任务…」确认框（取消/确定）
+                // —— 2026-11-02 21:18 真机实锤：行找到了、蓝字点到了、UC 框
+                // 弹了，但这个分支只认「重新下载」类文案，确认框没人点，
+                // 35 秒等不到文件。文案检查必须走**全窗口**（UC 是独立应用
+                // 窗口，root 还是钉钉的树，containsText(root,…) 永远查不到）。
+                Log.i(TAG, "UC 确认下载任务，点「确定」");
                 tap(svc, btn.exactCenterX(), btn.exactCenterY());
             }
             try {
@@ -1581,6 +1636,33 @@ final class AttachmentFetcher {
             }
         }
         return false;
+    }
+
+    /**
+     * 读文件，读到空的不急着判死：UC 新版（0.5.40 观察）落盘先建占位再写内容，
+     * 立刻读会拿到 0 字节（2026-11-02 22:05 export(32) 实锤：文件明明 4K，
+     * App 读的瞬间是空的，直接「文件空」放弃）。等 1.5 秒重读，最多 4 次；
+     * 仍为空才认输。
+     */
+    private byte[] readSettled(File f) {
+        for (int i = 0; i < 4; i++) {
+            byte[] data;
+            try {
+                data = java.nio.file.Files.readAllBytes(f.toPath());
+            } catch (Throwable e) {
+                // 老设备没有 java.nio.file.Files（API 26 以下）——手读兜底
+                data = readBytes(f);
+            }
+            if (data != null && data.length > 0) {
+                if (i > 0) {
+                    Log.i(TAG, "文件第 " + (i + 1) + " 次读到内容（"
+                            + data.length + " 字节），之前是空的——UC 落盘延迟");
+                }
+                return data;
+            }
+            sleep(1500);
+        }
+        return null;
     }
 
     private byte[] readBytes(File f) {
@@ -1782,10 +1864,14 @@ final class AttachmentFetcher {
      * （SelfHeal.tap 同款结论）。没给手势权限时返回 false，不静默失效。
      */
     private boolean tap(AccessibilityService svc, float x, float y) {
+        // 时长必须 ≥150ms（2026-11-02 实锤）：H5 卡片里的蓝字链接对「瞬间
+        // 点击」（60ms、input tap 同理）毫无反应——系统照常注入、界面纹丝
+        // 不动；人手「按下-停留-松开」才能触发。60ms 时代所有蓝字点击全部
+        // 白点，附件在群里躺到超时。150ms 实测一次即中。
         Path p = new Path();
         p.moveTo(x, y);
         GestureDescription gd = new GestureDescription.Builder()
-                .addStroke(new GestureDescription.StrokeDescription(p, 0, 60L))
+                .addStroke(new GestureDescription.StrokeDescription(p, 0, 150L))
                 .build();
         try {
             return svc.dispatchGesture(gd, null, null);
