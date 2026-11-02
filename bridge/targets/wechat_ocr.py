@@ -152,6 +152,7 @@ MOUSEEVENTF_LEFTUP = 0x0004
 VK_CONTROL = 0x11
 VK_MENU = 0x12          # ALT：单独按一下不上屏，用来破前台锁
 VK_V = 0x56
+VK_F = 0x46                             # Ctrl+F = 微信「搜索」快捷键
 VK_RETURN = 0x0D
 VK_A = 0x41
 VK_BACK = 0x08
@@ -583,6 +584,38 @@ class WeChatOcrTarget(Target):
             return True, f"消息区非空白（内容占比 {frac:.1%}）"
         return False, f"消息区基本空白（内容占比 {frac:.1%}）"
 
+    def _search_open_hotkey(self, hwnd: int, target: str) -> bool:
+        """Ctrl+F 打开搜索 → 粘贴群名 → **验证真的上屏了**。
+
+        2026-11-02 实锤：模拟点击搜索框会被微信**静默吞掉** —— ``_click``
+        返回 True，微信毫无反应，搜索框还是灰色的 placeholder「搜索」；
+        后面的粘贴全部落进聊天窗口（等于往输入框打字），回车反而切到
+        会话列表第一项 —— 表现成「搜索也没成功：搜索结果里没认出目标群」。
+
+        Ctrl+F 是微信自带的「搜索」快捷键，键盘注入不依赖点击命中。
+        粘贴后 OCR 顶部条验证：空搜索框的 placeholder 只有「搜索」两字，
+        群名上屏后是一长串文本 —— 长度对不上就是没进搜索态。
+        """
+        self._press(VK_F, ctrl=True)
+        time.sleep(0.5)
+        self._clear_input()
+        if not self._paste(target):
+            return False
+        time.sleep(1.0)
+        img = self._grab(hwnd)
+        if img is None:
+            return False
+        import numpy as np
+        w, h = img.size
+        top = img.crop((int(w * 0.04), 0, int(w * 0.55), int(h * 0.06)))
+        try:
+            texts = self._ocr(np.array(top))
+        except Exception:                      # noqa: BLE001
+            return False
+        joined = "".join((x[1] or "") for x in texts if x and len(x) > 1)
+        joined = joined.replace(" ", "")
+        return len(joined) >= max(4, len(target) // 2)
+
     def _search_chat(self, hwnd: int, target: str) -> tuple[bool, str]:
         """点搜索框 → 输入群名 → 回车选第一条 → 标题栏确认。
 
@@ -595,12 +628,14 @@ class WeChatOcrTarget(Target):
            回车失败才回落到 OCR 定位结果项，且匹配时排除搜索框区域
            （cy > 0.075H），最后必须标题栏确认才算成功。
         """
-        if not self._click(hwnd, *_LAYOUT["search"]):
-            return False, "点击搜索框失败"
-        time.sleep(0.45)
-        self._clear_input()
-        if not self._paste(target):
-            return False, "搜索词粘贴失败"
+        if not self._search_open_hotkey(hwnd, target):
+            # Ctrl+F 没能让搜索词上屏（窗口没焦点/被吞），退回点击路径。
+            if not self._click(hwnd, *_LAYOUT["search"]):
+                return False, "点击搜索框失败"
+            time.sleep(0.45)
+            self._clear_input()
+            if not self._paste(target):
+                return False, "搜索词粘贴失败"
         time.sleep(0.9)                      # 等搜索结果返回
 
         # ---- 首选：回车选第一条结果 ----

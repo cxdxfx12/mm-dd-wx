@@ -392,6 +392,34 @@ final class AttachmentFetcher {
                 restoreQuietly(svc);
                 continue;
             }
+            if (!viaBlue && CAN_SHOT) {
+                // 点空快速检测（2026-11-02 实锤）：卡片上的「下载附件」整行
+                // clickable=false，无障碍点击用不上，退回坐标点击；而 dump 报的
+                // 行 bounds 宽 752px、蓝字只占左边 204px，中心 x=588 戳在文字
+                // 右侧的空白处 —— 系统照常注入、返回 true，界面毫无反应，
+                // 白等满 35 秒才认输。这里点完 2.5 秒看一眼：还停在聊天页多半
+                // 是点空了，有蓝字就改点蓝字的真实位置（真机实测 x 216-420）。
+                // 点中了会离开聊天页（预览/H5），就不会走到这里。
+                sleep(2500);
+                if (inTargetChat(svc.getRootInActiveWindow())) {
+                    Rect blueB2 = firstBlueRow(svc);
+                    if (blueB2 != null) {
+                        Rect aim = (bounds != null) ? bounds : blueB;
+                        int bx = (int) blueB2.exactCenterX(),
+                             by = (int) blueB2.exactCenterY();
+                        if (Math.abs(bx - aim.exactCenterX()) > 60
+                                || Math.abs(by - aim.exactCenterY()) > 60) {
+                            Log.i(TAG, "点击后仍停在聊天页：节点中心("
+                                    + aim.exactCenterX() + "," + aim.exactCenterY()
+                                    + ")多半戳在空白处，改点蓝字(" + bx + "," + by + ")");
+                            tap(svc, bx, by);
+                            blueB = blueB2;          // 后续日志按蓝字兜底算，别留 null
+                            viaBlue = true;          // 行文本未必是那条，名字以落盘为准
+                            tapAt = System.currentTimeMillis();
+                        }
+                    }
+                }
+            }
             Log.i(TAG, "已点击「" + cand + "」"
                     + (viaBlue ? "（蓝字兜底 y=" + blueB.top + "-" + blueB.bottom + "）" : "")
                     + "，等文件落盘（最多 " + waitMs / 1000 + " 秒）…");
