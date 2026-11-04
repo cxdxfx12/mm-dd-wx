@@ -151,6 +151,7 @@ MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 VK_CONTROL = 0x11
 VK_MENU = 0x12          # ALT：单独按一下不上屏，用来破前台锁
+KEYEVENTF_KEYUP = 0x0002
 VK_V = 0x56
 VK_F = 0x46                             # Ctrl+F = 微信「搜索」快捷键
 VK_RETURN = 0x0D
@@ -240,6 +241,7 @@ class WeChatOcrTarget(Target):
         match_threshold: float = 0.62,
         focus_delay: float = 0.35,
         send_delay: float = 0.8,
+        show_hotkey: str = "",
     ):
         self.dry_run = dry_run
         self.verify = verify
@@ -247,6 +249,7 @@ class WeChatOcrTarget(Target):
         self.match_threshold = match_threshold
         self.focus_delay = focus_delay
         self.send_delay = send_delay
+        self.show_hotkey = show_hotkey
         self._engine = None
         self._hwnd = 0
         self._current = ""          # 当前已打开的会话名（避免重复点击）
@@ -441,6 +444,24 @@ class WeChatOcrTarget(Target):
             return False, "会话列表 OCR 为空，无法定位目标群"
 
         hit, score = self._best_match(target, items)
+        # ---- 相似度过低 = 画面大概率不是微信（2026-11-04 20:07 教训）----
+        # `_snapshot` 的「会话数 < 3」自检挡不住这种帧：喵喵自己的窗口 /
+        # 采集助手界面 OCR 也能认出二十多条假会话。真正可靠的判据是
+        # 「跟目标群的最佳相似度」——真微信列表哪怕没有目标群，也会有个
+        # 0.3+ 的擦边命中；抓到别人的界面就只有 0.1 出头。低到可疑就置顶
+        # 重抓一帧，谁高用谁，并把坏帧落盘留证。
+        if hit is None and score < 0.35:
+            img2 = self._grab_pinned(hwnd)
+            if img2 is not None:
+                items2 = self._ocr_sessions(img2)
+                _, score2 = self._best_match(target, items2)
+                if score2 > score:
+                    log.warning("首帧相似度仅 %.2f（疑似抓到遮挡者），"
+                                "置顶重抓得 %.2f —— 采用新帧", score, score2)
+                    self._dump_frame(img, "suspect")
+                    img, items, score = img2, items2, score2
+            if score < 0.35:
+                self._dump_frame(img, "suspect")
         if hit is None:
             # ---- 列表里没有（未在首屏）→ 用搜索框 ----
             log.info("会话列表首屏未见「%s」（最高 %.2f），改用搜索框", target, score)
@@ -836,6 +857,15 @@ class WeChatOcrTarget(Target):
                     user32.ShowWindow(wt.HWND(hwnd), 9)      # SW_RESTORE
                 else:
                     user32.ShowWindow(wt.HWND(hwnd), 5)      # SW_SHOW
+                    # 2026-11-04 20:07 真机：用户点 X 把微信收进托盘后，
+                    # SW_SHOW 偶发唤不回（连挂 40 分钟，报「被 Program
+                    # Manager 挡住」——其实是微信根本不在屏幕上，矩形处
+                    # 露出的是桌面/别的窗口）。微信的「显示主窗口」全局
+                    # 热键是显示/隐藏开关，隐藏态按下即为显示，用它兜底。
+                    if not user32.IsWindowVisible(wt.HWND(hwnd)):
+                        log.warning("SW_SHOW 唤不回托盘态微信，改发热键 %s",
+                                    self.show_hotkey or "(未配置)")
+                        self._press_show_hotkey()
                 time.sleep(0.4)
             if user32.IsIconic(wt.HWND(hwnd)):
                 user32.ShowWindow(wt.HWND(hwnd), 9)          # SW_RESTORE
@@ -1160,6 +1190,44 @@ class WeChatOcrTarget(Target):
                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
         except Exception:                              # noqa: BLE001
             log.warning("摘掉 TOPMOST 失败 —— 微信可能一直压在其它窗口上")
+
+    def _press_show_hotkey(self) -> None:
+        """发微信「显示/隐藏主窗口」全局热键（``wechat.show_hotkey``）。
+
+        格式 ``{Ctrl}{Alt}w``；未配置则不动。全局热键由微信自己注册，
+        不吃前台锁 —— 这是托盘态 SW_SHOW 失效时唯一可靠的唤回手段。
+        """
+        seq = (getattr(self, "show_hotkey", "") or "").strip()
+        if not seq:
+            return
+        specials = {"ctrl": VK_CONTROL, "alt": VK_MENU, "shift": 0x10,
+                    "win": 0x5B}
+        vks = []
+        i = 0
+        while i < len(seq):
+            if seq[i] == "{":
+                j = seq.find("}", i)
+                if j < 0:
+                    return                     # 格式坏，宁可不发
+                name = seq[i + 1:j].strip().lower()
+                if name in specials:
+                    vks.append(specials[name])
+                elif len(name) == 1:
+                    vks.append(ord(name.upper()))
+                i = j + 1
+            else:
+                vks.append(ord(seq[i].upper()))
+                i += 1
+        if not vks:
+            return
+        try:
+            for vk in vks:
+                user32.keybd_event(vk, 0, 0, 0)
+            time.sleep(0.06)
+            for vk in reversed(vks):
+                user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+        except Exception as exc:               # noqa: BLE001
+            log.warning("发送微信热键失败：%s", exc)
 
     def _grab(self, hwnd: int):
         """抓整窗画面，返回 PIL.Image；不抢焦点（背景模式）。

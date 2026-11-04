@@ -92,6 +92,7 @@ def build_target(cfg) -> Target:
             verify=bool(getattr(cfg.wechat, "ocr_verify", True)),
             keep_clipboard=bool(getattr(cfg.wechat, "ocr_keep_clipboard", True)),
             match_threshold=float(getattr(cfg.wechat, "ocr_match_threshold", 0.62)),
+            show_hotkey=str(getattr(cfg.wechat, "show_hotkey", "") or ""),
         )
     raise ValueError(
         f"未知的 wechat.driver：{driver!r}（可选 auto | wxauto | ui4 | ocr）")
