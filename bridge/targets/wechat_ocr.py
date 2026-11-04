@@ -550,12 +550,60 @@ class WeChatOcrTarget(Target):
 
     @staticmethod
     def _title_matches(target: str, title: str) -> bool:
-        """标题栏文本是否指向目标会话（群名可能带人数后缀/被截断）。"""
+        r"""标题栏文本是否指向目标会话（群名可能带人数后缀/被截断）。
+
+        2026-11-04 实锤（20:31 投递连挂）：目标群名 15 个字，微信标题栏
+        只放得下「申通五星业务员群（重... (86)」——**永远不可能包含完整
+        群名**，原「t in s」判据必挂；搜索页还会把窗口撑宽、标题起点
+        左移，裁剪线切掉首字后读成「通五星...」。结果：回车明明已经把
+        目标群打开了，却被判成「没切过去」，转入 OCR 点结果项继续空转。
+        新增截断感知：标题里出现「...」时，取省略号**之前**的名字段，
+        与目标（或目标去掉首字——防裁剪切字）做前缀比对。
+        """
         import re
-        t = re.sub(r"\s+", "", target)
-        s = re.sub(r"\s+", "", title)
-        s = re.sub(r"\(\d+\)$", "", s)           # 「群名 (84)」
-        return bool(t) and (t in s or s[:len(t)] in t)
+
+        def norm(x: str) -> str:
+            x = re.sub(r"\s+", "", x)
+            # 全角括号归一成半角（OCR 两种都可能出）
+            return x.replace("（", "(").replace("）", ")")
+
+        t = norm(target)
+        s = norm(title)
+        if not t:
+            return False
+        if t in s or s in t:                     # 完整包含（原有判据）
+            return True
+
+        def head_of(x: str) -> str:
+            r"""剥掉标题尾部的截断残渣（人数后缀/省略号/杂字符），循环剥到稳
+            定 —— OCR 会把「重... (86)」读成「重. (86) +」这类乱序组合，
+            一层正则剥不干净。两个细节：
+            * **数字不进杂字符类**：群名本身可能以数字结尾，乱剥会把
+              「xx群2」误配成「xx群」；
+            * **括号也不进杂字符类**：否则会先剥掉 «(86)» 的右括号，
+              人数规则 `[（(]\d+[)）]$` 就永远匹配不上了（实测踩过）。
+            """
+            prev, h = None, x
+            while prev != h:
+                prev = h
+                h = re.sub(r"[（(]\d+[)）]$", "", h)          # 人数 (86)
+                h = re.sub(r"[.。…⋯+·\\|:,，、;；\s-]+$", "", h)
+            return h
+
+        # 候选 1：显式省略号截断 —— 取第一个「...」前的名字段
+        # 候选 2：整段尾部剥残渣（OCR 读丢省略号时兜底，20:57 实况）
+        cands = []
+        m = re.search(r"\.{2,}|…+|⋯+", s)
+        if m:
+            cands.append(s[:m.start()])
+        cands.append(s)
+        for cand in cands:
+            head = head_of(cand)
+            # 前缀长度门槛 6 防短串误配；首字被裁剪线切掉时放宽到 t[1:]
+            if len(head) >= 6 and (t.startswith(head)
+                                   or t[1:].startswith(head)):
+                return True
+        return False
 
     def _pane_is_open(self, img) -> tuple[bool, str]:
         """右侧聊天区**是否真的打开了一个会话**（不看标题栏）。
@@ -610,6 +658,20 @@ class WeChatOcrTarget(Target):
         if frac >= self.PANE_MIN_FRAC:
             return True, f"消息区非空白（内容占比 {frac:.1%}）"
         return False, f"消息区基本空白（内容占比 {frac:.1%}）"
+
+    def _dismiss_search_overlay(self, hwnd: int) -> None:
+        """退出搜索态，关掉右侧搜索结果栏。
+
+        2026-11-04 实锤：搜索页会把窗口从 901 撑到 1204 宽（右侧多出一条
+        搜索结果栏）。不关掉的话，下一步点输入框用的是 ``_LAYOUT["input"]``
+        的比例坐标 —— 0.70×1204=843 正好落进搜索结果栏而不是聊天输入框，
+        后面的粘贴/发送全会打进搜索框，表现为「发了但群里没收到」。
+        """
+        try:
+            self._press(VK_ESCAPE)
+            time.sleep(0.45)
+        except Exception:                          # noqa: BLE001
+            log.warning("退出搜索态失败（忽略）", exc_info=True)
 
     def _search_open_hotkey(self, hwnd: int, target: str) -> bool:
         """Ctrl+F 打开搜索 → 粘贴群名 → **验证真的上屏了**。
@@ -668,8 +730,15 @@ class WeChatOcrTarget(Target):
         # ---- 首选：回车选第一条结果 ----
         self._press(VK_RETURN)
         time.sleep(1.2)
-        opened, title = self._current_chat_title(hwnd)
+        # 回车后窗口布局同样要收窄沉降，多读几轮再下结论
+        opened, title = False, ""
+        for _i in range(3):
+            opened, title = self._current_chat_title(hwnd)
+            if opened and self._title_matches(target, title):
+                break
+            time.sleep(0.7)
         if opened and self._title_matches(target, title):
+            self._dismiss_search_overlay(hwnd)
             self._current = target
             return True, f"已通过搜索（回车）切到目标（标题栏：{title[:24]}）"
 
@@ -697,12 +766,16 @@ class WeChatOcrTarget(Target):
             return False, f"点击搜索结果「{hit['text']}」失败"
         self._current = hit["text"]
 
-        # 核对：结果页切换有延迟，重试读标题栏
+        # 核对：结果页切换有延迟，且点击结果会关掉搜索侧栏、窗口从
+        # 搜索宽版（~1204）收窄回普通宽度（~900）—— 布局抖动期间标题
+        # OCR 读出的是「×」这类碎片（2026-11-04 20:4x 实测：群明明已
+        # 打开，3×0.6s 全读空，白白判失败）。首读前先沉降，轮数放宽。
         title_txt = ""
-        for _ in range(3):
-            time.sleep(0.6)
+        for _i in range(5):
+            time.sleep(0.9 if _i == 0 else 0.7)
             ok, title_txt = self._current_chat_title(hwnd)
             if ok and self._title_matches(target, title_txt):
+                self._dismiss_search_overlay(hwnd)
                 return True, (
                     f"已通过搜索（OCR 定位）切到目标（标题栏：{title_txt[:24]}）")
             # 标题读不到 → 看聊天面板（同 `_open_chat` 的兜底逻辑）
@@ -713,6 +786,7 @@ class WeChatOcrTarget(Target):
                     if pane_open:
                         log.info("搜索结果「%s」标题栏读不到，但聊天面板已打开"
                                  "（%s）—— 按成功处理", hit["text"], why)
+                        self._dismiss_search_overlay(hwnd)
                         return True, (
                             f"已通过搜索（OCR 定位）切到目标"
                             f"（标题栏读不到，按聊天面板判据确认）")
@@ -1235,12 +1309,24 @@ class WeChatOcrTarget(Target):
         ⚠ **PrintWindow 在这台机器的微信 4.x 上会返回「冻结的旧帧」**：
         2026-10-18 实测——真实点击后屏幕内容（ImageGrab 已变）与 PrintWindow
         返回的位图（md5 不变）不一致，微信的 Qt 渲染走 GPU 合成，
-        不响应 PrintWindow 的重绘请求。**所以这里用 ImageGrab 抓窗口矩形**，
-        前提是窗口没被遮挡 —— `_activate()` 已确保微信在前台。
-        若日后要做「完全不抢前台」，需要另找 GPU 友好的抓帧路径（如
-        Windows.Graphics.Capture），别改回 PrintWindow。
+        不响应 PrintWindow 的重绘请求。
+
+        ⚠ **抓帧顺序：WGC → ImageGrab(遮挡时置顶) → PrintWindow**。
+        WGC（Windows Graphics Capture）直接取窗口自己的合成表面，被别的
+        窗口盖住、被拖出屏幕都能抓到，且不需要把微信置顶（不会闪屏）。
+        2026-11-04 实测：用窗口严丝合缝盖住微信，WGC 抓到的仍是微信完整
+        界面；ImageGrab 同场景只能抓到遮挡者。WGC 不可用时自动回落老路径。
         """
         from PIL import Image, ImageGrab
+
+        # ---- 首选：WGC（遮挡无关，坐标系已对齐到窗口矩形） ----
+        try:
+            from . import wgc_capture
+        except ImportError:                    # 不在包内被导入时（脚本调试）
+            import wgc_capture                 # type: ignore
+        img = wgc_capture.grab(hwnd)
+        if img is not None:
+            return img
 
         r = self._rect(hwnd)
         if not r:
@@ -1335,7 +1421,20 @@ class WeChatOcrTarget(Target):
         猜是遮挡还是群名错 —— 这种证据不该再缺。
         """
         try:
-            import paths
+            # ⚠ ``paths.py`` 在 ``app/`` 下，只有 GUI 进程会把 app/ 放进
+            # sys.path。工作进程（run.py）只加了仓库根目录，因此这里
+            # 直接 ``import paths`` 必炸 ModuleNotFoundError —— 异常被下面
+            # 的 log.debug 吞掉，结果 2026-11-04 一整晚的失败现场一张图
+            # 都没留下（data/debug 压根没生成）。两条腿一起走：
+            try:
+                import paths                              # type: ignore
+            except ImportError:
+                import sys as _sys
+                from pathlib import Path as _Path
+                _app = _Path(__file__).resolve().parents[2] / "app"
+                if str(_app) not in _sys.path:
+                    _sys.path.insert(0, str(_app))
+                import paths                              # type: ignore
             d = paths.data_dir("debug")
             d.mkdir(parents=True, exist_ok=True)
             p = d / f"wechat-{tag}-{time.strftime('%Y%m%d-%H%M%S')}.png"
@@ -1348,7 +1447,7 @@ class WeChatOcrTarget(Target):
                     pass
             log.info("可疑画面已存 %s", p)
         except Exception as exc:                           # noqa: BLE001
-            log.debug("保存可疑画面失败：%s", exc)
+            log.warning("保存可疑画面失败：%s", exc)
 
     def _ocr(self, arr):
         """跑一次 OCR。引擎懒加载并缓存（首次加载模型约 1-2 秒）。

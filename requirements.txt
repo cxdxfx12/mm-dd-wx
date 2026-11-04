@@ -20,3 +20,11 @@ pillow>=10.0.0
 psutil>=5.9.0
 colorama>=0.4.6
 tenacity>=8.2.0
+
+# 窗口抓帧：WGC（Windows Graphics Capture）—— 被遮挡/移出屏幕也能抓到
+# 微信自己的画面，替代 ImageGrab 截屏幕（Rust 扩展，cp312 win_amd64）。
+# ⚠ **故意不写在这里**：它声明依赖 opencv-python，而本包装的是
+#   opencv-python-headless（同一个 cv2 模块、体积小一半）。pip 按包名
+#   判依赖 → 离线安装直接 «No matching distribution found»。
+#   安装器里用 `pip install --no-deps windows-capture` 单独装
+#   （见 installer/setup_gui.py 的 `_env_wgc`）。

@@ -40,7 +40,7 @@ APP_NAME = "喵喵钉钉-微信消息转发桥"
 #   bridge/__init__.py 里的 __version__。手工单独跑 setup_gui.py 调试时
 #   才会用到这里的值 —— 改了记得跟 bridge/__init__.py 对齐。
 #   格式必须是「0.xx」，与主程序底部的版本号一致。
-VERSION = "0.53"
+VERSION = "0.54"
 PUBLISHER = "杭州喵喵至家网络有限公司"
 WEBSITE = "www.hbdxm.com"
 COPYRIGHT = f"杭州喵喵至家网络有限公司　{WEBSITE}"
@@ -1043,7 +1043,30 @@ class Wizard(tk.Tk):
         if code != 0:
             self._env_log("离线依赖安装失败。", "err")
             return None
+        self._env_wgc(py, wheels_dir)
         return py
+
+    def _env_wgc(self, py: Path, wheels_dir: Path | None = None) -> None:
+        """单独安装 windows-capture（WGC 窗口抓帧）。
+
+        ⚠ **不能写进 requirements.txt**：它声明依赖 ``opencv-python``，而本包装
+        的是 ``opencv-python-headless``（同一个 ``cv2`` 模块、体积小一半）。
+        pip 按包名判依赖 → 离线解析直接
+        «No matching distribution found for opencv-python»，整个离线安装全盘失败。
+        所以这里 ``--no-deps`` 单独装，cv2 由 headless 包提供。
+
+        装不上也不阻塞安装：抓帧会自动回落到 ImageGrab + 置顶那套老路径
+        （见 ``wechat_ocr._grab``），只是被遮挡时没那么稳。
+        """
+        args = [py, "-m", "pip", "install", "--no-warn-script-location",
+                "--no-deps", "windows-capture"]
+        if wheels_dir is not None:
+            args[4:4] = ["--no-index", "--find-links", str(wheels_dir)]
+        else:
+            args[4:4] = ["-i", PYPI_MIRRORS[0]]
+        code, _ = self._run_logged(args)
+        if code != 0:
+            self._env_log("WGC 抓帧组件未装（会回落到截图模式，不影响投递）", "dim")
 
     def _env_finish(self, vpy: Path):
         """收尾：OCR 预热（尽力）→ 自检 → 写解释器缓存 → 完成页。"""
@@ -1179,6 +1202,7 @@ class Wizard(tk.Tk):
                 self._env_btn_retry()
                 return
 
+            self._env_wgc(vpy)          # WGC 抓帧组件（--no-deps，见方法注释）
             self._env_finish(vpy)
         except Exception as exc:
             _dbg("env-worker CRASH:\n" + traceback.format_exc())
