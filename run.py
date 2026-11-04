@@ -415,5 +415,31 @@ def main() -> int:
                 Path(f"{sim_db}{suffix}").unlink(missing_ok=True)
 
 
+def _enable_dpi_awareness() -> None:
+    """声明 Per-Monitor V2 DPI 感知，必须赶在任何窗口 API 之前。
+
+    不声明时，Windows 在 125%/150% 缩放屏上会把所有窗口坐标虚拟化：
+    GetWindowRect 返回的是缩放坐标系，而 ImageGrab 抓的是物理像素 ——
+    OCR 投递端按这个矩形截屏会整体错位几百像素，截到旁边窗口的内容，
+    相似度 0.00、投递全部失败（2026-11-04 事故根因，125% 缩放实测）。
+    """
+    import ctypes
+    try:
+        # Win10 1703+；已有 manifest 声明时会返回 FALSE，无妨
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(
+            ctypes.c_void_p(-4))            # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # Win8.1+
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()     # Vista 兜底
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
+    _enable_dpi_awareness()
     raise SystemExit(main())

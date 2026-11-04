@@ -435,8 +435,8 @@ class WeChatOcrTarget(Target):
         img, items = self._snapshot(hwnd)
         if img is None:
             return False, (
-                "抓不到微信窗口画面（窗口可能已最小化或收进托盘）——"
-                "请点任务栏微信图标还原窗口后重试")
+                "抓不到微信窗口画面（窗口可能已最小化、收进托盘，或被其他"
+                "窗口遮挡）——请把微信还原到桌面可见，或移开压在它上面的窗口")
         if not items:
             return False, "会话列表 OCR 为空，无法定位目标群"
 
@@ -1080,6 +1080,33 @@ class WeChatOcrTarget(Target):
 
     # ---------- 截图 ----------
 
+    def _occluder(self, hwnd: int) -> str | None:
+        """矩形采样点上最顶层的窗口若不是微信，返回它的标题（被谁盖住了）。
+
+        2026-11-04 事故：微信收进托盘/被其他窗口压住时，ImageGrab 仍按
+        微信的（陈旧）矩形抓屏，抓到的是压在那些坐标上的**别的窗口**，
+        OCR 全是无关文字、相似度 0.00，报错却甩锅给「会话列表没找到」，
+        排查极难。抓帧前先验证这块屏幕确实归微信：不是就如实上报遮挡者。
+        """
+        r = self._rect(hwnd)
+        if not r:
+            return None
+        cx, cy = (r[0] + r[2]) // 2, (r[1] + r[3]) // 2
+        # 会话列表在左侧栏：左 1/4、垂直中点再采一个点
+        lx = r[0] + max(8, (r[2] - r[0]) // 4)
+        ly = r[1] + (r[3] - r[1]) // 2
+        for px, py in ((cx, cy), (lx, ly)):
+            child = user32.WindowFromPoint(_POINT(px, py))
+            if not child:
+                continue
+            root = user32.GetAncestor(child, 2)      # GA_ROOT
+            if root and root != hwnd:
+                n = user32.GetWindowTextLengthW(root)
+                buf = ctypes.create_unicode_buffer(n + 1)
+                user32.GetWindowTextW(root, buf, n + 1)
+                return (buf.value or f"窗口#{root}")[:40]
+        return None
+
     def _grab(self, hwnd: int):
         """抓整窗画面，返回 PIL.Image；不抢焦点（背景模式）。
 
@@ -1099,6 +1126,17 @@ class WeChatOcrTarget(Target):
         w, h = r[2] - r[0], r[3] - r[1]
         if w <= 0 or h <= 0:
             return None
+        # ---- 遮挡守卫：矩形上压着别的窗口时，抓到的一定是别人的画面 ----
+        # 上一轮先再给 _activate 一次机会（托盘/最小化/前台被占都会在这里救回），
+        # 仍然被盖就放弃抓帧，让上层报「窗口被遮挡」而不是拿垃圾去 OCR。
+        occ = self._occluder(hwnd)
+        if occ is not None:
+            if self._activate(hwnd):
+                occ = self._occluder(hwnd)
+            if occ is not None:
+                log.warning("微信窗口被「%s」遮挡（或不在前台/已收进托盘），"
+                            "抓帧放弃，避免 OCR 到别的窗口", occ)
+                return None
         try:
             return ImageGrab.grab(bbox=r, all_screens=False)
         except Exception as exc:
