@@ -40,7 +40,7 @@ APP_NAME = "喵喵钉钉-微信消息转发桥"
 #   bridge/__init__.py 里的 __version__。手工单独跑 setup_gui.py 调试时
 #   才会用到这里的值 —— 改了记得跟 bridge/__init__.py 对齐。
 #   格式必须是「0.xx」，与主程序底部的版本号一致。
-VERSION = "0.49"
+VERSION = "0.50"
 PUBLISHER = "杭州喵喵至家网络有限公司"
 WEBSITE = "www.hbdxm.com"
 COPYRIGHT = f"杭州喵喵至家网络有限公司　{WEBSITE}"
@@ -508,11 +508,12 @@ class Wizard(tk.Tk):
         target = self.install_dir
         self._ui(self._set_step, "正在解压程序文件…", 5)
         _dbg(f"extract start: {payload} -> {target}")
+        self._release_file_locks(target)
         with zipfile.ZipFile(payload) as zf:
             names = zf.namelist()
             total = max(len(names), 1)
             for i, name in enumerate(names):
-                zf.extract(name, target)
+                self._extract_one(zf, name, target)
                 if i % 25 == 0 or i == total - 1:
                     self._ui(self._set_step,
                              f"正在解压程序文件… {i + 1}/{total}",
@@ -533,6 +534,79 @@ class Wizard(tk.Tk):
         except Exception as exc:
             self._ui(self._log, f"卸载程序复制失败（不影响使用）：{exc}", "dim")
         self._ui(self._set_step, "程序文件已就绪", 65)
+
+    def _extract_one(self, zf: zipfile.ZipFile, name: str, target: Path) -> None:
+        """解压单个条目，遇到文件被占用时自动释放占用再重试。
+
+        2026-11-04 真机踩到：``tools/platform-tools/AdbWinApi.dll`` 报
+        ``[Errno 13] Permission denied`` —— 上一版留下的 **adb server 常驻进程**
+        （adb.exe 监听 5037）一直握着自己的 DLL，安装器覆盖不了。用户看到的
+        就是「安装失败」，而且重试也没用，除非手动去任务管理器结束 adb.exe。
+        所以这里对 PermissionError 做「释放 → 重试」的闭环，而不是一次失败就崩。
+        """
+        if name.endswith("/"):
+            return
+        last: Exception | None = None
+        for attempt in range(4):
+            try:
+                zf.extract(name, target)
+                return
+            except PermissionError as exc:                 # 被占用 / 只读
+                last = exc
+                _dbg(f"extract busy ({attempt + 1}/4): {name} -> {exc}")
+                if attempt == 0:
+                    self._kill_by_image("adb.exe")
+                elif attempt == 1:
+                    self._release_file_locks(target)
+                time.sleep(0.4 * (attempt + 1))
+            except Exception as exc:                       # noqa: BLE001
+                last = exc
+                _dbg(f"extract fail: {name} -> {exc}")
+                time.sleep(0.2)
+        raise RuntimeError(
+            f"无法写入文件（可能被其他程序占用）：\n{target / name}\n\n"
+            f"具体错误：{last}\n\n"
+            "请先退出正在运行的「喵喵钉钉-微信消息转发桥」，"
+            "并在任务管理器里结束 adb.exe 后重试安装。")
+
+    def _kill_by_image(self, image: str) -> None:
+        """按进程名强杀。装升级包时必须的：旧进程握着 exe/dll，覆盖必失败。"""
+        try:
+            r = subprocess.run(["taskkill", "/F", "/IM", image],
+                               capture_output=True, timeout=10,
+                               creationflags=0x08000000 if os.name == "nt" else 0,
+                               stdin=subprocess.DEVNULL)
+            _dbg(f"taskkill {image} rc={r.returncode}")
+        except Exception as exc:                           # noqa: BLE001
+            _dbg(f"taskkill {image} failed: {exc}")
+
+    def _release_file_locks(self, target: Path) -> None:
+        """安装/升级前的清场：停掉会锁住目标目录文件的进程。
+
+        两类：
+        1. **主程序自己** —— 它锁着 ``喵喵钉钉-微信消息转发桥.exe``，不结束就
+           覆盖不了（升级时提示「正在使用中」或直接 PermissionError）。
+        2. **adb server** —— 手机画面面板一取帧就拉起常驻的 adb.exe，它握着
+           ``tools/platform-tools/AdbWinApi.dll`` 等文件。这是 2026-11-04
+           用户在 AdbWinApi.dll 上撞到 Permission denied 的真凶。
+
+        静默安装时本来就该先停程序（用户点安装就是要升级）；GUI 安装也一样，
+        否则必然失败。停完不自动重启，交回用户自己开。
+        """
+        if os.name != "nt":
+            return
+        adb = target / "tools" / "platform-tools" / "adb.exe"
+        if adb.exists():
+            try:
+                r = subprocess.run([str(adb), "kill-server"], capture_output=True,
+                                   timeout=8, creationflags=0x08000000,
+                                   stdin=subprocess.DEVNULL)
+                _dbg(f"adb kill-server rc={r.returncode}")
+            except Exception as exc:                       # noqa: BLE001
+                _dbg(f"adb kill-server failed: {exc}")
+        self._kill_by_image("adb.exe")
+        self._kill_by_image(APP_NAME + ".exe")
+        time.sleep(0.5)
 
     def _drop_stale_apks(self, target: Path, names: list[str]) -> None:
         """删掉上一版留下、这一版不再需要的 APK。
