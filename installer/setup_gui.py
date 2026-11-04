@@ -507,6 +507,7 @@ class Wizard(tk.Tk):
             raise RuntimeError("安装包内部缺少程序文件（payload.zip）")
         target = self.install_dir
         self._ui(self._set_step, "正在解压程序文件…", 5)
+        _dbg(f"extract start: {payload} -> {target}")
         with zipfile.ZipFile(payload) as zf:
             names = zf.namelist()
             total = max(len(names), 1)
@@ -516,6 +517,11 @@ class Wizard(tk.Tk):
                     self._ui(self._set_step,
                              f"正在解压程序文件… {i + 1}/{total}",
                              5 + 60 * (i + 1) / total)
+                    # 心跳落盘：界面若被杀软拦停/冻结，日志能告诉我们
+                    # 解压到底走到哪、卡没卡（2026-11-04 用户装机卡在
+                    # 151/256，实际文件已全部落盘，界面只是没再刷新）。
+                    _dbg(f"extract {i + 1}/{total}")
+        _dbg("extract done")
         self._ui(self._log, f"程序文件已释放到 {target}（{total} 个文件）", "ok")
         self._drop_stale_apks(target, names)
 
