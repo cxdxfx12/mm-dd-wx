@@ -449,10 +449,16 @@ class WeChatOcrTarget(Target):
                 return True, why
             sample = "、".join(it["text"] for it in items
                                if it.get("kind") == "session")[:5] or "（无）"
+            # 相似度极低 + 文本碎片化，多半是「检查时微信在前台、抓帧瞬间又被
+            # 别的程序压回去」（2026-11-04 实机：运单采集助手反复弹 Excel 抢
+            # 前台，OCR 只读到被盖后的残字，相似度 0.11 却查不出遮挡者）。
+            # 把此刻的遮挡状态如实带上，一眼看出是谁在捣乱。
+            occ = self._occluder(hwnd)
+            occ_note = f"⚠ 此刻微信被「{occ}」挡住了！" if occ else ""
             return False, (
                 f"会话列表首屏没找到「{target}」（最高相似度 {score:.2f} < "
                 f"{self.match_threshold}），搜索也没成功：{why}。"
-                f"当前可见会话：{sample}")
+                f"当前可见会话：{sample}{occ_note}")
 
         if self._current == hit["text"]:
             # 上面的短路已经查过一次标题栏，走到这里说明标题栏**没读到**或
@@ -1138,9 +1144,19 @@ class WeChatOcrTarget(Target):
                             "抓帧放弃，避免 OCR 到别的窗口", occ)
                 return None
         try:
-            return ImageGrab.grab(bbox=r, all_screens=False)
+            frame = ImageGrab.grab(bbox=r, all_screens=False)
         except Exception as exc:
             log.warning("ImageGrab 抓窗失败（%s），回退 PrintWindow", exc)
+        else:
+            # ---- 抓帧后复查：守卫检查到抓屏之间有百毫秒级空档，别的程序
+            # （2026-11-04：运单采集助手反复弹 WPS 表格抢前台）可能趁虚而入，
+            # 抓回一帧「半张别人的脸」。复查发现被盖就整帧作废，让上层重试，
+            # 绝不把垃圾喂给 OCR。
+            occ2 = self._occluder(hwnd)
+            if occ2 is not None:
+                log.warning("抓帧后微信被「%s」压住 —— 本帧作废，等待重试", occ2)
+                return None
+            return frame
         # ---- 回退：PrintWindow（仅当 ImageGrab 不可用时） ----
         hwnd_dc = user32.GetWindowDC(wt.HWND(hwnd))
         mem_dc = ctypes.windll.gdi32.CreateCompatibleDC(hwnd_dc)

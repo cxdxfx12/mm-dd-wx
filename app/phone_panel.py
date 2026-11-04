@@ -144,8 +144,13 @@ class PhonePanel(tk.Frame):
         head.pack(fill="x", padx=12, pady=(10, 6))
         tk.Label(head, text="手机画面", bg=c["card"], fg=c["text"],
                  font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
-        self.live_chk = ttk.Checkbutton(head, text="实时", variable=self._live,
-                                        command=self._sync_live)
+        # 同上：tk 控件，避开 vista 主题高 DPI 空白文字问题
+        self.live_chk = tk.Checkbutton(head, text="实时", variable=self._live,
+                                       command=self._sync_live,
+                                       bg=c["card"], fg=c["muted"],
+                                       activebackground=c["card"],
+                                       font=("Microsoft YaHei UI", 9),
+                                       highlightthickness=0, bd=0)
         self.live_chk.pack(side="right")
 
         self.canvas = tk.Canvas(self, bg="#fbfcfe", highlightthickness=0,
@@ -163,13 +168,23 @@ class PhonePanel(tk.Frame):
 
         bar = tk.Frame(self, bg=c["card"])
         bar.pack(fill="x", padx=10, pady=(0, 6))
-        for text, cmd, w in (("返回", lambda: self._send("input keyevent KEYCODE_BACK", "返回"), 5),
-                             ("主页", lambda: self._send("input keyevent KEYCODE_HOME", "主页"), 5),
-                             ("上翻", lambda: self._swipe_quick("up"), 5),
-                             ("下翻", lambda: self._swipe_quick("down"), 5)):
-            ttk.Button(bar, text=text, width=w, command=cmd).pack(side="left", padx=(0, 4))
-        ttk.Button(bar, text="存图", width=5,
-                   command=self.save_shot).pack(side="right")
+        # ⚠ 这里必须用 tk.Button 而不是 ttk.Button：vista 主题在 Per-Monitor
+        # DPI 感知下会把 ttk 按钮文字渲染成空白（0.48/0.49 实机截图：五个
+        # 只有边框没有字的按钮）。tk.Button 走 GDI 绘制，不受主题影响。
+        for text, cmd in (("返回", lambda: self._send("input keyevent KEYCODE_BACK", "返回")),
+                          ("主页", lambda: self._send("input keyevent KEYCODE_HOME", "主页")),
+                          ("上翻", lambda: self._swipe_quick("up")),
+                          ("下翻", lambda: self._swipe_quick("down"))):
+            tk.Button(bar, text=text, command=cmd, width=5,
+                      bg=c["card"], fg=c["text"], activebackground=c["bg"],
+                      activeforeground=c["accent"], relief="groove",
+                      font=("Microsoft YaHei UI", 9),
+                      highlightthickness=0, bd=1).pack(side="left", padx=(0, 4))
+        tk.Button(bar, text="存图", command=self.save_shot, width=5,
+                  bg=c["card"], fg=c["text"], activebackground=c["bg"],
+                  activeforeground=c["accent"], relief="groove",
+                  font=("Microsoft YaHei UI", 9),
+                  highlightthickness=0, bd=1).pack(side="right")
 
         foot = tk.Frame(self, bg=c["card"])
         foot.pack(fill="x", padx=12, pady=(0, 8))
