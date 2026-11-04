@@ -68,3 +68,6 @@ tools/scrcpy-win64-v5.0.1/
 
 # 会话记忆与本地设置（工具生成，不属于工程内容）
 .workbuddy/
+
+# 安装包离线组件（运行时 + wheel，体积大，不入库；installer/fetch_vendor.py 可重拉）
+installer/_vendor/

@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
@@ -178,6 +179,23 @@ def build_payload(app_exe: Path) -> Path:
     wx = ROOT.parent / "wxauto-main"
     if wx.is_dir():
         expected |= {"wxauto-main/" + r for r in copy_tree(wx, payload / "wxauto-main")}
+    else:
+        # 2026-11-04 事故：D:\wxauto-main 被清掉后构建静默跳过，装出来的
+        # 程序采集端(UIAutomation)直接不可用。缺了必须喊出来。
+        print("    ⚠ 缺少 wxauto 库源码（D:\\wxauto-main）——\n"
+              "      装出来的程序采集端将不可用！先恢复该目录再打包。",
+              flush=True)
+
+    # 2b) adb（platform-tools）：手机画面取帧/点击靠它。缺失时构建不拦，
+    #     但装出来的「手机画面」面板会一直报「未找到 adb」。缺了必须喊出来。
+    adb = ROOT / "tools" / "platform-tools" / "adb.exe"
+    if adb.is_file():
+        print(f"    adb：{adb.stat().st_size / 1e6:.1f} MB（随包分发）", flush=True)
+    else:
+        print("    ⚠ 缺少 tools\\platform-tools\\adb.exe ——\n"
+              "      装出来的程序「手机画面」将不可用！\n"
+              "      先下载 platform-tools 解压到 tools\\platform-tools 再打包。",
+              flush=True)
 
     # 3) 主程序 exe
     shutil.copy2(app_exe, payload / app_exe.name)
@@ -269,18 +287,62 @@ def build_setup(payload_zip: Path) -> Path:
     staged = BUILD / "setup_gui.py"
     staged.write_text(patched, encoding="utf-8")
     print(f"    安装向导版本：{ver}（来自 bridge/__init__.py）", flush=True)
+    # 离线组件：嵌入版 Python 运行时 + 全量依赖 wheel（installer/_vendor/）。
+    # 有它们，安装向导配环境全程不联网；没有则自动回退在线配置（不阻塞构建）。
+    vendor = HERE / "_vendor"
+    has_vendor = ((vendor / "wheels").is_dir()
+                  and list(vendor.glob("python-*-embed-amd64.zip")))
+    if has_vendor:
+        print("    离线组件：已随包（安装时无需联网）", flush=True)
+    else:
+        print("    ⚠ 缺少离线组件 installer/_vendor/ —— 安装时将联网配置环境",
+              flush=True)
     pyi("--onefile", "--windowed", "--icon", str(ROOT / "app" / "app.ico"),
         "--name", f"{APP_NAME}-Setup",
-        "--add-data", f"{payload_zip};.", str(staged))
+        # 安装向导会在运行时从**安装目录**里 import cfgfile / paths（写配置、
+        # 探测解释器）。PyInstaller 只收「主脚本能走到的模块」，所以这两个
+        # 模块的依赖（json、re…）默认不会进包，冻结后 import 会报
+        # ModuleNotFoundError —— 表现是静默安装「成功」退出，但 config.yaml
+        # 没生成、快捷方式与卸载登记也全被跳过。用 hidden-import 显式带上。
+        "--paths", "app",
+        "--hidden-import", "cfgfile",
+        "--hidden-import", "paths",
+        "--add-data", f"{payload_zip};.",
+        *(["--add-data", f"{vendor};vendor"] if has_vendor else []),
+        str(staged))
     out = ROOT / "dist" / f"{APP_NAME}-Setup.exe"
     if not out.is_file():
         raise SystemExit("Setup 没有生成")
     return out
 
 
+def check_toolchain() -> None:
+    """开跑之前先确认构建环境，别等三步跑完才在最后一步报错。
+
+    两个硬条件：
+      * ``pyinstaller``：三个 exe 全靠它；
+      * ``tkinter``：主程序与安装向导都是 tkinter 界面 —— 精简版/嵌入式
+        Python 常常把它裁掉（WorkBuddy 自带的解释器就没有），打出来的包
+        一启动就崩。
+    """
+    if importlib.util.find_spec("PyInstaller") is None:
+        raise SystemExit(
+            "    ✗ 当前解释器没有 PyInstaller。\n"
+            f"      {sys.executable}\n"
+            "      先执行：pip install pyinstaller")
+    if importlib.util.find_spec("tkinter") is None:
+        raise SystemExit(
+            "    ✗ 当前解释器没有 tkinter，打不出界面程序。\n"
+            f"      {sys.executable}\n"
+            "      请改用 python.org 官方 Windows 安装包自带的 Python"
+            "（自带 tcl/tk）。")
+    print(f"    构建解释器：{sys.executable}")
+
+
 def main() -> int:
     print(WELCOME.format(name=APP_NAME))
     print(f"    版本：{app_version()}")
+    check_toolchain()
     BUILD.mkdir(exist_ok=True)
     DIST.mkdir(exist_ok=True)
 

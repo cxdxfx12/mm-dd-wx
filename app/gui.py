@@ -308,7 +308,9 @@ class App(tk.Tk):
         # 「停止」应为灰色空心。不刷的话首帧停在 `_accent_btn()` 给的实心红 —
         # 用户会看到一个「停止」可点但点了没用的假象，正好是本次要修的那个毛病。
         self._refresh_state()
-        if not gui_ok:
+        if not gui_ok and not getattr(sys, "frozen", False):
+            # 安装版界面是冻结 exe 自带 tkinter，gui 字段为空是正常的；
+            # 只有源码运行（界面靠外部解释器）才可能出现真正的异常。
             self._log("⚠ 未找到带 tkinter 的解释器（不应出现，界面仍在运行）", "warn")
         if with_check:
             self.log_message("首次自检开始（只读，不发送任何消息）")

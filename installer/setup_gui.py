@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ctypes
+import base64
 import json
 import os
 import shutil
@@ -48,7 +49,12 @@ UNINSTALL_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\MiaoMiaoDi
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "MiaoMiaoDingWeChatBridge"
 
-PYPI_MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple"
+PYPI_MIRRORS = [
+    "https://pypi.tuna.tsinghua.edu.cn/simple",
+    "https://mirrors.aliyun.com/pypi/simple/",
+    "https://mirrors.cloud.tencent.com/pypi/simple",
+]
+PIP_COMMON = ["--progress-bar", "off", "--timeout", "15", "--retries", "2"]
 PY_RUNTIME_VER = "3.12.10"
 PY_URLS = [
     f"https://mirrors.huaweicloud.com/python/{PY_RUNTIME_VER}/"
@@ -97,6 +103,71 @@ def _self_exe() -> Path:
 def default_install_dir() -> Path:
     pf = os.getenv("ProgramFiles") or r"C:\Program Files"
     return Path(pf) / APP_NAME
+
+
+def _same_volume_tmp(target: Path) -> Path:
+    """挑一个与安装目录**同卷**的临时目录。
+
+    Windows 允许重命名正在运行的 exe，但**不允许删除**它。``shutil.move``
+    跨卷时会退化成「复制 + 删原文件」，删除这一步必然失败，整个 move 抛异常
+    （实测 ``%TEMP%`` 在 C:、程序装在 D: 时，卸载程序挪不走自己，最后整目录
+    只剩下一个 ``uninstall.exe``）。同卷则是纯 rename，一定成功。
+    """
+    tmp = Path(os.getenv("TEMP") or os.getenv("TMP") or ".")
+    try:
+        if os.path.splitdrive(str(tmp))[0].lower() == \
+                os.path.splitdrive(str(target))[0].lower():
+            return tmp
+    except Exception:
+        pass
+    return target.parent                     # 不同卷：退到父目录（同卷）
+
+
+def _dbg(msg: str) -> None:
+    """把环境配置过程的关键步骤追加到 ``%TEMP%\\mm-setup-debug.log``。
+
+    「一键自动配置」跑在后台线程里，窗口上那条日志框要靠 tkinter 的
+    跨线程调度（``after``）才能显示 —— 调度本身一旦出问题，用户看到的
+    就是「界面不动了」，且没有任何输出可排查。所以所有关键步骤都同步
+    落一份文件日志：用户反馈卡住时，直接看这个文件就能定位卡在哪一步。
+    """
+    try:
+        with open(Path(os.getenv("TEMP", ".")) / "mm-setup-debug.log",
+                  "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] [{os.getpid()}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _spawn_deferred_cleanup(paths: list[Path]) -> bool:
+    """让一个独立进程等本进程退出后，把残留的目录/文件删干净。
+
+    用 ``-EncodedCommand``（UTF-16LE + base64）传脚本，不走 .bat/.ps1 文件 ——
+    默认安装路径里有中文，写文件会撞上 cmd 的 OEM 代码页，脚本语法被劈断。
+    """
+    items = [p for p in paths if p]
+    if not items:
+        return False
+    # PowerShell 的**单引号**字符串是字面量（反斜杠不转义），双引号里
+    # json.dumps 会把 C:\x 写成 C:\\x，路径就废了。单引号内的 ' 用 '' 表示。
+    quote = lambda s: "'" + str(s).replace("'", "''") + "'"
+    script = "Start-Sleep -Seconds 2\n" + "\n".join(
+        f"Remove-Item -LiteralPath {quote(p)} -Recurse -Force "
+        f"-ErrorAction SilentlyContinue" for p in items)
+    enc = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-WindowStyle", "Hidden", "-EncodedCommand", enc],
+            # 用 CREATE_NO_WINDOW（无窗口）而**不是** DETACHED_PROCESS：
+            # 后者会让 powershell 起来就退出、脚本一句都不执行（实测 exit 0、
+            # 什么也没干成，而且完全静默）。父进程退出后子进程照常跑完，
+            # 这条已单独验证过。
+            creationflags=NO_WINDOW, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
 
 
 def user_data_dir() -> Path:
@@ -573,31 +644,58 @@ class Wizard(tk.Tk):
         self._ui(self._log, "已登记到「设置 → 应用」（可在控制面板卸载）", "ok")
         self._ui(self._set_step, "卸载信息已登记", 90)
 
-    def _step_env(self):
-        self._ui(self._set_step, "正在检测运行环境…", 92)
+    def _find_existing_worker(self) -> Path | None:
+        """找已有的、依赖齐全的工作解释器（不走 paths.resolve ——
+        Setup 是冻结 exe，resolve 用 sys.executable 推 BASE_DIR 会扫错地方，
+        装到 Program Files 时必然误判「缺依赖」弹配置页，实测过的坑）。"""
         sys.path.insert(0, str(self.install_dir / "app"))
         import paths                                   # noqa: E402
-        info = paths.resolve(force=True)
-        self.env_info = info
-        miss = info.get("worker_missing") or []
-        gui_miss = info.get("gui_missing") or []
-        self.env_missing = bool(miss)
+        for root in (self.install_dir, user_data_dir()):
+            for parts in (("runtime", "python.exe"),
+                          ("venv", "Scripts", "python.exe")):
+                exe = root.joinpath(*parts)
+                if exe.is_file() and paths.missing_modules(
+                        str(exe), paths.WORKER_MODULES)[0]:
+                    return exe
+        # 上一次配置写进缓存的解释器（%APPDATA% 侧的 _env.json）
+        try:
+            cache = user_data_dir() / "_env.json"
+            w = json.loads(cache.read_text(encoding="utf-8")).get("worker")
+            if w and Path(w).is_file() and paths.missing_modules(
+                    w, paths.WORKER_MODULES)[0]:
+                return Path(w)
+        except Exception:
+            pass
+        return None
 
-        def report():
-            self._log(f"工作解释器：{info.get('worker')}")
-            if miss:
-                self._log(f"缺少依赖：{'、'.join(miss)}", "dim")
-            if info.get("gui_ok"):
-                self._log(f"界面解释器：{info.get('gui')}", "ok")
-            if not miss:
-                self._log("运行环境完整，可以开始使用。", "ok")
-                self._ui(self._set_step, "环境检测通过", 100)
-                self.after(600, lambda: self._show("finish"))
-            else:
-                self._ui(self._set_step, "检测到缺少依赖，需要联网自动配置", 95)
-                self.after(600, lambda: self._show("env"))
+    def _step_env(self):
+        self._ui(self._set_step, "正在检测运行环境…", 92)
+        existing = self._find_existing_worker()
 
-        self._ui(report)
+        def report_ok():
+            self._log(f"工作解释器：{existing}", "ok")
+            self._log("运行环境完整，可以开始使用。", "ok")
+        if existing:
+            self.env_missing = False
+            self._ui(report_ok)
+            self._ui(self._set_step, "环境检测通过", 100)
+            self.after(600, lambda: self._show("finish"))
+            return
+
+        def report_missing():
+            self._log("未找到可用的运行环境，需要配置", "dim")
+        self.env_missing = True
+        offline = self._vendor_bundle() is not None
+
+        def goto_env():
+            self._show("env")
+            if offline:
+                # 随包离线组件：配置又快又不联网，没必要让用户再点一次
+                self._env_log("检测到随包离线组件，自动开始配置（全程离线）。", "ok")
+                self._start_env_setup()
+        self._ui(report_missing)
+        self._ui(self._set_step, "需要配置运行环境", 95)
+        self.after(600, goto_env)
 
     # ---------------- 静默卸载 ----------------
 
@@ -618,12 +716,18 @@ class Wizard(tk.Tk):
     # ---------------- 环境配置页 ----------------
 
     def _page_env(self, f: tk.Frame):
-        box = self._card(f, "运行环境需要联网配置")
-        tk.Label(box, text=("本机还没有能跑「钉钉采集 + 微信投递」的 Python 环境。\n"
-                            "点击下面的按钮，安装程序会自动：\n"
-                            "  1. 准备一个 Python 3 运行时（本机没有就自动下载，约 25MB）\n"
-                            "  2. 建立独立虚拟环境并安装依赖（国内镜像，约 300-600MB）\n"
-                            "全部装在用户目录，不污染系统 Python。"),
+        offline = self._vendor_bundle() is not None
+        box = self._card(f, "运行环境配置"
+                         if offline else "运行环境需要联网配置")
+        intro = ("安装包内已附带完整的 Python 运行时和全部依赖，\n"
+                 "点击开始后自动完成配置，全程离线、无需联网。"
+                 if offline else
+                 "本机还没有能跑「钉钉采集 + 微信投递」的 Python 环境。\n"
+                 "点击下面的按钮，安装程序会自动：\n"
+                 "  1. 准备一个 Python 3 运行时（本机没有就自动下载，约 25MB）\n"
+                 "  2. 建立独立虚拟环境并安装依赖（国内镜像，约 300-600MB）\n"
+                 "全部装在用户目录，不污染系统 Python。")
+        tk.Label(box, text=intro,
                  bg="white", fg="#1c2333", justify="left",
                  font=("Microsoft YaHei UI", 10)).pack(anchor="w", padx=16,
                                                        pady=(2, 12))
@@ -638,7 +742,8 @@ class Wizard(tk.Tk):
 
         bar = tk.Frame(f, bg="#eef1f7")
         bar.pack(side="bottom", fill="x", pady=14)
-        self.env_btn = ttk.Button(bar, text="一键自动配置（联网）",
+        self.env_btn = ttk.Button(bar, text="一键自动配置（离线）" if offline
+                                  else "一键自动配置（联网）",
                                   style="Accent.TButton",
                                   command=self._start_env_setup)
         self.env_btn.pack(side="right", padx=28)
@@ -649,6 +754,7 @@ class Wizard(tk.Tk):
     def _env_log(self, msg: str, tag: str = "n"):
         color = {"n": "#1c2333", "ok": "#0f9d58", "err": "#e5484d",
                  "dim": "#8b93a8"}[tag]
+        _dbg(f"env[{tag}] {msg}")          # 先落文件，再走界面调度
 
         def go():
             self.env_log.configure(state="normal")
@@ -664,20 +770,36 @@ class Wizard(tk.Tk):
         self.env_prg.start(12)
         threading.Thread(target=self._env_worker, daemon=True).start()
 
-    def _run_logged(self, argv, cwd=None, timeout=3600) -> tuple[int, str]:
-        """跑外部命令，把关键输出滚动写进环境日志。"""
+    def _run_logged(self, argv, cwd=None, timeout=3600,
+                    env=None) -> tuple[int, str]:
+        """跑外部命令，把关键输出滚动写进环境日志。
+
+        逐字符读取（pip 的进度条用 \\r 刷新，按行读会憋到结束才出输出，
+        界面几分钟没动静就像死机——实测过的坑）。
+        """
         self._env_log("$ " + " ".join(str(a) for a in argv[:6]) +
                       (" …" if len(argv) > 6 else ""), "dim")
+        _dbg("run: " + " ".join(str(a) for a in argv))
         proc = subprocess.Popen(
             [str(a) for a in argv], cwd=cwd, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-            errors="replace", creationflags=NO_WINDOW)
+            errors="replace", creationflags=NO_WINDOW, env=env)
         out_tail: list[str] = []
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip()
-            if not line:
-                continue
+        state = {"last": time.time()}
+        t0 = time.time()
+
+        def heartbeat():
+            # 长时间无输出时给用户一句活话，避免“不动了”的错觉
+            while proc.poll() is None:
+                if time.time() - state["last"] > 20:
+                    self._env_log(
+                        f"仍在执行…（已用时 {int(time.time() - t0)} 秒，"
+                        "大依赖下载需要几分钟）", "dim")
+                    state["last"] = time.time()
+                time.sleep(5)
+        threading.Thread(target=heartbeat, daemon=True).start()
+
+        def emit(line: str):
             out_tail.append(line)
             low = line.lower()
             if any(k in low for k in ("error", "失败", "could not", "no matching")):
@@ -685,11 +807,32 @@ class Wizard(tk.Tk):
             elif any(k in low for k in ("successfully installed", "installed",
                                         "done", "created")):
                 self._env_log(line[:300], "ok")
+            elif low.startswith(("collecting ", "downloading ", "using cached")):
+                self._env_log(line[:200], "dim")
+            state["last"] = time.time()
+
+        assert proc.stdout is not None
+        buf = ""
+        while True:
+            ch = proc.stdout.read(1)
+            if not ch:
+                break
+            if ch in "\r\n":
+                if buf.strip():
+                    emit(buf.strip())
+                buf = ""
+            else:
+                buf += ch
+        if buf.strip():
+            emit(buf.strip())
         try:
             code = proc.wait(timeout=timeout)
         except Exception:
             proc.kill()
+            _dbg(f"run TIMEOUT/KILL: {' '.join(str(a) for a in argv[:3])}")
             return -1, "timeout"
+        _dbg(f"run done rc={code} ({time.time() - t0:.0f}s): "
+             f"{' '.join(str(a) for a in argv[:3])}")
         return code, "\n".join(out_tail[-40:])
 
     def _pick_base_python(self) -> str | None:
@@ -697,11 +840,23 @@ class Wizard(tk.Tk):
         import ast
         sys.path.insert(0, str(self.install_dir / "app"))
         import paths                                   # noqa: E402
-        for exe in paths._candidate_pythons():
-            r = subprocess.run(
-                [exe, "-c", "import sys;print(sys.version_info[:2])"],
-                capture_output=True, text=True, timeout=20,
-                creationflags=NO_WINDOW, encoding="utf-8", errors="replace")
+        cands = paths._candidate_pythons()
+        _dbg(f"probe candidates: {cands}")
+        for exe in cands:
+            t0 = time.time()
+            try:
+                r = subprocess.run(
+                    [exe, "-c", "import sys;print(sys.version_info[:2])"],
+                    capture_output=True, text=True, timeout=20,
+                    creationflags=NO_WINDOW, encoding="utf-8", errors="replace")
+            except subprocess.TimeoutExpired:
+                _dbg(f"probe TIMEOUT ({time.time() - t0:.1f}s): {exe}")
+                continue
+            except Exception as exc:
+                _dbg(f"probe ERROR ({time.time() - t0:.1f}s): {exe} -> {exc!r}")
+                continue
+            _dbg(f"probe ({time.time() - t0:.1f}s) rc={r.returncode} "
+                 f"out={r.stdout.strip()!r}: {exe}")
             try:
                 ver = ast.literal_eval((r.stdout or "").strip() or "(0, 0)")
             except Exception:
@@ -728,10 +883,157 @@ class Wizard(tk.Tk):
                 self._env_log(f"下载失败：{exc}", "err")
         return None
 
-    def _env_worker(self):
+    def _vendor_bundle(self):
+        """内嵌离线组件：(运行时 zip, wheels 目录)；没带就返回 None。"""
+        if getattr(sys, "frozen", False):
+            base = Path(getattr(sys, "_MEIPASS", "."))
+        else:
+            base = Path(__file__).resolve().parent / "_vendor"
+        vdir = base / "vendor" if (base / "vendor").is_dir() else base
+        zips = list(vdir.glob("python-*-embed-amd64.zip"))
+        wheels = vdir / "wheels"
+        if zips and wheels.is_dir():
+            return zips[0], wheels
+        return None
+
+    @staticmethod
+    def _dir_writable(d: Path) -> bool:
         try:
-            data_root = user_data_dir()
+            probe = d / ".__write_probe__"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            return True
+        except Exception:
+            return False
+
+    def _env_offline(self, data_root: Path, runtime_zip: Path,
+                     wheels_dir: Path) -> Path | None:
+        """用随包的 Python 运行时 + wheel 离线配好环境（全程不联网）。"""
+        rt = data_root / "runtime"
+        py = rt / "python.exe"
+        if not py.is_file():
+            self._env_log("解压随包 Python 运行时 …", "dim")
+            if rt.exists():
+                shutil.rmtree(rt, ignore_errors=True)
+            try:
+                with zipfile.ZipFile(runtime_zip) as zf:
+                    zf.extractall(rt)
+            except Exception as exc:
+                self._env_log(f"运行时解压失败：{exc}", "err")
+                return None
+            # 嵌入版默认只认 python312.zip；打开 site-packages 支持
+            pth = rt / "python312._pth"
+            if pth.is_file():
+                pth.write_text("python312.zip\n.\nLib/site-packages\n"
+                               "import site\n", encoding="utf-8")
+        if not py.is_file():
+            self._env_log("运行时解压后缺 python.exe。", "err")
+            return None
+        self._env_log(f"使用随包 Python 运行时：{py}", "ok")
+
+        pip_whl = next(wheels_dir.glob("pip-*.whl"), None)
+        if pip_whl is None:
+            self._env_log("离线组件里缺 pip wheel。", "err")
+            return None
+        # 嵌入版不带 pip；且 ._pth 存在时是隔离模式，PYTHONPATH 会被忽略。
+        # 把 pip wheel 路径临时写进 ._pth 引导 pip，装好后还原。
+        pth = rt / "python312._pth"
+        base_pth = "python312.zip\n.\nLib/site-packages\nimport site\n"
+        if pth.is_file():
+            pth.write_text(base_pth.replace("import site",
+                                            f"{pip_whl}\nimport site"),
+                           encoding="utf-8")
+        self._env_log("初始化 pip（离线）…", "dim")
+        code, _ = self._run_logged(
+            [py, "-m", "pip", "install", "--no-index",
+             "--no-warn-script-location",
+             "--find-links", str(wheels_dir), "pip"])
+        if pth.is_file():
+            pth.write_text(base_pth, encoding="utf-8")
+        if code != 0:
+            self._env_log("pip 初始化失败。", "err")
+            return None
+
+        req = self.install_dir / "requirements.txt"
+        self._env_log("安装依赖（全部随包，无需联网）…", "dim")
+        code, _ = self._run_logged(
+            [py, "-m", "pip", "install", "--no-index",
+             "--no-warn-script-location",
+             "--find-links", str(wheels_dir), "-r", str(req)])
+        if code != 0:
+            self._env_log("离线依赖安装失败。", "err")
+            return None
+        return py
+
+    def _env_finish(self, vpy: Path):
+        """收尾：OCR 预热（尽力）→ 自检 → 写解释器缓存 → 完成页。"""
+        # 预热 OCR 模型：若 rapidocr 的模型不在 wheel 里，这次会把模型拉下来；
+        # 离线组件场景下 wheel 已带模型，此步秒过。失败不阻塞安装。
+        self._env_log("预热 OCR 模型…", "dim")
+        warmup = (
+            "import numpy as np\n"
+            "try:\n"
+            "    from rapidocr import RapidOCR\n"
+            "    eng = RapidOCR()\n"
+            "except ImportError:\n"
+            "    from rapidocr_onnxruntime import RapidOCR\n"
+            "    eng = RapidOCR(det_limit_side_len=1536, det_box_thresh=0.35,\n"
+            "                   det_thresh=0.25, text_score=0.35,\n"
+            "                   det_model_path=None)\n"
+            "eng(np.full((64, 320, 3), 255, dtype='uint8'))\n"
+            "print('ok')\n"
+        )
+        self._run_logged([vpy, "-c", warmup])
+
+        sys.path.insert(0, str(self.install_dir / "app"))
+        import paths                                 # noqa: E402
+        # 注意：不能在这里调 paths.resolve()——Setup 本身是冻结 exe，
+        # paths 会拿 sys.executable（下载目录里的 Setup）推 BASE_DIR，
+        # 扫出的候选解释器里没有刚配好的运行时，必然误报全缺。
+        # 直接对工作解释器做缺失自检：
+        good, miss = paths.missing_modules(str(vpy), paths.WORKER_MODULES)
+        if not good:
+            self._env_log(f"配置完成但仍有缺失：{'、'.join(miss)}", "err")
+            self._env_btn_retry()
+            return
+        # 把结果写进「正式应用」启动时会读的缓存位置。双写两处：
+        # <安装目录>\app\_env.json（安装目录可写时应用从这读）和
+        # %APPDATA%\<应用>\_env.json（应用判定安装目录只读时从这读）——
+        # Setup 与应用对「目录可写」的判定可能因提权与否不一致，双写兜底。
+        payload = json.dumps({"gui": "", "worker": str(vpy)},
+                             ensure_ascii=False, indent=2)
+        for cf in (self.install_dir / "app" / "_env.json",
+                   user_data_dir() / "_env.json"):
+            try:
+                cf.parent.mkdir(parents=True, exist_ok=True)
+                cf.write_text(payload, encoding="utf-8")
+            except Exception:
+                pass
+        self._env_log(f"环境配置完成！工作解释器：{vpy}", "ok")
+        self._ui(self._set_step, "环境已就绪", 100)
+        self.after(800, lambda: self._show("finish"))
+
+    def _env_worker(self):
+        _dbg("=== env-worker start ===")
+        try:
+            # 运行时/venv 的落点与正式应用 paths.py 的规则保持一致：
+            # 安装目录可写就放安装目录，否则放 %APPDATA%。
+            data_root = (self.install_dir
+                         if self._dir_writable(self.install_dir)
+                         else user_data_dir())
+
+            vendored = self._vendor_bundle()
+            if vendored:
+                self._env_log("检测到随包离线组件，全程无需联网。", "ok")
+                vpy = self._env_offline(data_root, *vendored)
+                if vpy is None:
+                    self._env_btn_retry()
+                    return
+                self._env_finish(vpy)
+                return
+
             base = self._pick_base_python()
+            _dbg(f"base python = {base}")
             if base:
                 self._env_log(f"使用本机 Python：{base}", "ok")
             else:
@@ -769,51 +1071,37 @@ class Wizard(tk.Tk):
 
             self._env_log("升级 pip（国内镜像）…", "dim")
             self._run_logged([vpy, "-m", "pip", "install", "--upgrade", "pip",
-                              "-i", PYPI_MIRROR, "--quiet"])
+                              "-i", PYPI_MIRRORS[0], "--quiet", *PIP_COMMON])
 
             req = self.install_dir / "requirements.txt"
             self._env_log("安装依赖：pyyaml / pillow / numpy / rapidocr / "
-                          "onnxruntime …（体积较大，耐心等待）", "dim")
-            code, out = self._run_logged(
-                [vpy, "-m", "pip", "install", "-r", str(req),
-                 "-i", PYPI_MIRROR])
+                          "onnxruntime …（体积较大，需要几分钟）", "dim")
+            code = 1
+            for i, mirror in enumerate(PYPI_MIRRORS):
+                code, out = self._run_logged(
+                    [vpy, "-m", "pip", "install", "-r", str(req),
+                     "-i", mirror, *PIP_COMMON])
+                if code == 0:
+                    break
+                if i < len(PYPI_MIRRORS) - 1:
+                    self._env_log("换备用镜像重试…", "dim")
+            if code != 0:
+                # 最后一次兜底：某些启动环境带着失效的代理变量，
+                # 会让 pip 秒失败（versions: none）。去掉代理直连再试。
+                self._env_log("镜像均失败，尝试不走代理直连…", "dim")
+                clean_env = {k: v for k, v in os.environ.items()
+                             if not k.lower().endswith("_proxy")}
+                code, _ = self._run_logged(
+                    [vpy, "-m", "pip", "install", "-r", str(req),
+                     "-i", PYPI_MIRRORS[0], *PIP_COMMON], env=clean_env)
             if code != 0:
                 self._env_log("依赖安装失败，请检查网络后重试。", "err")
                 self._env_btn_retry()
                 return
 
-            # 预热 OCR 模型：新版 rapidocr 的模型文件（约几 MB）是首次运行时
-            # 才下载的。现在网络可用，趁热拉下来，用户之后离线也能采集；
-            # 失败不阻塞安装 —— 只是首次采集会多等一次模型下载。
-            self._env_log("预下载 OCR 模型（离线运行要用）…", "dim")
-            warmup = (
-                "import numpy as np\n"
-                "try:\n"
-                "    from rapidocr import RapidOCR\n"
-                "    eng = RapidOCR()\n"
-                "except ImportError:\n"
-                "    from rapidocr_onnxruntime import RapidOCR\n"
-                "    eng = RapidOCR(det_limit_side_len=1536, det_box_thresh=0.35,\n"
-                "                   det_thresh=0.25, text_score=0.35,\n"
-                "                   det_model_path=None)\n"
-                "eng(np.full((64, 320, 3), 255, dtype='uint8'))\n"
-                "print('ok')\n"
-            )
-            self._run_logged([vpy, "-c", warmup])
-
-            sys.path.insert(0, str(self.install_dir / "app"))
-            import paths                                 # noqa: E402
-            paths._save_cache({"gui": "", "worker": str(vpy)})
-            info = paths.resolve(force=True)
-            miss = info.get("worker_missing") or []
-            if miss:
-                self._env_log(f"配置完成但仍有缺失：{'、'.join(miss)}", "err")
-                self._env_btn_retry()
-                return
-            self._env_log(f"环境配置完成！工作解释器：{vpy}", "ok")
-            self._ui(self._set_step, "环境已就绪", 100)
-            self.after(800, lambda: self._show("finish"))
+            self._env_finish(vpy)
         except Exception as exc:
+            _dbg("env-worker CRASH:\n" + traceback.format_exc())
             traceback.print_exc()
             self._env_log(f"配置过程出错：{exc}", "err")
             self._env_btn_retry()
@@ -933,25 +1221,33 @@ class Wizard(tk.Tk):
         except Exception:
             pass
 
+        # ⚠ 必须**先**把安装位置取出来再删登记：一旦注册表项被删掉，
+        #   _install_location() 就返回 None，只能退回默认目录 —— 装到自定义
+        #   目录（--dir / 用户改过路径）时会变成「卸载看着成功、文件全留着」。
+        loc = (_argv_value("--dir") or _argv_value("/d")
+               or self._install_location() or str(default_install_dir()))
+
         self._ulog("正在移除卸载登记…")
         try:
             winreg.DeleteKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY)
         except Exception:
             pass
 
-        loc = self._install_location() or str(default_install_dir())
         if Path(loc).is_dir():
             self._ulog(f"正在删除程序文件：{loc}")
             target = Path(loc)
-            # 卸载程序自己就在安装目录里：先把自己挪到临时目录，再整目录删除
+            # 卸载程序自己就在安装目录里：先把自己挪走，再整目录删除。
+            # 必须挪到**同一个卷**，跨卷 move 会退化成「复制 + 删原文件」，
+            # 而运行中的 exe 删不掉 —— 见 _same_volume_tmp 的注释。
+            moved_self: Path | None = None
             try:
                 me = _self_exe()
                 if me.resolve().is_relative_to(target.resolve()):
-                    moved = Path(os.getenv("TEMP", ".")) / (
-                        f"mm-uninst-{os.getpid()}-{me.name}")
-                    shutil.move(str(me), moved)
+                    moved_self = _same_volume_tmp(target) / (
+                        f"mm-uninst-{os.getpid()}{me.suffix}")
+                    shutil.move(str(me), moved_self)
             except Exception:
-                pass
+                moved_self = None
 
             def onerr(func, path, _exc):
                 try:
@@ -960,7 +1256,19 @@ class Wizard(tk.Tk):
                 except Exception:
                     self._ulog(f"（保留）无法删除：{path}")
             shutil.rmtree(target, ignore_errors=False, onexc=onerr)
-            self._ulog("程序文件已删除。")
+            if target.exists():
+                # 兜底：还有删不掉的东西（最常见是运行中的 uninstall.exe，
+                # 其次是被杀毒软件短暂占用），交给一个独立进程等我们退出再删。
+                if _spawn_deferred_cleanup([target, moved_self]):
+                    self._ulog("程序文件将在卸载程序退出后自动清除。")
+                else:
+                    self._ulog(f"（保留）请手动删除残留目录：{target}")
+            else:
+                self._ulog("程序文件已删除。")
+                # 自己还在运行，挪出去的副本删不掉，同样交给独立进程收尾
+                # （同卷时它在 %TEMP%，不同卷时在安装目录的父级，都别留下）
+                if moved_self is not None:
+                    _spawn_deferred_cleanup([moved_self])
 
         if self.wipe_data.get():
             d = user_data_dir()
