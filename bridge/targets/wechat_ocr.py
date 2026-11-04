@@ -1113,6 +1113,54 @@ class WeChatOcrTarget(Target):
                 return (buf.value or f"窗口#{root}")[:40]
         return None
 
+    def _grab_pinned(self, hwnd: int):
+        """被别的窗口压住时的强抓：临时把微信顶到 TOPMOST，抓完立刻摘。
+
+        ── 为什么需要这条路径（2026-11-04 真机事故）────────────────────
+        用户一边用 WorkBuddy / WPS 表格、一边让桥投递时，微信被压在下面。
+        ``SetForegroundWindow`` 对后台进程会被前台锁**静默拒绝**（只闪一下
+        任务栏），微信始终上不来；``ImageGrab`` 按矩形抓的是屏幕像素，
+        于是抓到遮挡者的界面。表现极具误导性：OCR 读出「耳(E)」这类碎片、
+        相似度 0.13，报错却写成「会话列表没找到」，看起来像群名写错。
+
+        ``SetWindowPos(HWND_TOPMOST)`` 不走前台锁，能把微信临时提到所有
+        普通窗口之上；抓完立即摘掉，用户最多看到微信闪一下（约 0.2 秒）。
+
+        ⚠ 摘除必须写在 ``finally``：中途抛异常也不能让微信长期置顶压着
+        用户的窗口 —— 那比投递失败更糟。
+        """
+        from PIL import ImageGrab
+
+        r = self._rect(hwnd)
+        if not r:
+            return None
+        hwnd_w = wt.HWND(hwnd)
+        try:
+            user32.SetWindowPos(hwnd_w, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                                | SWP_SHOWWINDOW)
+            time.sleep(0.18)          # 等 DWM 重新合成，别抓到旧帧
+            occ = self._occluder(hwnd)
+            if occ is not None:
+                log.warning("置顶后微信仍被「%s」压住（对方也是置顶窗口）", occ)
+                return None
+            return ImageGrab.grab(bbox=r, all_screens=False)
+        except Exception as exc:                       # noqa: BLE001
+            log.warning("置顶抓帧失败：%s", exc)
+            return None
+        finally:
+            self._unpin(hwnd, hwnd_w)
+
+    @staticmethod
+    def _unpin(hwnd: int, hwnd_w=None) -> None:
+        """摘掉微信的 TOPMOST（``finally`` 里调用，异常也不许漏）。"""
+        try:
+            user32.SetWindowPos(hwnd_w or wt.HWND(hwnd), HWND_NOTOPMOST,
+                                0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        except Exception:                              # noqa: BLE001
+            log.warning("摘掉 TOPMOST 失败 —— 微信可能一直压在其它窗口上")
+
     def _grab(self, hwnd: int):
         """抓整窗画面，返回 PIL.Image；不抢焦点（背景模式）。
 
@@ -1140,9 +1188,11 @@ class WeChatOcrTarget(Target):
             if self._activate(hwnd):
                 occ = self._occluder(hwnd)
             if occ is not None:
-                log.warning("微信窗口被「%s」遮挡（或不在前台/已收进托盘），"
-                            "抓帧放弃，避免 OCR 到别的窗口", occ)
-                return None
+                # 2026-11-04：用户正用 WorkBuddy / WPS 表格时，微信被压在
+                # 下面，SetForegroundWindow 被前台锁静默拒绝 —— 以前这里
+                # 直接放弃，投递全挂。改成置顶强抓，见 _grab_pinned。
+                log.warning("微信窗口被「%s」遮挡 —— 改用置顶抓帧", occ)
+                return self._grab_pinned(hwnd)
         try:
             frame = ImageGrab.grab(bbox=r, all_screens=False)
         except Exception as exc:
@@ -1189,7 +1239,48 @@ class WeChatOcrTarget(Target):
         img = self._grab(hwnd)
         if img is None:
             return None, []
-        return img, self._ocr_sessions(img)
+        items = self._ocr_sessions(img)
+        # ---- 画面内容自检（2026-11-04）--------------------------------
+        # `_occluder` 只在窗口中心 + 左侧 1/4 两个点看归属：遮挡者只盖住
+        # 一半、或刚好切走又被切回来时都会漏检，抓回来的仍是别人的界面。
+        # 真实微信会话列表总有好几条，只剩零星碎片就说明这一帧不可信 ——
+        # 置顶重抓一帧，谁认出更多会话用谁，并把可疑帧落盘留证据。
+        n1 = sum(1 for it in items if it.get("kind") == "session")
+        if n1 < 3:
+            img2 = self._grab_pinned(hwnd)
+            if img2 is not None:
+                items2 = self._ocr_sessions(img2)
+                n2 = sum(1 for it in items2 if it.get("kind") == "session")
+                if n2 > n1:
+                    log.info("首帧可疑（会话仅 %d 条）—— 置顶重抓得 %d 条",
+                             n1, n2)
+                    self._dump_frame(img, "suspect")
+                    return img2, items2
+            self._dump_frame(img, "suspect")
+        return img, items
+
+    @staticmethod
+    def _dump_frame(img, tag: str) -> None:
+        """把可疑帧存到 ``data/debug/``，事后能直接看到 OCR 到底看到了什么。
+
+        2026-11-04 排查「相似度 0.13」时，现场没有留下任何画面，只能靠
+        猜是遮挡还是群名错 —— 这种证据不该再缺。
+        """
+        try:
+            import paths
+            d = paths.data_dir("debug")
+            d.mkdir(parents=True, exist_ok=True)
+            p = d / f"wechat-{tag}-{time.strftime('%Y%m%d-%H%M%S')}.png"
+            img.save(p)
+            old = sorted(d.glob("wechat-*.png"))[:-40]     # 只留最近 40 张
+            for f in old:
+                try:
+                    f.unlink(missing_ok=True)
+                except Exception:                          # noqa: BLE001
+                    pass
+            log.info("可疑画面已存 %s", p)
+        except Exception as exc:                           # noqa: BLE001
+            log.debug("保存可疑画面失败：%s", exc)
 
     def _ocr(self, arr):
         """跑一次 OCR。引擎懒加载并缓存（首次加载模型约 1-2 秒）。
@@ -1371,12 +1462,41 @@ class WeChatOcrTarget(Target):
     # ---------- 输入 ----------
 
     def _click(self, hwnd: int, rx: float, ry: float) -> bool:
-        """按窗口内相对比例点击。"""
+        """按窗口内相对比例点击。
+
+        ⚠ 点击是**真实鼠标事件**：那个坐标上是谁，就点谁。微信被别的程序
+        压住时盲点，等于点进用户的 WorkBuddy / WPS —— 后果比投递失败严重
+        得多（可能误删、误发、误改）。所以点之前先确认这块屏幕归微信；
+        不归就置顶让它临时压上去，点完立刻摘掉。
+        """
         r = self._rect(hwnd)
         if not r:
             return False
         w, h = r[2] - r[0], r[3] - r[1]
-        return self._click_screen(r[0] + int(w * rx), r[1] + int(h * ry))
+        x, y = r[0] + int(w * rx), r[1] + int(h * ry)
+
+        pinned = False
+        if self._occluder(hwnd) is not None:
+            self._activate(hwnd)
+            if self._occluder(hwnd) is not None:
+                hwnd_w = wt.HWND(hwnd)
+                user32.SetWindowPos(hwnd_w, HWND_TOPMOST, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+                time.sleep(0.15)
+                pinned = True
+                user32.SetForegroundWindow(hwnd_w)
+                time.sleep(0.1)
+                occ = self._occluder(hwnd)
+                if occ is not None:
+                    log.warning("点击前微信仍被「%s」遮挡 —— 放弃本次点击，"
+                                "避免误点用户正在用的程序", occ)
+                    self._unpin(hwnd)
+                    return False
+        try:
+            return self._click_screen(x, y)
+        finally:
+            if pinned:
+                self._unpin(hwnd)
 
     def _click_abs(self, hwnd: int, cx: float, cy: float) -> bool:
         """按截图内绝对像素点击（OCR 结果用这个）。"""
