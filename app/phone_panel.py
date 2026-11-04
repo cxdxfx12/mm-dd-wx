@@ -106,6 +106,13 @@ class PhonePanel(tk.Frame):
         self.interval = interval
         self._q: queue.Queue = queue.Queue(maxsize=2)
         self._stop = threading.Event()
+        # ⚠ 实时开关不要用 tk.BooleanVar 在取帧线程里 .get()：打包后的 Tcl 是
+        # threaded 构建，跨线程访问变量必抛 RuntimeError(main thread is not in
+        # main loop)，而且这个调用在 try 之外 —— 线程会**静默死亡**，画面永远
+        # 停在「正在取第一帧…」（2026-11-04 实机截图抓到的就是这个形态）。
+        # 所以真正的开关用 threading.Event，Checkbutton 的 command 在主线程同步它。
+        self._live_ev = threading.Event()
+        self._live_ev.set()
         self._live = tk.BooleanVar(value=True)
         self._photo = None            # 必须留引用，否则被 GC 掉画面变空白
         self._last_img = None         # 上一帧原图，窗口缩放时重绘用
@@ -137,7 +144,8 @@ class PhonePanel(tk.Frame):
         head.pack(fill="x", padx=12, pady=(10, 6))
         tk.Label(head, text="手机画面", bg=c["card"], fg=c["text"],
                  font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
-        self.live_chk = ttk.Checkbutton(head, text="实时", variable=self._live)
+        self.live_chk = ttk.Checkbutton(head, text="实时", variable=self._live,
+                                        command=self._sync_live)
         self.live_chk.pack(side="right")
 
         self.canvas = tk.Canvas(self, bg="#fbfcfe", highlightthickness=0,
@@ -178,6 +186,13 @@ class PhonePanel(tk.Frame):
         except Exception:                                  # noqa: BLE001
             pass
 
+    def _sync_live(self) -> None:
+        """Checkbutton 的 command 只在主线程跑：在这里同步线程用的 Event。"""
+        if self._live.get():
+            self._live_ev.set()
+        else:
+            self._live_ev.clear()
+
     # ------------------------------------------------------------ 取帧
 
     def _adb(self, args: list[str], timeout: float = 12) -> bytes:
@@ -187,16 +202,31 @@ class PhonePanel(tk.Frame):
         return p.stdout
 
     def _loop(self) -> None:
+        # 整个线程体套一层兜底：任何没料到的异常都要落到队列里显示出来，
+        # 绝不允许线程悄悄死掉 —— 死了画面就永远「正在取第一帧…」，人没法排障。
+        try:
+            self._loop_inner()
+        except Exception as e:                             # noqa: BLE001
+            try:
+                if self._q.full():
+                    self._q.get_nowait()
+                self._q.put((None, f"取帧线程异常退出：{type(e).__name__}: {e}\n"
+                                   f"请把这一行截图反馈给开发者"))
+            except Exception:                              # noqa: BLE001
+                pass
+
+    def _loop_inner(self) -> None:
         fails = 0
         while not self._stop.is_set():
-            if not self._live.get():
+            if not self._live_ev.is_set():
                 time.sleep(0.15)
                 continue
             t0 = time.monotonic()
             try:
                 raw = self._adb(["exec-out", "screencap", "-p"])
                 if not raw.startswith(b"\x89PNG"):
-                    raise RuntimeError("不是 PNG")
+                    detail = raw[:80].decode("utf-8", "replace").strip()
+                    raise RuntimeError(f"不是 PNG（adb 回了 {len(raw)} 字节：{detail}）")
                 im = Image.open(io.BytesIO(raw))
                 im.load()
                 fails = 0
@@ -209,7 +239,12 @@ class PhonePanel(tk.Frame):
             except Exception as e:                         # noqa: BLE001
                 fails += 1
                 if fails in (1, 5, 20):
-                    self._q.put((None, f"{type(e).__name__}: {e}"))
+                    try:
+                        if self._q.full():
+                            self._q.get_nowait()
+                        self._q.put((None, f"{type(e).__name__}: {e}"))
+                    except Exception:                      # noqa: BLE001
+                        pass
                 time.sleep(min(2.0, 0.3 * fails))
             rest = self.interval - (time.monotonic() - t0)
             if rest > 0:
@@ -219,17 +254,21 @@ class PhonePanel(tk.Frame):
         """主线程：把后台取到的帧贴到画布上。"""
         if self._stop.is_set():
             return
-        got = None
         try:
-            got = self._q.get_nowait()
-        except queue.Empty:
-            pass
-        if got:
-            im, meta = got
-            if im is None:
-                self._set_status(f"取画面失败：{meta}\n检查 USB 连接 / 手机是否授权调试", err=True)
-            else:
-                self._show(im, meta)
+            got = None
+            try:
+                got = self._q.get_nowait()
+            except queue.Empty:
+                pass
+            if got:
+                im, meta = got
+                if im is None:
+                    self._set_status(f"取画面失败：{meta}\n检查 USB 连接 / 手机是否授权调试", err=True)
+                else:
+                    self._show(im, meta)
+        except Exception as e:                             # noqa: BLE001
+            # 贴帧出错也不能断 after 链 —— 断了面板就永远不再刷新。
+            self._set_status(f"显示帧失败：{type(e).__name__}: {e}", err=True)
         self.after(120, self._pump)
 
     def _show(self, im, dt: float) -> None:

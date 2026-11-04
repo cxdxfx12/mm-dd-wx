@@ -55,10 +55,11 @@ EXCLUDE_TOP = {"data", "installer", "dist", "build", ".workbuddy", ".git",
                }
 
 # tools/ 下「不随包发」的子目录（按目录名，只在 tools 这一层匹配）。
-# tools/platform-tools 必须随包发（界面右侧手机画面靠它取帧、点击），
-# 但同一层里还躺着开发期的截图和备用的 scrcpy —— 合计 35 MB，用户一点都
-# 用不到，不进安装包。
-TOOLS_SKIP_DIRS = {"shots", "scrcpy-win64-v5.0.1"}
+# tools/platform-tools 必须随包发（界面右侧手机画面靠它取帧、点击）。
+# scrcpy-win64-v5.0.1 也要随包发：tools/打开手机画面.bat 引用它，不打包
+# 用户点开就是「系统找不到指定的路径」（2026-11-04 用户报「PC 抓不到手机
+# 画面」时顺带发现）。
+TOOLS_SKIP_DIRS = {"shots"}
 
 WELCOME = r"""
 =============================================================
