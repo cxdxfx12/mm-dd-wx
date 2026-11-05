@@ -27,6 +27,7 @@ import json
 import time
 import unittest
 import urllib.request
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from bridge.sources import android_gateway as G
@@ -41,6 +42,19 @@ GROUP = "【数字质控】浙江杭州萧山区大江东公司"
 
 
 # ---------------------------------------------------------------- 解析层
+
+def recent_ts(minutes_ago: int = 5) -> str:
+    """动态时间条（打捞层要求读得出「今天 HH:MM」且不超过 30 分钟）。
+
+    写死「今天 16:55」只在下午那一个小时内成立：晚上跑全量时它已超龄 5 小时，
+    「标题证据打捞」的用例会全红（2026-11-05 22:00 实测 3 条假失败）。
+    跨零点要标「昨天」，否则「今天 00:03」会被解析成未来时刻。
+    """
+    now = datetime.now()
+    t = now - timedelta(minutes=minutes_ago)
+    day = "今天" if t.date() == now.date() else "昨天"
+    return f"{day} {t:%H:%M}"
+
 
 def title_row(text: str) -> str:
     return (f'<node index="22" text="{text}" class="android.widget.TextView" '
@@ -147,6 +161,11 @@ class TestSweepWithTitleEvidence(unittest.TestCase):
         return G.Unit(sender=sender, content=content, ts=ts,
                       y0=500, y1=600, clipped_below=0)
 
+    @staticmethod
+    def _ts(minutes_ago: int = 5) -> str:
+        """动态时间条（实现见模块级 recent_ts，两个用例类共用一份）。"""
+        return recent_ts(minutes_ago)
+
     def _frame(self, units, hints=(), title=GROUP):
         return SimpleNamespace(units=units, view=(0, 200, 1080, 2100),
                                hints=hints, title=title)
@@ -154,35 +173,36 @@ class TestSweepWithTitleEvidence(unittest.TestCase):
     def test_title_evidence_sweeps_full_screen(self):
         """无已知消息、无徽标，但群名对上 → 整屏按候选处理。"""
         h = self._h()
-        new = self._u("服务诊断专员", "刚来的长消息", "今天 16:55")
+        new = self._u("服务诊断专员", "刚来的长消息", self._ts())
         swept = h._sweep_recent(self._frame([new]))
         self.assertEqual([u.content for u in swept], ["刚来的长消息"])
 
     def test_foreign_title_still_no_sweep(self):
         """标题对不上 = 换了群：整屏都不能捞（防灌群事故）。"""
         h = self._h()
-        u = self._u("别群的人", "别群的消息", "今天 16:55")
+        u = self._u("别群的人", "别群的消息", self._ts())
         self.assertEqual(h._sweep_recent(self._frame([u], title="别的群")), [])
 
     def test_no_title_no_sweep(self):
         """标题读不出来（旧版手机端没这个能力）→ 维持「宁可不捞」。"""
         h = self._h()
-        u = self._u("甲", "新消息", "今天 16:55")
+        u = self._u("甲", "新消息", self._ts())
         self.assertEqual(h._sweep_recent(self._frame([u], title="")), [])
 
     def test_known_units_still_filtered(self):
         """整屏候选不等于整屏都发：持久库里见过的照样过滤。"""
-        fp = self._u("甲", "发过的", "今天 16:50").fp
+        seen_ts = self._ts(8)
+        fp = self._u("甲", "发过的", seen_ts).fp
         h = self._h(known_uids=[f"android:{fp}:1"])
-        seen = self._u("甲", "发过的", "今天 16:50")
-        fresh = self._u("乙", "新的", "今天 16:55")
+        seen = self._u("甲", "发过的", seen_ts)
+        fresh = self._u("乙", "新的", self._ts())
         swept = h._sweep_recent(self._frame([seen, fresh]))
         self.assertEqual([u.content for u in swept], ["新的"])
 
     def test_stale_units_still_filtered(self):
         """超龄/读不出时刻的照旧不捞（时间护栏不因新证据放宽）。"""
         h = self._h()
-        old = self._u("甲", "一小时前的", "今天 15:00")
+        old = self._u("甲", "一小时前的", self._ts(90))
         bare = self._u("乙", "裸今天", "今天")
         swept = h._sweep_recent(self._frame([old, bare]))
         self.assertEqual(swept, [])
@@ -218,7 +238,7 @@ class TestAnchorFlushedByTitle(GatewayCase):
             title_row(GROUP), garbled_rows(),
             msg_row("服务诊断专员", "刚来的长消息一", 400),
             msg_row("履约跟单专员", "刚来的长消息二", 700),
-            f'<node text="今天 16:55" class="android.widget.TextView" '
+            f'<node text="{recent_ts()}" class="android.widget.TextView" '
             f'package="{PKG}" bounds="[500,300][600,340]"></node>'))
         self.assertEqual(body["messages"], 2,
                          f"note={body.get('note')}")

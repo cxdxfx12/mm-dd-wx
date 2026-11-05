@@ -15,12 +15,18 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from pathlib import Path
 
 import cfgfile
+
+try:                                        # 界面解释器不该因它打不开窗口
+    from bridge import dbclean
+except Exception:                           # noqa: BLE001
+    dbclean = None
 
 WINDOW_RE = re.compile(r"^\s*\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\s*$")
 
@@ -138,6 +144,33 @@ def _tip(parent, text: str, bg: str = CARD, fg: str = MUTED,
     return lab
 
 
+def _dingtalk_pc_hint() -> str:
+    """「漏转对账」页脚那行环境说明。
+
+    只查目录、不 import pycryptodome：界面跑在**只有 tkinter 的解释器**里，
+    装不下 Crypto（那是工作进程 runtime 里的事），import 会直接抛异常。
+    所以这里只能回答「有没有钉钉电脑版的数据目录」，能不能解密由工作进程
+    启动时自己判断，日志里会给结论。
+    """
+    import os
+    base = Path(os.environ.get("APPDATA") or "") / "DingTalk"
+    if not base.is_dir():
+        return ("⚠ 本机没检测到钉钉电脑版的数据目录（%APPDATA%\\DingTalk）——"
+                "装好并登录后才能对账，现在开着也不会生效。")
+    try:
+        dirs = sorted((d for d in base.iterdir()
+                       if d.is_dir() and d.name.endswith(("_v2", "_v3"))),
+                      key=lambda d: d.stat().st_mtime, reverse=True)
+    except OSError:
+        dirs = []
+    if not dirs:
+        return "⚠ 钉钉目录存在但没有账号数据（没登录过？）——对账暂时不可用。"
+    latest = dirs[0] / "DBFiles" / "dingtalk.db"
+    if latest.is_file():
+        return f"✔ 已检测到钉钉电脑版数据库：{latest.parent.parent.name}"
+    return "⚠ 钉钉目录里没有数据库文件（客户端可能还没同步完）。"
+
+
 # ---------------------------------------------------------------- 自动巡检档位
 #
 # 档位与 bridge/sources/android_gateway.WATCH_CHOICES 必须一致（那边夹值、
@@ -147,6 +180,38 @@ def _tip(parent, text: str, bg: str = CARD, fg: str = MUTED,
 WATCH_CHOICES = (0, 5, 10, 15, 30)
 WATCH_LABELS = {0: "关闭（不巡检）", 5: "每 5 分钟", 10: "每 10 分钟",
                 15: "每 15 分钟", 30: "每 30 分钟"}
+
+
+# ---------------------------------------------------------------- 数据库保留档位
+#
+# 与 bridge/dbclean.py 的 KEEP_CHOICES / KEEP_LABELS 保持一致（那边负责算与删，
+# 这边只管显示）。这里留兜底常量：万一界面解释器 import 不到 bridge 包，
+# 下拉框也不该是空的。
+_KEEP_FALLBACK = {0: "永久保留（只清孤儿记录）", 30: "保留 30 天",
+                  90: "保留 90 天（推荐）", 180: "保留 180 天",
+                  365: "保留 1 年"}
+KEEP_LABELS = dict(getattr(dbclean, "KEEP_LABELS", None) or _KEEP_FALLBACK)
+KEEP_CHOICES = tuple(getattr(dbclean, "KEEP_CHOICES", None) or
+                     (30, 90, 180, 365, 0))
+
+
+def _keep_label(days) -> str:
+    """配置里的天数 → 下拉框文字。认不出的值原样显示，不悄悄改成 90 ——
+    用户手工写了 45 天，界面就该让他看见 45。"""
+    try:
+        d = int(days)
+    except (TypeError, ValueError):
+        return str(days)
+    return KEEP_LABELS.get(d, f"保留 {d} 天")
+
+
+def _keep_days(label: str) -> int:
+    """下拉框文字 → 天数；认不出就按 90 天（默认值）。"""
+    for d, text in KEEP_LABELS.items():
+        if text == label:
+            return int(d)
+    m = re.search(r"(\d+)", label or "")
+    return int(m.group(1)) if m else 90
 
 
 def _watch_label(minutes) -> str:
@@ -882,6 +947,46 @@ class SettingsDialog:
                         variable=self.st["n_at_all"]).pack(anchor="w", padx=14,
                                                            pady=(4, 12))
 
+        # ---- 漏转对账 ----
+        # 采集端看不到的东西，日志里也没有（卡片被滑走 / 重绘间隙 / 附件超时）。
+        # 钉钉自己的库有每条消息的精确时间戳和卡片标题，正好当基准：库里有的
+        # 卡片，桥在容差时间内一条都没入库 → 疑似漏转。
+        rc = self.cfg.get("reconcile") or {}
+        self.st["rc_enabled"] = tk.BooleanVar(value=bool(rc.get("enabled", True)))
+        self.st["rc_interval"] = tk.StringVar(value=str(rc.get("interval_min", 10)))
+        self.st["rc_lookback"] = tk.StringVar(value=str(rc.get("lookback_min", 40)))
+        self.st["rc_tolerance"] = tk.StringVar(value=str(rc.get("tolerance_min", 30)))
+
+        box4 = _card(page, "漏转对账（拿钉钉电脑端本地库核对微信侧）")
+        box4.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Checkbutton(box4, text="启用漏转对账：发现了钉钉里有、微信侧没转过去的消息就告警",
+                        variable=self.st["rc_enabled"]).pack(anchor="w", padx=14,
+                                                             pady=(10, 4))
+        row6 = tk.Frame(box4, bg=CARD)
+        row6.pack(fill="x", padx=14, pady=2)
+        tk.Label(row6, text="每", bg=CARD, fg=TEXT, font=F_UI).pack(side="left")
+        ttk.Spinbox(row6, from_=2, to=120, textvariable=self.st["rc_interval"],
+                    width=5).pack(side="left", padx=6)
+        tk.Label(row6, text="分钟核对一次，回看", bg=CARD, fg=TEXT,
+                 font=F_UI).pack(side="left")
+        ttk.Spinbox(row6, from_=10, to=720, textvariable=self.st["rc_lookback"],
+                    width=5).pack(side="left", padx=6)
+        tk.Label(row6, text="分钟，时间容差", bg=CARD, fg=TEXT,
+                 font=F_UI).pack(side="left")
+        ttk.Spinbox(row6, from_=5, to=120, textvariable=self.st["rc_tolerance"],
+                    width=5).pack(side="left", padx=6)
+        tk.Label(row6, text="分钟", bg=CARD, fg=TEXT, font=F_UI).pack(side="left")
+        _tip(box4, "时间容差给足是因为微信侧的时间来自截图上的时间条（只到分钟），"
+                   "同一条消息实测能差几分钟到十几分钟。", bg=CARD
+             ).pack(anchor="w", padx=16, pady=(2, 0))
+        tk.Label(box4, text=_dingtalk_pc_hint(), bg=CARD, fg=MUTED, font=F_SMALL,
+                 justify="left", wraplength=620).pack(anchor="w", padx=14,
+                                                      pady=(4, 2))
+        _tip(box4, "前提：这台电脑上装了钉钉电脑版，并且登录的是**手机采集用的那个账号**"
+                   "（不是的话库里查不到目标群，对账会自己停用并在日志里说明）。"
+                   "对账只读标题和时间戳 —— 卡片的正文/表格/附件本来就不存在本地库里。",
+             bg=CARD).pack(anchor="w", padx=16, pady=(2, 10))
+
     def _field(self, box, label: str, var, width: int, note: str = ""):
         row = tk.Frame(box, bg=CARD)
         row.pack(fill="x", padx=14, pady=3)
@@ -1044,6 +1149,44 @@ class SettingsDialog:
                         variable=self.st["autostart"]).pack(anchor="w", padx=14,
                                                             pady=12)
 
+        # ---- 消息数据库 ----
+        # 库只增不减：每条消息一行，每条消息再记 1~3 条投递记录；而且 SQLite
+        # 的 DELETE 不会把文件缩小，必须 VACUUM。用户 2026-11-05 问「以后会不会
+        # 很臃肿」，这里给他一个能看见体积、能自己决定删多少的入口。
+        st_cfg = self.cfg.get("storage") or {}
+        keep_default = int(st_cfg.get("keep_days", 90) or 0)
+        self.st["db_keep"] = tk.StringVar(value=_keep_label(keep_default))
+        self._db_path = Path(st_cfg.get("db_path") or "data/bridge.db")
+        if not self._db_path.is_absolute():
+            self._db_path = (self.path.parent / self._db_path).resolve()
+
+        boxdb = _card(page, "消息数据库（历史消息与投递记录）")
+        boxdb.pack(fill="x", padx=12, pady=(0, 8))
+        self._db_info = tk.Label(boxdb, text="正在统计…", bg=CARD, fg=TEXT,
+                                 font=F_SMALL, justify="left", anchor="w",
+                                 wraplength=600)
+        self._db_info.pack(fill="x", padx=14, pady=(4, 2))
+
+        rowdb = tk.Frame(boxdb, bg=CARD)
+        rowdb.pack(fill="x", padx=14, pady=(2, 4))
+        tk.Label(rowdb, text="保留", bg=CARD, fg=TEXT, font=F_UI).pack(side="left")
+        self._db_keep_cb = ttk.Combobox(
+            rowdb, state="readonly", width=22,
+            values=[KEEP_LABELS[k] for k in KEEP_CHOICES])
+        self._db_keep_cb.set(_keep_label(keep_default))
+        self._db_keep_cb.pack(side="left", padx=6)
+        self._db_btn = ttk.Button(rowdb, text="清理旧数据…",
+                                  command=self._clean_db)
+        self._db_btn.pack(side="left", padx=(10, 6))
+        ttk.Button(rowdb, text="刷新",
+                   command=self._refresh_db_info).pack(side="left")
+        _tip(boxdb, "清理只删库里的行（超出保留期的历史消息 + 投递记录），"
+                    "不动 data\\attachments 里的附件文件。删完会 VACUUM 把磁盘"
+                    "空间真正收回来 —— 正在转发时库被占用就收不回来，先停止再点。"
+                    "删除不可撤销：还想回查老消息就把保留期调长。",
+             bg=CARD).pack(anchor="w", padx=16, pady=(0, 10))
+        self.win.after(120, self._refresh_db_info)
+
         box2 = _card(page, "运行环境")
         box2.pack(fill="x", padx=12, pady=(0, 8))
         gridbox = tk.Frame(box2, bg=CARD)
@@ -1071,6 +1214,127 @@ class SettingsDialog:
                    ).pack(side="left", padx=8)
         ttk.Button(btns, text="打开日志目录", command=self.app.open_log_dir
                    ).pack(side="left")
+
+    # ------------------------------------------------------------ 消息数据库
+
+    def _db_size(self, p: Path) -> int:
+        """主库 + -wal + -shm 的实际占盘（单看主库会低估：WAL 可能有几十 MB）。"""
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                total += Path(f"{p}{suffix}").stat().st_size
+            except OSError:
+                pass
+        return total
+
+    def _refresh_db_info(self):
+        """把库的体积和行数刷到界面上。
+
+        只读一次 COUNT(*)：几万行的库也是毫秒级，不值得为它起线程，反而
+        让「刷新」按钮点下去没反应。读不到就如实显示原因 —— 文件不存在、
+        被占用、不是本程序的库，三种情况都要能区分。
+        """
+        p = self._db_path
+        if not p.is_file():
+            self._db_info.configure(text=f"还没有数据库文件（{p}）")
+            return
+        size = self._db_size(p)
+        human = dbclean.human_size(size) if dbclean else f"{size / 1e6:.1f} MB"
+        msgs = dels = -1
+        try:
+            conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=3)
+            try:
+                msgs = conn.execute("select count(*) from messages").fetchone()[0]
+                dels = conn.execute("select count(*) from deliveries").fetchone()[0]
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError as exc:
+            self._db_info.configure(
+                text=f"占用 {human}，行数读不到（{exc}）\n{p}")
+            return
+        wal = self._db_size(p) - (p.stat().st_size if p.is_file() else 0)
+        extra = f"，其中 WAL 等 {dbclean.human_size(wal)}" if wal > 0 else ""
+        self._db_info.configure(
+            text=f"占用 {human}{extra}\n"
+                 f"消息 {msgs} 条 ｜ 投递记录 {dels} 条\n"
+                 f"{p}")
+
+    def _clean_db(self):
+        """预览 → 确认 → 删行 + VACUUM。
+
+        为什么要先预览：删的是历史消息，不可撤销。清单里连「不会动什么」也
+        一起写（附件文件、配置、待发送队列），用户真正怕的是多删。
+        """
+        if dbclean is None:
+            messagebox.showerror(
+                "无法清理",
+                "界面进程没能加载 bridge.dbclean 模块，清理功能不可用。\n"
+                "可以改用命令行：见 README 的「清理消息数据库」。",
+                parent=self.win)
+            return
+        keep = _keep_days(self.st["db_keep"].get())
+        try:
+            plan = dbclean.scan(self._db_path, keep)
+        except ValueError as exc:
+            messagebox.showwarning("保留期不对", str(exc), parent=self.win)
+            return
+        except Exception as exc:                    # noqa: BLE001
+            messagebox.showerror("读取数据库失败", str(exc), parent=self.win)
+            return
+        if plan.error:
+            messagebox.showerror("读取数据库失败", plan.error, parent=self.win)
+            return
+        if plan.nothing_to_do:
+            messagebox.showinfo("没有需要清理的数据",
+                                "\n".join(dbclean.summary_lines(plan)),
+                                parent=self.win)
+            return
+
+        body = ("将删除下列数据（不可撤销）：\n\n"
+                + "\n".join(dbclean.summary_lines(plan))
+                + "\n\n不会动：data\\attachments 里的附件文件、config.yaml、"
+                  "待发送队列、去重所需的最近记录。\n\n"
+                  "删完会压缩数据库，那一步需要把库独占 —— 正在转发时可能"
+                  "失败（数据照删，空间下次再收）。\n\n确定清理吗？")
+        if not messagebox.askyesno("清理消息数据库", body, parent=self.win):
+            return
+
+        self._db_btn.configure(state="disabled")
+        self._db_info.configure(text="正在删除并压缩数据库，请稍候…")
+
+        def work():
+            try:
+                res = dbclean.execute(plan)
+            except Exception as exc:                # noqa: BLE001
+                # 别在 lambda 里引用 exc：except 块一结束它就被删了，
+                # 晚执行的回调会拿到 NameError（tests/test_no_except_var_leak
+                # 专门钉这条）。先落成字符串再绑到默认参数上。
+                err = str(exc)
+                self.win.after(0, lambda msg=err: self._clean_db_done(None, msg))
+                return
+            self.win.after(0, lambda r=res: self._clean_db_done(r, ""))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _clean_db_done(self, res, err: str):
+        try:
+            self._db_btn.configure(state="normal")
+        except Exception:                           # noqa: BLE001
+            return                                   # 窗口已关
+        self._refresh_db_info()
+        if err or res is None or res.error:
+            messagebox.showerror("清理失败", err or res.error, parent=self.win)
+            return
+        freed = dbclean.human_size(res.freed)
+        msg = (f"已删除 {res.deleted_messages} 条消息、"
+               f"{res.deleted_deliveries} 条投递记录。\n")
+        if res.vacuumed:
+            msg += f"数据库已压缩，释放 {freed}。"
+        else:
+            msg += f"目前释放 {freed}。\n\n{res.note}"
+        if res.deleted_messages == 0 and res.deleted_deliveries == 0:
+            msg = "没有需要删除的行。"
+        messagebox.showinfo("清理完成", msg, parent=self.win)
 
     # ------------------------------------------------------------ 读写
 
@@ -1231,6 +1495,17 @@ class SettingsDialog:
                      self.st["n_at_mobiles"].get().replace("，", ";").split(";")
                      if x.strip()]
 
+        # ---- 漏转对账的数值 ----
+        try:
+            rc_interval = max(2, int(float(self.st["rc_interval"].get())))
+            rc_lookback = max(10, int(float(self.st["rc_lookback"].get())))
+            rc_tolerance = max(5, int(float(self.st["rc_tolerance"].get())))
+        except ValueError:
+            messagebox.showwarning("数值不对",
+                                   "漏转对账的「间隔 / 回看 / 容差」必须是数字（分钟）。",
+                                   parent=self.win)
+            return
+
         cfgfile.backup(self.path)
         problems: list[str] = []
 
@@ -1250,6 +1525,14 @@ class SettingsDialog:
 
         if not cfgfile.set_routes(self.path, rules_in):
             problems.append("routes")
+
+        # ---- 消息数据库保留期 ----
+        # 只记「用户选了多少天」，不动数据：真正的删除必须由他点「清理旧数据」
+        # 并在预览清单上确认。storage 段不存在（少见）就跳过 —— 那不是致命
+        # 问题，Config 会用默认 db_path，没必要因此让整个设置存不下来。
+        if cfgfile.has_section(self.path, "storage"):
+            S("storage", "keep_days", _keep_days(self.st["db_keep"].get()),
+              after="db_path")
 
         # 各键的 after= 描述的是「样板文件里的先后顺序」：老配置缺哪个键，
         # 就地补在它该在的位置，而不是堆到段尾让人看不懂。
@@ -1325,6 +1608,22 @@ class SettingsDialog:
           after="idle_window")
         S("notify", "report_daily_at", n_daily, after="report_hourly")
 
+        # ---- 漏转对账 ----
+        # reconcile 是后加的顶层段：老用户的 config.yaml 里根本没有它，
+        # 而 set_or_insert_scalar 在「段不存在」时一律失败 —— 先把样板里的
+        # 整段插进去，再逐个写键。插在 routes 之前（cfgfile 的硬要求）。
+        if not cfgfile.has_section(self.path, "reconcile"):
+            sample = Path(self.path).parent / "config.example.yaml"
+            block = cfgfile.section_text(sample, "reconcile") if sample.is_file() else ""
+            if block.strip():
+                cfgfile.ensure_section(self.path, "reconcile", block)
+            else:
+                problems.append("reconcile（配置文件里缺这一段，且找不到样板）")
+        S("reconcile", "enabled", bool(self.st["rc_enabled"].get()))
+        S("reconcile", "interval_min", rc_interval, after="enabled")
+        S("reconcile", "lookback_min", rc_lookback, after="interval_min")
+        S("reconcile", "tolerance_min", rc_tolerance, after="lookback_min")
+
         if problems:
             messagebox.showerror(
                 "保存失败",
@@ -1337,12 +1636,15 @@ class SettingsDialog:
         self.app.reload_after_settings()
         notify_line = ("钉钉通知：已启用，故障会发到群里。"
                        if n_enabled else "钉钉通知：未启用。")
+        reconcile_line = ("漏转对账：已启用，发现漏转会告警。"
+                          if self.st["rc_enabled"].get() else "漏转对账：未启用。")
         messagebox.showinfo(
             "已保存",
             "设置已保存（原配置已备份到 data/backup/）。\n\n"
             + ("当前仍是【试运行】模式，不会真实发送。" if
                self.st["dry_run"].get() else "当前为【正式发送】模式。")
             + "\n" + notify_line
+            + "\n" + reconcile_line
             + "\n\n若转发任务正在运行，请停止后重新开始。",
             parent=self.win)
         self.win.destroy()
