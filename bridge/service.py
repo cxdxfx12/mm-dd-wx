@@ -21,6 +21,7 @@ from .models import Message
 from .notify import (DingTalkNotifier, SYSTEM_PREFIX, in_hhmm_window,
                      install_alert_handler)
 from .router import Router
+from .reconcile import Reconciler
 from .storage import Storage
 from .table_image import render_message
 from .targets import build_target
@@ -227,6 +228,7 @@ class BridgeService:
         self._idle_alerted = False
         self._watchdog: threading.Thread | None = None
         self._watchdog_stop = threading.Event()
+        self._reconciler: Reconciler | None = None
         self._hour_key = datetime.now().strftime("%Y-%m-%d %H")
         self._day_key = datetime.now().strftime("%Y-%m-%d")
         self._started_at: datetime | None = None
@@ -749,6 +751,39 @@ class BridgeService:
         self._watchdog.start()
         log.info("已启用钉钉通知：%s", self.notifier.describe())
 
+    def start_reconcile(self) -> bool:
+        """启动「漏转对账」巡检线程（钉钉 PC 本地库 ↔ 桥已入库消息）。
+
+        与看门狗分开启动：看门狗依赖钉钉机器人（没配 webhook 就直接返回），
+        而对账的价值在**日志**里也成立 —— 没配通知照样该核对、该 WARNING。
+
+        整个构造 + 启动都套了兜底：对账是旁路能力，缺依赖、库被占用、
+        钉钉没装，都不该影响转发主流程。
+        """
+        if self._reconciler is not None:
+            return True
+        rc = getattr(self.cfg, "reconcile", None)
+        if not rc or not getattr(rc, "enabled", False):
+            return False
+        try:
+            rec = Reconciler(self.cfg, self.cfg.resolve(self.cfg.storage.db_path),
+                             notifier=self.notifier)
+            if not rec.start():
+                return False
+        except Exception:                       # noqa: BLE001
+            log.exception("漏转对账启动失败（不影响转发）")
+            return False
+        self._reconciler = rec
+        return True
+
+    def reconcile_once(self, force: bool = True):
+        """手动跑一轮对账，返回 `reconcile.Result`（`run.py --reconcile` 用）。"""
+        if self._reconciler is None:
+            self._reconciler = Reconciler(
+                self.cfg, self.cfg.resolve(self.cfg.storage.db_path),
+                notifier=self.notifier)
+        return self._reconciler.run_once(force=force)
+
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.wait(WATCHDOG_TICK):
             try:
@@ -873,6 +908,13 @@ class BridgeService:
         self._watchdog_stop.set()
         if self._watchdog and self._watchdog.is_alive():
             self._watchdog.join(timeout=2.0)
+        # 对账线程可能在解密（单轮约 7 秒），不能等它 —— daemon 线程 + 短 join
+        if self._reconciler is not None:
+            try:
+                self._reconciler.stop()
+            except Exception:                   # noqa: BLE001
+                pass
+            self._reconciler = None
         # 补投线程：置停 + 唤醒队列，别让 close 卡在 30 秒延迟上
         self._retry_stop.set()
         self._retry_queue.put(None)

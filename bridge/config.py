@@ -15,6 +15,10 @@ import yaml
 @dataclass
 class StorageConfig:
     db_path: str = "data/bridge.db"
+    # 消息数据库保留天数：设置中心「其他 → 消息数据库」的默认值，也是清理
+    # 功能的建议上限。**不会自动删**（删数据必须在用户点确认时发生），
+    # 只是把用户上次选的值记住。0 = 永久保留（只清孤儿投递记录）。
+    keep_days: int = 90
 
 
 @dataclass
@@ -136,6 +140,29 @@ class NotifyConfig:
 
 
 @dataclass
+class ReconcileConfig:
+    """漏转对账：拿钉钉 PC 本地库当基准，查桥有没有漏消息。
+
+    只有在**本机装了钉钉 PC 客户端、且登录的是采集用的那个账号**时才有意义
+    —— 手机端采集的账号和 PC 登录账号不是同一个时，库里一条都查不到，
+    对账器会自己报「找不到这个群」并停用，不会假装「没有漏转」。
+
+    依赖 pycryptodome。没装时整块功能自动失效，主流程完全不受影响。
+    """
+    enabled: bool = True
+    interval_min: float = 10.0        # 每几轮核对一次
+    lookback_min: float = 40.0        # 单轮常规回看窗口
+    tolerance_min: float = 30.0       # 时间兜底容差（OCR 时间条只到分钟）
+    # 停机/挂起之后一次补齐的最大回看深度；超过这个时长的历史不再追。
+    # 太大会让重启后一次解密几万条卡片、告警刷屏。
+    max_gap_hours: float = 12.0
+    alert: bool = True                # 除日志外还发钉钉通知
+    dingtalk_path: str = ""           # 留空自动找最近活跃的 *_v3 目录
+    dingtalk_chat: str = ""           # 钉钉侧群名关键词，留空用 dingtalk.chat_names[0]
+    bridge_chat: str = ""             # 桥侧群名关键词，留空同上
+
+
+@dataclass
 class RouteConfig:
     name: str = "default"
     companies: list[str] = field(default_factory=list)
@@ -152,6 +179,7 @@ class Config:
     dingtalk: DingTalkConfig = field(default_factory=DingTalkConfig)
     wechat: WeChatConfig = field(default_factory=WeChatConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
+    reconcile: ReconcileConfig = field(default_factory=ReconcileConfig)
     routes: list[RouteConfig] = field(default_factory=list)
 
     @property
@@ -186,6 +214,7 @@ def load_config(path: str | Path = "config.yaml") -> Config:
         dingtalk=_section(DingTalkConfig, raw.get("dingtalk")),
         wechat=_section(WeChatConfig, raw.get("wechat")),
         notify=_section(NotifyConfig, raw.get("notify")),
+        reconcile=_section(ReconcileConfig, raw.get("reconcile")),
         routes=[_section(RouteConfig, r) for r in (raw.get("routes") or [])],
     )
 
