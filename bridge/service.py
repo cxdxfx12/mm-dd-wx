@@ -288,9 +288,22 @@ class BridgeService:
         age_min = self._backlog_minutes(msg)
         if not force and limit > 0 and age_min > limit:
             self.counter["filtered"] += 1
-            log.info("积压超龄不转发（源消息 %s，已 %.0f 分钟，上限 %.0f）：%s",
-                     msg.time_text or "时间未知", age_min, limit,
-                     (msg.content or "").replace("\n", " ")[:40])
+            if msg.msg_type == "file":
+                # 附件走这条路时最容易被当成「漏了」：手机端明明抓到了、
+                # 文件也落盘了，只是抓取本身耗掉的时间把源消息推过了 30 分钟
+                # 线（2026-11-04 20:43 实锤：19:32 的卡片、重试到 20:43 才
+                # 拿到，71 分钟 > 30 → 只入库不转发，群里什么都没有）。
+                # 这不是 bug 而是闸门在按规则办事，但**必须吵**：用户看到的是
+                # 「附件没发出去」，日志里却只有一条 info，根本对不上。
+                log.warning("附件已抓到但源消息超龄，只入库不转发"
+                            "（源消息 %s，已 %.0f 分钟，上限 %.0f）：%s"
+                            " —— 要补发用 tools/forward_recent.py",
+                            msg.time_text or "时间未知", age_min, limit,
+                            (msg.content or "").replace("\n", " ")[:40])
+            else:
+                log.info("积压超龄不转发（源消息 %s，已 %.0f 分钟，上限 %.0f）：%s",
+                         msg.time_text or "时间未知", age_min, limit,
+                         (msg.content or "").replace("\n", " ")[:40])
             return True
 
         matched = self.router.match(msg)

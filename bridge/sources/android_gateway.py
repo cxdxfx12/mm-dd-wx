@@ -164,8 +164,19 @@ def _attach_re(keys: list) -> "re.Pattern":
     文件名（2026-11-01 14:3x 实测「：拦截风险明细.xlsx」），手机端拿这个
     名字去屏上找必然找不到。
     """
+    # ⚠ 2026-11-05 实锤的大坑：这里原来写的是 ``[\s：:]*``，而 ``\s`` 含换行。
+    #   于是「下载附件」独占一行、下一行是标题时，正则**跨行**把标题当成了
+    #   文件名：
+    #
+    #       下载附件
+    #       以下为签收进度最低的TOP5承包区（按签收进度从低到高排序）：
+    #
+    #   → 名字 = 那行标题 → 手机端 contains() 永远找不到 → 每个候选白等 35 秒
+    #   （实测一次下单烧掉 130~170 秒），队列还因此被堵住，同一张卡里真正的
+    #   按钮「下载附件」根本没进候选链（第 2 步命中就 return 了，走不到第 3 步）。
+    #   现在只吃同一行内的冒号/空白，绝不跨行。
     return re.compile(
-        r"^(?:明细)?(?:%s)[\s：:]*(\S[^\n]{0,40})$"
+        r"^(?:明细)?(?:%s)[ \t\u3000：:]*(\S[^\n]{0,40})$"
         % "|".join(re.escape(k) for k in keys),
         re.M)
 # 锚点对不上时「请手机翻一屏试着找回」的节流参数。
@@ -232,6 +243,16 @@ SWEEP_MAX_UNITS = 15
 # 硬上限约 40 秒（20s 等落盘 + 12 步返回）；120 秒还没文件，基本是手机端
 # 没找到附件行 / UC 下载失败，不告警就只有「发现附件」一条日志，最难查。
 ATTACH_FETCH_TIMEOUT = 120.0
+# 抓取失败后的**自动重试**间隔（秒），依次取用；用完就放弃（改为只留日志）。
+#
+# 为什么必须有（2026-11-05）：一次抓取失败以前等于**永久丢失** —— 超时只是
+# 「释放冷却」，而重新下单的唯一触发是「这张卡片又作为新消息出现」；卡片
+# 早就滚出屏幕、也不会再被当成新单元，于是再也轮不到它。当天实测 5 次下单
+# 只成功 1 次：14:22「拦截风险明细.xlsx」、14:24「猫超件明细」、
+# 15:35「重点商家运单明细.xlsx」全部 35 秒无文件 → 永久丢；而 15:35 那份
+# 同一名字在 16:24 重下一遍就成功了 —— 说明「再试一次」就能救回来。
+# 间隔从 2 分钟起：手机端单次抓取要 35 秒/候选 + 退避，太密只会互相打断。
+ATTACH_RETRY_DELAYS = (120.0, 300.0)
 # 长消息「攒齐再发」最多等多久（秒）。等不到补全帧就发手头那半截 ——
 # 手机没手势权限、用户在操作别的界面、群消息太快把前半截顶掉，都可能让
 # 补全永远不来。宁可发一条不完整的，也不能永远不发。
@@ -1132,6 +1153,10 @@ _FILE_LINE_RE = re.compile(
     r"^[\w\u4e00-\u9fa5（）()\[\]【】\-—_.·＋+&＆]{1,60}"
     r"\.(?:xlsx|xlsm|xls|csv|docx|doc|pdf|zip|rar|7z|txt|pptx|ppt)$", re.I)
 
+# 章节号：卡片里的小标题是「✅ 3. 后续行动」「📊1. 二阶段签收情况」这种形态。
+# 2026-11-05 跨行捕获把它当成了附件名，手机端找不到、白等 35 秒。
+_SECTION_NO_RE = re.compile(r"^[^\w\u4e00-\u9fa5]{0,3}\d+\s*[.、)）]\s*\S")
+
 # ── 万能字眼（2026-11-01 用户：「加个万能的字眼，附件、excel、明细都下载」）──
 #
 # 只认「短行 + 名词 + 动作」三件套，不是「正文里出现『明细』二字就抓」：
@@ -1194,6 +1219,11 @@ def _mingxi_lines(content: str) -> list:
             continue
         if any(w in s for w in _MINGXI_STOP_WORDS):
             continue
+        # 形态校验：「所有承包区签收明细我已经整理成Excel附件：」这种说明句
+        # 也带「明细」二字、也短，但屏上根本不是可点的行（2026-11-05 实测
+        # 它进了候选链，白等一次 35 秒）。
+        if not _plausible_attach_name(s):
+            continue
         if s not in out:
             out.append(s)
     return out
@@ -1233,6 +1263,15 @@ def _attach_cands(content: str, keys: list, auto: bool = True,
     for n in ming:
         if not redundant(n):
             push(n)
+    # ③ 屏上真按钮就一个词（「下载附件」「查看完整」）：**一律兜底收进来**。
+    #    2026-11-05 现场：前面任意一条规则先命中就会 return，于是这一行
+    #    从来没进过候选链 —— 名字取错时，真按钮明明在屏上、就是没人点它。
+    #    排最后是因为它最泛（一张卡里可能有多个「下载附件」），前面那些
+    #    更具体的候选先试，试不到再点它。
+    for k in _clean_attach_keys(keys):
+        if len(k) >= 4 and k not in cands and any(
+                ln.strip() == k for ln in (content or "").splitlines()):
+            push(k)
     return cands[:limit]
 
 
@@ -1261,6 +1300,65 @@ def _fetch_keys_for(ctx, name: str) -> str:
     if len(head) >= 3 and head not in keys:
         keys.append(head)
     return ",".join(keys)
+
+
+def _plausible_attach_name(s: str) -> bool:
+    """这个名字像不像「屏上真能点到的那一行」。
+
+    2026-11-05 之前名字只靠正则抠，抠到什么算什么 —— 实测抠出过
+
+        以下为签收进度最低的TOP5承包区（按签收进度从低到高排序）：
+        ✅ 3. 后续行动
+        所有承包区签收明细我已经整理成Excel附件：
+
+    第一条是卡片里的**小标题**、第二条是**章节号**、第三条是**说明句**，
+    都不是可点的附件行。手机端拿它们去找节点必然找不到，白等 35 秒 ×N，
+    还把队列堵死。这里按「标题/句子」的形态把它们挡掉：宁可这一张卡不下单
+    （下一帧候选链还有「下载附件」这种真按钮兜着），也不要用一个假名字
+    把整条队列占住两分多钟。
+    """
+    s = (s or "").strip()
+    if not (2 <= len(s) <= 40):
+        return False
+    if s[-1] in "：:，,；;、·":        # 标题/说明句的收尾
+        return False
+    # 句读出现在名字中间 = 说明句（「今日巡检发现异常，麻烦你结合下方明细判断
+    # 一下」）。可点的按钮/文件名不会带逗号句号。
+    if any(c in s for c in "。！？!?，,；;"):
+        return False
+    if _SECTION_NO_RE.match(s):        # 「3. 后续行动」「1. 二阶段签收情况」
+        return False
+    if s.startswith(("以下", "如下", "所有")):   # 「以下为…」「所有…我已经整理成…」
+        return False
+    return True
+
+
+def _attach_key_alone_names(content: str, keys: list) -> list:
+    """「字眼独占一行、名字在下一行」的形态（真机确实存在）。
+
+        附件
+        运单明细
+
+    跨行捕获（本函数就是它唯一合法的场景）必须逐条校验：下一行像不像名字，
+    由 :func:`_plausible_attach_name` 说了算 —— 标题（以「：」收尾）、章节号
+    （「✅ 3. 后续行动」）、说明句全部被挡掉。
+    """
+    ks = _clean_attach_keys(keys)
+    pat = re.compile(r"^(?:明细)?(?:%s)[ \t\u3000：:]*$"
+                     % "|".join(re.escape(k) for k in ks))
+    lines = (content or "").splitlines()
+    out: list = []
+    for i, ln in enumerate(lines):
+        if not pat.match(ln.strip()):
+            continue
+        for nxt in lines[i + 1:]:
+            t = nxt.strip()
+            if not t:
+                continue
+            if _plausible_attach_name(t) and t not in out:
+                out.append(t)
+            break                       # 只看紧接着的非空行
+    return out
 
 
 def _attach_names(content: str, keys: list, auto: bool = True) -> list:
@@ -1294,8 +1392,17 @@ def _attach_names(content: str, keys: list, auto: bool = True) -> list:
         # 「履约失败明细（Excel）」—— 屏上根本没有以它开头的一行。
         if _FORMAT_ONLY_RE.match(name) or _FORMAT_IN_NAME_RE.search(name):
             name = m.group(0).strip()
-        if name and name not in out:
+        # 像标题/句子的不收（见 _plausible_attach_name）：手机端根本点不到，
+        # 收下来的唯一后果是占住单飞队列白等两分钟。
+        if name and _plausible_attach_name(name) and name not in out:
             out.append(name)
+    if out:
+        return out
+    # 1b) 「字眼独占一行、名字在下一行」的形态。
+    #     放在同行规则之后：同行能读出来时，那一行才是屏上真正可点的文本。
+    for n in _attach_key_alone_names(content, keys):
+        if n not in out:
+            out.append(n)
     if out:
         return out
     # 卡片按钮有时不带格式后缀，整行就是短语本身（「查看完整月报明细」）。
@@ -1479,6 +1586,43 @@ def _take_attach_src_time(ctx: "_Ctx", *names) -> "datetime | None":
     return datetime.now() - timedelta(seconds=age)
 
 
+def _schedule_attach_retry(ctx: "_Ctx", name: str, now: float) -> None:
+    """抓失败的名字排进「过一会儿再试一次」的队（见 ATTACH_RETRY_DELAYS）。
+
+    只排不派：真正的下发仍由 :func:`_order_attach` 统一调度（手机同一时刻
+    只能跑一个抓取任务，并发下发会被它当场丢掉）。
+    """
+    tries = ctx.attach_tries.get(name, 0)
+    if tries >= len(ATTACH_RETRY_DELAYS):
+        ctx.attach_tries.pop(name, None)
+        ctx.attach_retry_at.pop(name, None)
+        log.warning("附件「%s」已自动重试 %d 次仍未抓到 —— 放弃（可 "
+                    "POST /attach-now?name=… 手工补抓）", name, tries)
+        return
+    delay = ATTACH_RETRY_DELAYS[tries]
+    ctx.attach_tries[name] = tries + 1
+    ctx.attach_retry_at[name] = now + delay
+    log.info("附件「%s」%.0f 秒后自动重试（第 %d/%d 次）", name, delay,
+             tries + 1, len(ATTACH_RETRY_DELAYS))
+
+
+def _pull_attach_retries(ctx: "_Ctx", now: float) -> None:
+    """到点的重试单塞回队列（在扫本帧新消息**之前**跑）。"""
+    for name, due in list(ctx.attach_retry_at.items()):
+        if now < due:
+            continue
+        ctx.attach_retry_at.pop(name, None)
+        if not name or name == ctx.attach_active or name in ctx.attach_queue:
+            continue
+        # 冷却仍然有效：这一份刚抓到过就别再点（卡片重渲染会反复出现）。
+        if now - ctx.attach_orders.get(name, 0.0) < ATTACH_COOLDOWN:
+            ctx.attach_tries.pop(name, None)
+            continue
+        ctx.attach_queue.append(name)
+        log.info("附件「%s」自动重试（第 %d 次）—— 重新下发抓取指令",
+                 name, ctx.attach_tries.get(name, 0))
+
+
 def _attach_timeout_check(ctx: "_Ctx") -> None:
     """附件下单后迟迟没收到文件：告警一次并释放冷却。
 
@@ -1510,6 +1654,9 @@ def _attach_timeout_check(ctx: "_Ctx") -> None:
                     "卡片再次出现会重新下单",
                     name, now - at,
                     ctx.last_attach or "手机从未回报过任何结论")
+        # 光等「卡片再出现」是不够的：卡片早滚走了，滚走了就不再是新消息。
+        # 排一次有界重试，抓回来的概率立刻从 0 变成「再试一次」。
+        _schedule_attach_retry(ctx, name, now)
 
     # ⚠ 2026-11-01 实锤的另一种卡法：``attach_active`` 与 ``attach_orders``
     # **脱钩** —— active 里的名字在 orders 里没有键（``/attach-now`` 清冷却
@@ -1526,6 +1673,7 @@ def _attach_timeout_check(ctx: "_Ctx") -> None:
             log.warning("附件抓取超时（active 兜底）：「%s」没有在 %d 秒内"
                         "拿到文件 —— 已释放，可重新下单", active,
                         int(ATTACH_FETCH_TIMEOUT))
+            _schedule_attach_retry(ctx, active, now)
 
 
 def _attach_pending(ctx: "_Ctx") -> dict:
@@ -1556,6 +1704,9 @@ def _order_attach(ctx: "_Ctx", pending: list) -> str:
         return ""
     _attach_timeout_check(ctx)
     now = time.monotonic()
+    # 0) 到点的重试单先进队列 —— 它们比新卡片更「欠着」，而且与卡片在不在
+    #    屏幕上无关（见 _schedule_attach_retry）。
+    _pull_attach_retries(ctx, now)
 
     # 1) 先把本帧看到的附件行全部收进队列（已在抓/冷却中的跳过）
     auto = bool(getattr(ctx, "attach_auto", True))
@@ -1572,6 +1723,16 @@ def _order_attach(ctx: "_Ctx", pending: list) -> str:
             if now - getattr(ctx, "attach_fail_at", {}).get(name, 0.0) < ATTACH_FAIL_BACKOFF:
                 continue
             ctx.attach_queue.append(name)
+            # 同一张卡里有两个一模一样的按钮（2026-11-05 13:03 那张卡就是
+            # 「下载附件」×2，各自对应一份 Excel）：手机端按名字 contains()
+            # 找行，永远只点得到第一个 —— 第二个文件拿不到，且这是**APK 侧**
+            # 的限制（下拉没有「第几个」参数）。这里至少把话说清楚，别让人
+            # 以为是程序又漏了。
+            if sum(1 for _ln in content.splitlines()
+                   if _ln.strip() == name) > 1 and name not in ctx.attach_warned:
+                ctx.attach_warned.add(name)
+                log.warning("附件「%s」在同一张卡片里出现了多次 —— 手机端只能"
+                            "点到第一个，其余同名文件需要手工补发", name)
             # 记下这条消息的时间条：附件回到电脑侧要靠它算「多少分钟前」，
             # 否则附件永远算 0 分钟、拦不住积压（见 attach_src_ts 的说明）。
             ctx.attach_src_ts.setdefault(name, getattr(u, "ts", "") or "")
@@ -1700,6 +1861,14 @@ class _Ctx:
     # 三次，每次 20 秒、来回跳 UC，日志刷满还干扰了用户。退避期内不许自动
     # 重派（手动 /attach-now 不受限）。
     attach_fail_at: dict = field(default_factory=dict)
+    # 自动重试（2026-11-05）：附件名 → 已经重试过几次 / 下一次重试到点的时刻。
+    # 以前超时即永久丢失（重新下单只靠「卡片又当新消息出现」），实测 5 次
+    # 下单只成 1 次；有了这两个字典，抓失败的名字会自己回到队列里再试，
+    # 与「卡片还在不在屏幕上」无关（手机会自己上翻找行）。
+    attach_tries: dict = field(default_factory=dict)
+    attach_retry_at: dict = field(default_factory=dict)   # 名字 -> monotonic
+    # 已经提示过「同名按钮出现多次」的名字（只在日志里说一次，别每帧刷）。
+    attach_warned: set = field(default_factory=set)
     # 触发字眼（dingtalk.attach_keys）：下单时随 fetch_attach 一起下发给手机，
     # 手机端按同样的字眼找屏上的附件行 —— 两边必须一致，改配置两端同时生效。
     attach_keys: list = field(
@@ -2636,6 +2805,12 @@ class _Handler(BaseHTTPRequestHandler):
         # attach_src_ts 里，键可能是 active 名、手机报的行名、或显示名。
         src_time = _take_attach_src_time(self.ctx, self.ctx.attach_active,
                                          name, wanted)
+        # 抓到了：这个名字的重试次数与排期一起清掉，别过两分钟又抓一遍
+        # （同一份文件虽然会被 sha1 拦住，但手机端要白跑一趟 30+ 秒）。
+        for _n in (self.ctx.attach_active, name, wanted):
+            if _n:
+                self.ctx.attach_tries.pop(_n, None)
+                self.ctx.attach_retry_at.pop(_n, None)
         self.ctx.attach_active = ""
         cb = self.ctx.on_file
         # ⚠ attach_seen **不能**拿来挡回调（2026-11-01 14:46~14:53 实锤）：
