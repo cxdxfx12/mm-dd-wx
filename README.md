@@ -249,6 +249,7 @@ ddwx-bridge/
 │   ├── test_scroll_guard.py     实测滚动不会导致历史消息被误转发
 │   ├── test_wechat4.py          微信投递端验证（默认只读）
 │   ├── probe_dingtalk_ui.py     钉钉控件树探针（判断 UI 路线是否可行）
+│   ├── probe_dingtalk_db.py     钉钉 PC 本地库解密 + WAL 合并探针（查群/查附件，只读）
 │   ├── probe_dingtalk_capture.py  截图方式探针（PrintWindow / 位图 / 屏幕）
 │   ├── probe_dingtalk_scrollbar.py  消息区滚动条探针（贴底判定的依据）
 │   ├── probe_scroll_scale.py    实测「滚动条数值 == 像素位移」（Δ 公式验证）
@@ -271,6 +272,23 @@ ddwx-bridge/
 ├── config.example.yaml   配置样板
 └── requirements.txt
 ```
+
+## 查钉钉 PC 本地库（绕开 OCR，只读）
+
+钉钉 PC 端把消息加密存在本地 SQLite 里，新消息先落 `dingtalk.db-wal`。
+**只拷主库不并 WAL，读到的是几小时前的旧数据**；WAL 帧里的页同样是密文，
+必须逐帧解密并重算校验和，sqlite 才肯认（直接 `PRAGMA wal_checkpoint`
+对密文库只会报 `file is not a database`）。
+
+```bash
+python tools/probe_dingtalk_db.py --status                  # UID/WAL 滞后/总量
+python tools/probe_dingtalk_db.py --list 20 --grep 申通       # 找群
+python tools/probe_dingtalk_db.py --cid 77521050361 --files  # 看某群的文件消息
+```
+
+依赖 `pycryptodome`（只在跑这个探针时需要，不进 `requirements.txt`、
+不随安装包分发）。它是诊断工具：能确认「某条消息/附件到底有没有到本机」，
+但只覆盖**本机登录的那个钉钉账号**，与手机端采集到的群不是同一套数据。
 
 ## 验证微信投递端（默认只读，零副作用）
 
