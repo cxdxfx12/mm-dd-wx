@@ -221,6 +221,14 @@ def main() -> int:
     parser.add_argument("--live", action="store_true", help="正式运行（采集真实消息）")
     parser.add_argument("--dry-run", action="store_true", help="强制 dry-run，不真实发送")
     parser.add_argument("--stats", action="store_true", help="打印统计")
+    parser.add_argument("--reconcile", action="store_true",
+                        help="漏转对账：拿钉钉 PC 本地库核对桥有没有漏消息")
+    parser.add_argument("--clean-db", action="store_true",
+                        help="清理消息数据库里超出保留期的历史数据并压缩")
+    parser.add_argument("--keep-days", type=int, metavar="N",
+                        help="配合 --clean-db：保留多少天（默认取 storage.keep_days）")
+    parser.add_argument("--preview", action="store_true",
+                        help="配合 --clean-db：只预览会删什么，不动数据")
     parser.add_argument("--export", metavar="CSV", help="导出消息到 CSV")
     parser.add_argument("--notify-test", action="store_true",
                         help="给钉钉机器人发一条测试消息")
@@ -254,6 +262,57 @@ def main() -> int:
         svc = BridgeService(cfg)
         print(svc.storage.stats())
         svc.close()
+        return 0
+
+    if args.reconcile:
+        # 只读能力：不启动采集、不碰微信，单独跑一轮对账并打印结论。
+        from bridge.reconcile import describe
+        rc = getattr(cfg, "reconcile", None)
+        if not rc or not getattr(rc, "enabled", False):
+            print("漏转对账未启用。请在「设置中心 → 钉钉通知」勾上「漏转对账」，"
+                  "或把 config.yaml 的 reconcile.enabled 改成 true。")
+            return 1
+        svc = BridgeService(cfg)
+        try:
+            result = svc.reconcile_once(force=True)
+        finally:
+            svc.close()
+        print(describe(result))
+        return 0 if result.ok else 1
+
+    if args.clean_db:
+        # 只动数据库，不需要构造 BridgeService（也就不必碰微信/钉钉）。
+        from bridge import dbclean
+        dbp = cfg.resolve(cfg.storage.db_path)
+        keep = args.keep_days if args.keep_days is not None else int(cfg.storage.keep_days)
+        try:
+            plan = dbclean.scan(dbp, keep)
+        except ValueError as exc:
+            print(f"保留期不对：{exc}")
+            return 1
+        if plan.error:
+            print(f"读取失败：{plan.error}")
+            return 1
+        print(f"数据库：{dbp}")
+        print("\n".join(dbclean.summary_lines(plan)))
+        if plan.nothing_to_do:
+            print("没有需要清理的数据。")
+            return 0
+        if args.preview:
+            print("\n（--preview：只预览，没有删除任何数据）")
+            return 0
+        res = dbclean.execute(plan)
+        if res.error:
+            print(f"清理失败：{res.error}")
+            return 1
+        print(f"\n已删除 {res.deleted_messages} 条消息、"
+              f"{res.deleted_deliveries} 条投递记录。")
+        if res.vacuumed:
+            print(f"数据库已压缩：{dbclean.human_size(res.before_bytes)} → "
+                  f"{dbclean.human_size(res.after_bytes)}"
+                  f"（释放 {dbclean.human_size(res.freed)}）")
+        else:
+            print(f"目前释放 {dbclean.human_size(res.freed)}。{res.note}")
         return 0
 
     if args.notify_test or args.notify_report or args.notify_say:
@@ -353,6 +412,8 @@ def main() -> int:
                 problems.append(f"采集端构建失败：{type(exc).__name__}: {exc}")
             print(f"  dry-run  : {cfg.wechat.dry_run}")
             print(f"  钉钉通知 : {svc.notify_status()}")
+            from bridge.reconcile import env_hint
+            print(f"  漏转对账 : {env_hint()}")
             print(f"  转发目标 : {cfg.routes[0].targets if cfg.routes else []}")
             if problems:
                 print()
@@ -382,6 +443,7 @@ def main() -> int:
                 print(f"  钉钉通知：{svc.notify_status()}")
             # 通知与巡检只在正式运行时挂上：自检/预览这类短命令没必要打扰群
             svc.start_watchdog()
+            svc.start_reconcile()
             svc.announce_start(repr(source))
             try:
                 # 第二个回调是附件转发：手机抓回的 Excel → 表格图 → 微信。

@@ -40,7 +40,7 @@ APP_NAME = "喵喵钉钉-微信消息转发桥"
 #   bridge/__init__.py 里的 __version__。手工单独跑 setup_gui.py 调试时
 #   才会用到这里的值 —— 改了记得跟 bridge/__init__.py 对齐。
 #   格式必须是「0.xx」，与主程序底部的版本号一致。
-VERSION = "0.59"
+VERSION = "0.60"
 PUBLISHER = "杭州喵喵至家网络有限公司"
 WEBSITE = "www.hbdxm.com"
 COPYRIGHT = f"杭州喵喵至家网络有限公司　{WEBSITE}"
@@ -1044,6 +1044,7 @@ class Wizard(tk.Tk):
             self._env_log("离线依赖安装失败。", "err")
             return None
         self._env_wgc(py, wheels_dir)
+        self._env_pycryptodome(py, wheels_dir)
         return py
 
     def _env_wgc(self, py: Path, wheels_dir: Path | None = None) -> None:
@@ -1067,6 +1068,27 @@ class Wizard(tk.Tk):
         code, _ = self._run_logged(args)
         if code != 0:
             self._env_log("WGC 抓帧组件未装（会回落到截图模式，不影响投递）", "dim")
+
+    def _env_pycryptodome(self, py: Path, wheels_dir: Path | None = None) -> None:
+        """单独安装 pycryptodome（钉钉 PC 本地库解密，供「漏转对账」用）。
+
+        为什么不写进 requirements.txt：对账是**旁路可选能力** —— 缺了它转发
+        主流程一点不受影响（对账器自己会停用，日志里说一句原因）。而
+        requirements 里任何一项装失败会让整个环境配置失败，用户连程序都装不上。
+        所以这里 ``--no-deps`` 单独装，失败只降级。
+
+        版本要跟 ``installer/_vendor/wheels`` 里那个 wheel 一致（cp39-abi3，
+        Python 3.9+ 通吃），别手动改 requirements 去带它。
+        """
+        args = [py, "-m", "pip", "install", "--no-warn-script-location",
+                "--no-deps", "pycryptodome"]
+        if wheels_dir is not None:
+            args[4:4] = ["--no-index", "--find-links", str(wheels_dir)]
+        else:
+            args[4:4] = ["-i", PYPI_MIRRORS[0]]
+        code, _ = self._run_logged(args)
+        if code != 0:
+            self._env_log("钉钉库解密组件未装（漏转对账不可用，转发不受影响）", "dim")
 
     def _env_finish(self, vpy: Path):
         """收尾：OCR 预热（尽力）→ 自检 → 写解释器缓存 → 完成页。"""
@@ -1203,6 +1225,7 @@ class Wizard(tk.Tk):
                 return
 
             self._env_wgc(vpy)          # WGC 抓帧组件（--no-deps，见方法注释）
+            self._env_pycryptodome(vpy)  # 钉钉库解密（--no-deps，可选）
             self._env_finish(vpy)
         except Exception as exc:
             _dbg("env-worker CRASH:\n" + traceback.format_exc())

@@ -28,3 +28,10 @@ tenacity>=8.2.0
 #   判依赖 → 离线安装直接 «No matching distribution found»。
 #   安装器里用 `pip install --no-deps windows-capture` 单独装
 #   （见 installer/setup_gui.py 的 `_env_wgc`）。
+
+# 漏转对账（可选）：解密钉钉 PC 本地库，拿真实时间戳核对微信侧有没有漏消息。
+# ⚠ 同样**故意不写在这里**：它只是旁路诊断能力，缺了主流程一点不受影响
+#   （对账器会自己停用，日志写清原因）；而本文件里任何一项装失败会让整个
+#   环境配置失败、用户连程序都装不上。安装器用 `--no-deps` 单独装
+#   （见 installer/setup_gui.py 的 `_env_pycryptodome`）。
+#   源码环境想跑对账就手动：pip install pycryptodome
