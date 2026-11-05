@@ -3,7 +3,7 @@
 为什么单独一个模块
     界面逻辑集中在这里，「设置能改什么」一眼可见：
         转发规则   —— 哪个钉钉群 → 哪个（哪些）微信群，可自由增删
-        时间范围   —— 不限 / 仅当天 / 只在指定时段
+        时间范围   —— 不限 / 仅当天 / 只在指定时段、多久以前的旧消息不再转发
         采集与投递 —— 轮询间隔、发送间隔、试运行、两道防护
         消息格式   —— 转发文案模板（带实时预览）
         钉钉通知   —— 故障告警与运行报告（自定义机器人 webhook）
@@ -164,6 +164,46 @@ def watch_minutes(label: str) -> int:
         if v == label:
             return k
     return 0
+
+
+# ---------------------------------------------------------------- 积压超龄档位
+#
+# 「源消息时间超过 N 分钟就不转发」的阈值。默认 30（2026-11-01 用户要求），
+# 和 bridge/service.MAX_BACKLOG_MIN 一致；0 = 关闭闸门。给的是档位而不是
+# 自由填：这个数字决定「断线恢复后会有多少历史涌进业务群」，填 7 这种值
+# 在现场根本无法验证它对不对。
+
+BACKLOG_CHOICES = (0, 10, 15, 30, 60, 120)
+BACKLOG_LABELS = {0: "不限制（关闭）", 10: "10 分钟", 15: "15 分钟",
+                  30: "30 分钟", 60: "1 小时", 120: "2 小时"}
+DEFAULT_BACKLOG_MIN = 30
+
+
+def _backlog_label(minutes) -> str:
+    """配置里的分钟数 → 下拉框文字。非标准值原样显示，绝不悄悄改档。"""
+    try:
+        v = float(minutes)
+    except (TypeError, ValueError):
+        return BACKLOG_LABELS[DEFAULT_BACKLOG_MIN]
+    if v <= 0:
+        return BACKLOG_LABELS[0]
+    if float(int(v)) == v and int(v) in BACKLOG_LABELS:
+        return BACKLOG_LABELS[int(v)]
+    return f"{v:g} 分钟"
+
+
+def backlog_minutes(label: str) -> float:
+    """下拉框文字 → 分钟数。认不出按默认 30（闸门不能因为选了个怪值就失效）。"""
+    for k, v in BACKLOG_LABELS.items():
+        if v == label:
+            return float(k)
+    m = re.match(r"^([\d.]+)\s*分钟$", (label or "").strip())
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    return float(DEFAULT_BACKLOG_MIN)
 
 
 # ---------------------------------------------------------------- 附件触发字眼
@@ -397,6 +437,31 @@ class SettingsDialog:
         _tip(win_box, "格式 HH:MM，支持跨零点（22:00-06:00 = 夜里转、白天不转）。\n"
                       "注意：钉钉对「最新几条消息」不显示时间戳，这类消息按【当前时刻】判定，"
                       "所以这个设置的实际效果是「只在上班时段转发」。",
+             bg=CARD).pack(fill="x", padx=14, pady=(0, 12))
+
+        # ---- 积压超龄：旧消息只入库、不投递 ----
+        # 2026-11-05 用户要求做成可调：手机断线/卡住再恢复时，屏上能看见的
+        # 历史会被一起补上来，一口气全发出去就是往业务群刷旧闻。
+        w = self.cfg.get("wechat") or {}
+        cur = _backlog_label(w.get("max_backlog_min", DEFAULT_BACKLOG_MIN))
+        self.st["backlog"] = tk.StringVar(value=cur)
+        old_box = _card(page, "多久以前的消息不再转发（按钉钉消息头顶的时间条判）")
+        old_box.pack(fill="x", padx=12, pady=(0, 8))
+        line = tk.Frame(old_box, bg=CARD)
+        line.pack(fill="x", padx=14, pady=10)
+        tk.Label(line, text="源消息时间比现在早", bg=CARD, fg=TEXT,
+                 font=F_UI).pack(side="left")
+        values = [BACKLOG_LABELS[k] for k in BACKLOG_CHOICES]
+        if cur not in values:
+            values.append(cur)
+        ttk.Combobox(line, textvariable=self.st["backlog"], state="readonly",
+                     width=14, font=F_UI, values=values).pack(side="left", padx=8)
+        tk.Label(line, text="→ 只入库留档，不发微信群", bg=CARD, fg=MUTED,
+                 font=F_SMALL).pack(side="left")
+        _tip(old_box,
+             "屏幕上写着「昨天 20:01」「星期三 09:15」的卡片，过多久翻到都不会发出去 —— "
+             "只入库，事后能用 tools/forward_recent.py 人工补发（它不受此限）。\n"
+             "选「不限制」= 关掉这道闸门：手机断线一段时间再恢复时，屏上十几条历史会一次性刷进业务群。",
              bg=CARD).pack(fill="x", padx=14, pady=(0, 12))
 
         self._sync_window_state()
@@ -1046,6 +1111,7 @@ class SettingsDialog:
                                    "时段要写成 HH:MM-HH:MM，例如 08:00-18:00 或 22:00-06:00。",
                                    parent=self.win)
             return
+        backlog_min = backlog_minutes(str(self.st["backlog"].get()))
         try:
             interval = max(1.0, float(self.st["interval"].get()))
             poll = max(3.0, float(self.st["poll"].get()))
@@ -1224,6 +1290,10 @@ class SettingsDialog:
         S("wechat", "show_hotkey", hotkey, after="wxauto_path")
         S("wechat", "table_image", bool(self.st["table_image"].get()),
           after="show_hotkey")
+        # 积压超龄阈值（分钟），0 = 关闭。写成整数更好读，非整数才带小数。
+        S("wechat", "max_backlog_min",
+          int(backlog_min) if float(backlog_min).is_integer() else backlog_min,
+          after="table_image")
 
         # ---- 钉钉通知 ----
         S("notify", "enabled", n_enabled)

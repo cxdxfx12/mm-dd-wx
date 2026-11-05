@@ -282,11 +282,14 @@ class BridgeService:
         # 积压超龄不转发：手机卡住一段时间后恢复，屏上能看见的历史会被一起
         # 补上来，一口气全发出去等于往业务群刷旧闻（用户 2026-11-01 要求）。
         # force（人工补发）不受限 —— 那时候"发旧消息"正是用户要的。
+        # 阈值可在「设置中心 → 时间范围」里改（wechat.max_backlog_min），
+        # 0 = 关闭这条闸门。
+        limit = self.backlog_limit()
         age_min = self._backlog_minutes(msg)
-        if not force and age_min > MAX_BACKLOG_MIN:
+        if not force and limit > 0 and age_min > limit:
             self.counter["filtered"] += 1
             log.info("积压超龄不转发（源消息 %s，已 %.0f 分钟，上限 %.0f）：%s",
-                     msg.time_text or "时间未知", age_min, MAX_BACKLOG_MIN,
+                     msg.time_text or "时间未知", age_min, limit,
                      (msg.content or "").replace("\n", " ")[:40])
             return True
 
@@ -457,6 +460,22 @@ class BridgeService:
         except (TypeError, ValueError):
             return 0.0
         return delta if delta > 0 else 0.0
+
+    def backlog_limit(self) -> float:
+        """「积压超龄不转发」的阈值（分钟）；0 或负数 = 关闭这条闸门。
+
+        取自 ``wechat.max_backlog_min``（设置中心 → 时间范围可改）。配置缺失、
+        写错、写成 ``None`` 一律回落到 :data:`MAX_BACKLOG_MIN` —— 闸门是保护
+        业务群不被历史刷屏的，不能因为一个配置项没写完就静默失效。
+        """
+        raw = getattr(self.cfg.wechat, "max_backlog_min", MAX_BACKLOG_MIN)
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            log.warning("max_backlog_min=%r 不是数字，按默认 %.0f 分钟处理",
+                        raw, MAX_BACKLOG_MIN)
+            return MAX_BACKLOG_MIN
+        return max(0.0, val)
 
     def _attach_redirect_on(self) -> bool:
         """附件改投文件助手现在生效吗（看 ``attach_target_until``）。

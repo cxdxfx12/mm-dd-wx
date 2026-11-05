@@ -90,6 +90,10 @@ class WeChatConfig:
     # 形态的表格行画成 PNG、在文字消息之后补发一张图。文字照常发，图片
     # 失败不影响文字（见 service.handle）。关掉就完全回到纯文字。
     table_image: bool = True
+    # 「积压超龄不转发」的阈值（分钟）。源消息时间距现在超过它 → 只入库留档、
+    # 不投微信（详见 service.MAX_BACKLOG_MIN 与 BridgeService._backlog_minutes）。
+    # 0 = 关闭这条闸门（不建议：手机断线恢复时会把一屏历史一次性刷进业务群）。
+    max_backlog_min: float = 30.0
     # 附件（原文件）专用的微信目标 + 它的**有效截止时间**。平时两个都留空 ——
     # 留空就是「附件跟正文一样发业务群」，这是日常行为，别动。
     #
