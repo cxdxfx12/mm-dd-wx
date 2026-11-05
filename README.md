@@ -213,6 +213,33 @@ onnx）是首次运行时联网下载的；安装向导装完依赖后会**预�
 之后离线可用。升级引擎后的第一次启动，请让钉钉停在目标群并滚回底部 ——
 模型变了同一条消息的文本指纹可能变化，贴底建好基线可避免旧消息被重复补发。
 
+### 为什么没接视觉大模型（VLM）—— 2026-11-05 实测否掉了
+
+社区常见的做法是「截图丢给多模态模型（Qwen-VL 之类）直接吐 JSON」（如
+`dd-to-wx`）。看着能一步替掉 OCR + 规则，实测**不成立**，结论存档以免
+以后重复评估：
+
+1. **文件名不在屏幕上，模型也读不出来。** 互动卡片里附件只是一行「下载附件」
+   蓝字；把那一屏的节点树整棵树搜 `xlsx|xls|pdf|zip|docx`，0 命中。真正可靠
+   的名字来自手机端下载后的 `file.getName()`（`AttachmentFetcher` 已在用），
+   比任何识别都准。想修「附件名错乱」不该往识别上加，该往「别猜、用真名字」
+   上改。
+2. **视口截断不是模型能救的。** 卡片宽度受限，表格右侧被硬裁掉（「承」列只
+   剩半个字），云端模型看到的和本地 OCR 是同一份残缺画面。
+3. **表格还原本地已经够用。** `android_parse._inline_table` 按 x 坐标还原后输出
+   `列名: 值 ｜ 列名: 值`，再由 `table_image` 画成图片；内容不缺，只是列名重复，
+   属于排版问题，加一层云端调用换不来相应收益。
+
+代价侧也不合适：单张 5~15 秒、依赖公网、运单号/营业部信息要出境。本机 GPU
+（GT 1030 2GB）也跑不动本地 7B 视觉模型。
+
+留了 `tools/probe_vlm.py` 当排障工具：任何 OpenAI 兼容的视觉端点（ModelScope /
+阿里云百炼）都能直接喂一张截图看结构化结果，**但不进主链路**。
+
+> 顺带记一笔平台现状：ModelScope 的 API-Inference 在 2026-11 对普通账号已
+> 不可用 —— token 能通过鉴权（`/models` 返回 38 个模型），但任何推理都返回
+> `Model id: X, has no provider supported`，绑定阿里云账号后依旧。
+
 ## 目录结构
 
 ```
@@ -250,6 +277,7 @@ ddwx-bridge/
 │   ├── test_wechat4.py          微信投递端验证（默认只读）
 │   ├── probe_dingtalk_ui.py     钉钉控件树探针（判断 UI 路线是否可行）
 │   ├── probe_dingtalk_db.py     钉钉 PC 本地库解密 + WAL 合并探针（查群/查附件，只读）
+│   ├── probe_vlm.py             视觉大模型识别探针（排障用，不入主链路）
 │   ├── probe_dingtalk_capture.py  截图方式探针（PrintWindow / 位图 / 屏幕）
 │   ├── probe_dingtalk_scrollbar.py  消息区滚动条探针（贴底判定的依据）
 │   ├── probe_scroll_scale.py    实测「滚动条数值 == 像素位移」（Δ 公式验证）
@@ -346,6 +374,32 @@ python run.py --clean-db --keep-days 180    # 临时改用 180 天
 
 服务正在跑时 VACUUM 拿不到排他锁：数据照删、空间下次再收，界面会如实提示
 「没回收，停掉转发再点一次」。
+
+## 现场取证：把「手机当时那一屏」原样存下来
+
+怀疑漏转/识别错时，光看日志不够 —— 要能拿出「那一刻屏幕上到底是什么」。
+手机连着 USB 就能存两样东西，而且**用的是同一帧**，可以直接 A/B：
+
+```bash
+# Git Bash 下必须关掉路径转换，否则 /sdcard 会被改写成 Windows 路径
+export MSYS_NO_PATHCONV=1
+A=tools/scrcpy-win64-v5.0.1/adb.exe
+$A exec-out screencap -p > shot.png        # 画面
+$A shell uiautomator dump /sdcard/w.xml && $A pull /sdcard/w.xml screen.xml   # 节点树
+```
+
+`screen.xml` 与手机端 POST 的 `/screen` 是同一格式，可以直接喂给解析器看
+我们算出了什么：
+
+```python
+from bridge.sources import android_parse as P
+f = P.parse_frame(open("screen.xml", encoding="utf-8").read())
+print(f.page, f.title, len(f.units), f.hints)
+for u in f.units: print(u.ts, u.sender, u.content)
+```
+
+⚠ `screencap` 抓的是**整屏**（含状态栏、其他 App），和采集端只取钉钉窗口
+不是一回事，别拿它当投递素材，只用来判读。
 
 ## 验证微信投递端（默认只读，零副作用）
 
@@ -485,6 +539,7 @@ python run.py --live                     # 6. 正式运行
 | `python tools/probe_dingtalk_scrollbar.py` | 看消息区滚动条数值与「贴底」状态 |
 | `python tools/probe_anchor_stability.py` | 逐帧统计锚点存活/指纹抖动（定位漏转） |
 | `python tools/probe_scroll_scale.py` | 实测「滚动条数值 == 像素位移」（验证 Δ 公式） |
+| `python tools/probe_vlm.py --image x.png` | 把一张截图交视觉大模型看结构化结果（排障，需 token） |
 | `python run.py --export out.csv` | 导出消息为 CSV（UTF-8-BOM，Excel 可直接打开） |
 | `python run.py --notify-test` | 发一条钉钉测试消息，验证 webhook / 关键词 / 加签（多机器人会逐个发） |
 | `python run.py --notify-report` | 把累计统计发到钉钉群 |

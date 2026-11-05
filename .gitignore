@@ -71,3 +71,6 @@ tools/scrcpy-win64-v5.0.1/
 
 # 安装包离线组件（运行时 + wheel，体积大，不入库；installer/fetch_vendor.py 可重拉）
 installer/_vendor/
+
+# VLM 验证用的临时截图/节点树（含群消息内容，不入库）
+.tmp_vlm/
