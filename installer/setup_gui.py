@@ -40,7 +40,7 @@ APP_NAME = "喵喵钉钉-微信消息转发桥"
 #   bridge/__init__.py 里的 __version__。手工单独跑 setup_gui.py 调试时
 #   才会用到这里的值 —— 改了记得跟 bridge/__init__.py 对齐。
 #   格式必须是「0.xx」，与主程序底部的版本号一致。
-VERSION = "0.60"
+VERSION = "0.61"
 PUBLISHER = "杭州喵喵至家网络有限公司"
 WEBSITE = "www.hbdxm.com"
 COPYRIGHT = f"杭州喵喵至家网络有限公司　{WEBSITE}"
@@ -748,6 +748,32 @@ class Wizard(tk.Tk):
             pass
         return None
 
+    def _ensure_optional(self, py: Path) -> None:
+        """给「复用的老环境」补装新增的可选组件（失败只降级，不阻塞）。
+
+        `_find_existing_worker` 只认 `paths.WORKER_MODULES`（主流程必需项），
+        于是从旧版升级上来时，新版本才引入的可选组件一个都补不上 ——
+        0.60 实测踩过：复用 0.59 的 runtime 后 pycryptodome 没进环境，
+        「漏转对账」静默降级成「不可用」，而安装日志看着一切成功。
+        这里按需补装，优先用随包离线 wheel，没有才联网。
+        """
+        try:
+            sys.path.insert(0, str(self.install_dir / "app"))
+            import paths                                # noqa: E402
+            _ok, missing = paths.missing_modules(
+                str(py), ("Crypto", "windows_capture"))
+        except Exception:
+            return
+        if not missing:
+            return
+        self._ui(self._log, f"补齐可选组件：{'、'.join(missing)}", "dim")
+        bundle = self._vendor_bundle()
+        wheels = bundle[1] if bundle else None
+        if "Crypto" in missing:
+            self._env_pycryptodome(py, wheels)
+        if "windows_capture" in missing:
+            self._env_wgc(py, wheels)
+
     def _step_env(self):
         self._ui(self._set_step, "正在检测运行环境…", 92)
         existing = self._find_existing_worker()
@@ -757,6 +783,7 @@ class Wizard(tk.Tk):
             self._log("运行环境完整，可以开始使用。", "ok")
         if existing:
             self.env_missing = False
+            self._ensure_optional(existing)   # 复用的老环境可能缺新增组件
             self._ui(report_ok)
             self._ui(self._set_step, "环境检测通过", 100)
             self.after(600, lambda: self._show("finish"))
@@ -835,6 +862,10 @@ class Wizard(tk.Tk):
         color = {"n": "#1c2333", "ok": "#0f9d58", "err": "#e5484d",
                  "dim": "#8b93a8"}[tag]
         _dbg(f"env[{tag}] {msg}")          # 先落文件，再走界面调度
+        if getattr(self, "env_log", None) is None:
+            # 复用老环境时根本没建环境页，补装组件的日志只能落到主日志上
+            self._ui(self._log, msg, tag)
+            return
 
         def go():
             self.env_log.configure(state="normal")

@@ -60,9 +60,13 @@ def main() -> int:
             return 1
 
     print("下载依赖 wheel（几分钟，onnxruntime/opencv 体积较大）…")
+    # pycryptodome / windows-capture 不写在 requirements.txt 里（装失败会拖垮
+    # 主环境，见 setup_gui 的 _env_pycryptodome / _env_wgc），但安装器要用
+    # 离线 wheel 单独装，所以这里必须显式一起拉。
     r = subprocess.run([
         sys.executable, "-m", "pip", "download",
         "-r", str(ROOT / "requirements.txt"), "pip",
+        "pycryptodome", "windows-capture",
         "-d", str(WHEELS), "--only-binary=:all:", "-i", PIP_INDEX,
     ])
     if r.returncode != 0:
