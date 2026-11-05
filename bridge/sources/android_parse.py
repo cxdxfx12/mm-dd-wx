@@ -68,19 +68,32 @@ _TS_ABS_RE = re.compile(r"^(今天|昨天|前天|大前天)\s*(\d{1,2}):(\d{2})$
 _TS_DAY_OFFSET = {"今天": 0, "昨天": 1, "前天": 2, "大前天": 3}
 
 
+def ts_to_datetime(ts: str, now: datetime | None = None) -> datetime | None:
+    """时间条文本 → 绝对时刻；读不出绝对时刻返回 ``None``。
+
+    「今天 17:57」→ 今天的 17:57；「昨天 20:01」→ 昨天 20:01。
+    裸「今天」「星期一」「10-16」这类没有时刻的返回 ``None`` —— 调用方要退回
+    「按本机时间处理」，不能自己编一个 00:00 出来（那会把今天的消息判成超龄）。
+    """
+    m = _TS_ABS_RE.match((ts or "").strip())
+    if not m:
+        return None
+    now = now or datetime.now()
+    return (now - timedelta(days=_TS_DAY_OFFSET[m.group(1)])).replace(
+        hour=int(m.group(2)), minute=int(m.group(3)),
+        second=0, microsecond=0)
+
+
 def unit_age_seconds(ts: str, now: datetime | None = None) -> float | None:
     """时间条文本 → 距 ``now`` 的秒数；读不出绝对时刻返回 ``None``。
 
     「今天 17:57」→ 秒龄；「星期一」「10-16」「今天」（裸的）→ None。
     手机时钟偶尔比电脑快几十秒，负数按 0 处理（刚到的新消息不该被当旧）。
     """
-    m = _TS_ABS_RE.match((ts or "").strip())
-    if not m:
+    base = ts_to_datetime(ts, now)
+    if base is None:
         return None
     now = now or datetime.now()
-    base = (now - timedelta(days=_TS_DAY_OFFSET[m.group(1)])).replace(
-        hour=int(m.group(2)), minute=int(m.group(3)),
-        second=0, microsecond=0)
     return max(0.0, (now - base).total_seconds())
 
 # 非文本消息的占位描述（图片/文件这类只有 content-desc，没有正文）。
@@ -1693,6 +1706,13 @@ def units_to_messages(units: list[Unit], *, chat_name: str,
 
     ``raw_id`` 用 ``{指纹}:{同批内第几次}``，与网关 ``/messages`` 那条路径同一
     口径：同一条消息重传会得到同一个 uid，被下游 ``is_duplicate`` 挡掉。
+
+    时间：``msg_time`` 取**消息头顶那条时间条**（「今天 11:52」「昨天 20:01」），
+    不再一律填 ``now``。这不是为了展示好看 —— ``BridgeService.handle`` 里那条
+    「源消息超过 30 分钟不投递」的闸门就是看 ``msg_time``：填 ``now`` 等于把
+    闸门焊死（2026-11-05 现场：翻历史/重建基线时把昨天的卡片转进了业务群，
+    日志里连一条「积压超龄」都没有）。时间条读不出绝对时刻才退回 ``now``
+    —— 宁可多发一条，也不因为时间条格式变化把当下的消息全吃掉。
     """
     now = now or datetime.now()
     companies = list(companies or [])
@@ -1710,7 +1730,7 @@ def units_to_messages(units: list[Unit], *, chat_name: str,
             content=unit.content,
             msg_type=unit.kind if unit.kind in ("text", "image", "file", "voice",
                                                 "link") else "unknown",
-            msg_time=now,
+            msg_time=ts_to_datetime(getattr(unit, "ts", ""), now) or now,
             raw_id=f"{fp}:{seq}",
             no_forward=getattr(unit, "baseline_only", False),
         ))
