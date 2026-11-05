@@ -77,7 +77,7 @@ def pick_token(args) -> tuple[str, str]:
 
 
 def call_vl(token: str, base_url: str, model: str, image_path: str,
-            timeout: float) -> str:
+            timeout: float, prompt: str = PROMPT) -> str:
     b64 = base64.b64encode(open(image_path, "rb").read()).decode()
     ext = os.path.splitext(image_path)[1].lstrip(".").lower() or "png"
     body = {
@@ -88,7 +88,7 @@ def call_vl(token: str, base_url: str, model: str, image_path: str,
             {"role": "user", "content": [
                 {"type": "image_url", "image_url":
                  {"url": f"data:image/{ext};base64,{b64}"}},
-                {"type": "text", "text": PROMPT},
+                {"type": "text", "text": prompt},
             ]},
         ],
     }
@@ -110,6 +110,8 @@ def main() -> int:
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--timeout", type=float, default=90.0)
     ap.add_argument("--raw", action="store_true", help="只打印原始返回")
+    ap.add_argument("--ask", help="覆盖默认 prompt（直接问一句话更省事，"
+                                  "例如「聊天气泡最后一条是什么」）")
     args = ap.parse_args()
 
     token, base_url = pick_token(args)
@@ -121,7 +123,8 @@ def main() -> int:
           f"({os.path.getsize(args.image) / 1024:.0f} KB)，上传中…")
     t0 = time.time()
     try:
-        text = call_vl(token, base_url, args.model, args.image, args.timeout)
+        text = call_vl(token, base_url, args.model, args.image, args.timeout,
+                       args.ask or PROMPT)
     except urllib.error.HTTPError as e:
         print(f"HTTP {e.code}: {e.read().decode(errors='replace')[:500]}",
               file=sys.stderr)
