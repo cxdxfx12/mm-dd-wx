@@ -284,11 +284,16 @@ ddwx-bridge/
 python tools/probe_dingtalk_db.py --status                  # UID/WAL 滞后/总量
 python tools/probe_dingtalk_db.py --list 20 --grep 申通       # 找群
 python tools/probe_dingtalk_db.py --cid 77521050361 --files  # 看某群的文件消息
+# 漏转对账：钉钉库为准，列出桥没入库的卡片
+python tools/probe_dingtalk_db.py --cid 79617007357 --reconcile 数字质控 --hours 12
 ```
 
+只覆盖本机登录的钉钉账号。**2950 互动卡片在库里只留标题 + 精确时间戳，
+正文/表格/附件不落盘**（实测 3 个正文短语全库 0 命中），所以它不能替代
+手机采集，只能当「哪条该转、转了没有」的对账基准。
+
 依赖 `pycryptodome`（只在跑这个探针时需要，不进 `requirements.txt`、
-不随安装包分发）。它是诊断工具：能确认「某条消息/附件到底有没有到本机」，
-但只覆盖**本机登录的那个钉钉账号**，与手机端采集到的群不是同一套数据。
+不随安装包分发）。
 
 ## 验证微信投递端（默认只读，零副作用）
 

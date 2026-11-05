@@ -31,6 +31,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import struct
@@ -395,6 +396,111 @@ def show_messages(conn, cid: str, limit: int, only_files: bool) -> None:
             break
 
 
+def default_bridge_db() -> Path:
+    """桥的 bridge.db：优先安装目录，其次仓库里的 data/。"""
+    candidates = [
+        Path(r"C:\Program Files\喵喵钉钉-微信消息转发桥\data\bridge.db"),
+        Path(__file__).resolve().parent.parent / "data" / "bridge.db",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return candidates[0]
+
+
+def card_title(content: str | None) -> str:
+    """2950 互动卡片只在 extension 里留标题，正文/表格由客户端渲染，不落库。"""
+    try:
+        data = json.loads(content or "{}")
+        ext = json.loads(data["attachments"][0]["extension"])
+        return ext.get("interactiveCardLastMessage") or ext.get("LastMessageI18n") or ""
+    except Exception:
+        return ""
+
+
+def _load_cards(conn, cid: str, since_ms: int) -> list[tuple[int, str]]:
+    rows: list[tuple[int, str]] = []
+    for t in _tables(conn):
+        try:
+            rows += conn.execute(
+                f'select createdAt, content from "{t}" where cid=? and createdAt>=?',
+                (cid, since_ms)).fetchall()
+        except sqlite3.OperationalError:
+            continue
+    rows.sort(key=lambda r: r[0] or 0)
+    return [(r[0], card_title(r[1])) for r in rows]
+
+
+def _load_forwarded(bridge_db: Path, chat_kw: str, since: float) -> list[tuple[float, str, str]]:
+    """桥侧已入库的消息：msg_time 字符串是本地时间（可能被取整到分钟）。"""
+    conn = sqlite3.connect(f"file:{bridge_db}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "select msg_time, msg_type, content from messages where chat_name like ?",
+            (f"%{chat_kw}%",)).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for stamp, kind, content in rows:
+        try:
+            ts = time.mktime(time.strptime(str(stamp)[:19], "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            continue
+        if ts >= since:
+            out.append((ts, kind or "", (content or "").replace("\n", " ")))
+    return out
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[\s@#*【】\[\]（）()，。,.：:！!～~\-]", "", text or "")
+
+
+def show_reconcile(conn, cid: str, bridge_db: Path, chat_kw: str, hours: float,
+                   tolerance: float = 1800.0) -> None:
+    """钉钉库为准，检查桥有没有漏转。
+
+    两道判据，都不完美，所以只输出「疑似」供人眼确认：
+      1. 标题优先——卡片标题常原样出现在桥的正文里（``拦截任务风险提醒-中心未到件``），
+         这条不受时间错位影响；
+      2. 时间兜底——OCR 时间条只到分钟、再叠加重试延迟，实测同一张卡片能差
+         十几分钟，所以容差给到 tolerance 秒。
+    桥把一张卡片拆成正文/表格图/附件多条属正常，反向的「多」只报个数不列明细。
+    """
+    since = time.time() - hours * 3600
+    cards = _load_cards(conn, cid, int(since * 1000))
+    forwarded = _load_forwarded(bridge_db, chat_kw, since - tolerance)
+    print(f"  窗口内钉钉卡片 {len(cards)} 条 / 桥已入库 {len(forwarded)} 条")
+
+    used = [False] * len(forwarded)
+    missing = []
+    for ts, title in cards:
+        sec = ts / 1000
+        needle = _norm(title)
+        hit = None
+        if len(needle) >= 5:
+            for i, (_fts, _kind, content) in enumerate(forwarded):
+                if not used[i] and needle in _norm(content):
+                    hit = i
+                    break
+        if hit is None:
+            near = [(abs(f[0] - sec), i) for i, f in enumerate(forwarded)
+                    if not used[i] and abs(f[0] - sec) <= tolerance]
+            if near:
+                hit = min(near)[1]
+        if hit is None:
+            missing.append((ts, title))
+        else:
+            used[hit] = True
+
+    print(f"  桥侧未被认领 {sum(1 for u in used if not u)} 条（多为同一条消息的正文/表格图/附件多段）")
+    if not missing:
+        print("  ✅ 没有疑似漏转")
+        return
+    print(f"  ⚠ 疑似漏转 {len(missing)} 条（标题对不上、且 {tolerance/60:.0f} 分钟内没有可认领记录）：")
+    for ts, title in missing:
+        print(f"    {time.strftime('%m-%d %H:%M:%S', time.localtime(ts / 1000))}  {title or '(无标题)'}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="钉钉 PC 库解密 + WAL 合并探针")
     ap.add_argument("--dir", help="钉钉数据目录（默认自动查找最近活跃的）")
@@ -406,6 +512,10 @@ def main() -> int:
     ap.add_argument("--cid", help="按会话 cid 看消息")
     ap.add_argument("--limit", type=int, default=20, help="消息条数，默认 20")
     ap.add_argument("--files", action="store_true", help="只看带附件的消息")
+    ap.add_argument("--reconcile", metavar="CHAT", help="漏转对账：桥里的群名关键词（配合 --cid）")
+    ap.add_argument("--hours", type=float, default=12, help="对账回看小时数，默认 12")
+    ap.add_argument("--tolerance", type=float, default=30, help="时间兜底容差（分钟），默认 30")
+    ap.add_argument("--bridge-db", help="桥的 bridge.db 路径（默认找安装目录）")
     args = ap.parse_args()
 
     data_dir = Path(args.dir) if args.dir else find_data_dir()
@@ -417,6 +527,18 @@ def main() -> int:
     info = sync(data_dir, Path(args.out))
     conn = sqlite3.connect(str(info["db"]))
     try:
+        if args.reconcile:
+            if not args.cid:
+                print("--reconcile 需要配合 --cid 指定钉钉侧会话")
+                return 1
+            bridge_db = Path(args.bridge_db) if args.bridge_db else default_bridge_db()
+            if not bridge_db.is_file():
+                print(f"找不到 bridge.db：{bridge_db}")
+                return 1
+            print(f"对账: 钉钉 cid={args.cid} ↔ 桥「{args.reconcile}」（近 {args.hours:g} 小时）")
+            show_reconcile(conn, args.cid, bridge_db, args.reconcile, args.hours,
+                           tolerance=args.tolerance * 60)
+            return 0
         if args.list or args.grep:
             show_list(conn, args.list or 30, args.grep)
         if args.cid:
