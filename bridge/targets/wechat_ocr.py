@@ -559,6 +559,13 @@ class WeChatOcrTarget(Target):
         目标群打开了，却被判成「没切过去」，转入 OCR 点结果项继续空转。
         新增截断感知：标题里出现「...」时，取省略号**之前**的名字段，
         与目标（或目标去掉首字——防裁剪切字）做前缀比对。
+
+        2026-11-05 实锤（14:22 起投递连挂半小时）：标题栏 OCR 把左侧的
+        ×（关闭/清除按钮）读成前导「X」——「X 申通五星业务员群 (重...
+        (86)」，截断判据只剥**尾部**残渣，前导 X 让比对从第一个字符就
+        错位，明明已切到目标群却每次都判失败，重试循环空转。head_of
+        因此同时剥**头部**杂字符（x/×/+ 等）；剥掉后即使群名真以 x 开头
+        也不会误判 —— t[1:] 兜底分支会接住。
         """
         import re
 
@@ -569,7 +576,9 @@ class WeChatOcrTarget(Target):
 
         t = norm(target)
         s = norm(title)
-        if not t:
+        # 空标题（OCR 没读到字）不许命中 —— "" 是任何串的子串，原「s in t」
+        # 会误判 True，只靠调用方 opened 标志挡着太悬（2026-11-05 补）。
+        if not t or not s:
             return False
         if t in s or s in t:                     # 完整包含（原有判据）
             return True
@@ -581,13 +590,17 @@ class WeChatOcrTarget(Target):
             * **数字不进杂字符类**：群名本身可能以数字结尾，乱剥会把
               「xx群2」误配成「xx群」；
             * **括号也不进杂字符类**：否则会先剥掉 «(86)» 的右括号，
-              人数规则 `[（(]\d+[)）]$` 就永远匹配不上了（实测踩过）。
+              人数规则 `[（(]\d+[)）]$` 就永远匹配不上了（实测踩过）；
+            * **头部同样要剥**：OCR 把标题栏左侧的 × 读成前导 X（2026-11-05
+              实况）。x 不区分大小写；剥过头（群名真以 x 开头）也没关系，
+              下方 t[1:] 兜底分支会接住。
             """
             prev, h = None, x
             while prev != h:
                 prev = h
                 h = re.sub(r"[（(]\d+[)）]$", "", h)          # 人数 (86)
                 h = re.sub(r"[.。…⋯+·\\|:,，、;；\s-]+$", "", h)
+                h = re.sub(r"^[.。…⋯+·\\|:,，、;；()（）\sxX×✕]+", "", h)
             return h
 
         # 候选 1：显式省略号截断 —— 取第一个「...」前的名字段
@@ -599,9 +612,10 @@ class WeChatOcrTarget(Target):
         cands.append(s)
         for cand in cands:
             head = head_of(cand)
-            # 前缀长度门槛 6 防短串误配；首字被裁剪线切掉时放宽到 t[1:]
-            if len(head) >= 6 and (t.startswith(head)
-                                   or t[1:].startswith(head)):
+            # 前缀长度门槛 6 防短串误配；首字被裁剪线切掉时放宽到 t[1:]，
+            # 群名以双 Latin 字母开头（XX快运…）且头部杂字符一并被剥掉时
+            # 再放宽到 t[2:]（2026-11-05）。
+            if len(head) >= 6 and any(t[k:].startswith(head) for k in (0, 1, 2)):
                 return True
         return False
 

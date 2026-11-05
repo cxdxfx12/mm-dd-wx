@@ -819,8 +819,11 @@ def _deliver_ready(ctx: "_Ctx", msgs: list) -> int:
                  if s == sender and is_same_message(old, msg.content)),
                 None)
         if dup_age is not None:
+            # now 在函数顶取、recent_keys 由 flusher 线程并发插入，极端时序下
+            # 会出现「-115 秒前」这种负数（2026-11-05 实况日志）；判重结论
+            # 不受影响（反正都跳过），只是显示难看，钳到 0。
             log.info("同一卡片换了渲染形态（%.0f 秒前已发过同一条），跳过：%s",
-                     dup_age, msg.content[:40].replace("\n", " "))
+                     max(0.0, dup_age), msg.content[:40].replace("\n", " "))
             with ctx.lock:
                 ctx.count["rejected"] += 1
             continue
