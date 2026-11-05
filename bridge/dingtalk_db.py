@@ -58,7 +58,11 @@ def available() -> tuple[bool, str]:
     try:
         import Crypto.Cipher.AES  # noqa: F401
     except Exception:
-        return False, "缺少 pycryptodome（离线包未附带），钉钉库对账不可用"
+        # 注意：这不是「安装包没带」—— 离线包里一直有 pycryptodome 的 wheel，
+        # 0.60 的真实事故是升级时复用了老运行环境、安装器没补装可选组件，
+        # 于是组件缺了却显示成「离线包未附带」，把排查方向引偏。
+        return False, ("缺少 pycryptodome（运行环境里没装解密组件，"
+                       "重跑安装包会自动补装；源码环境 pip install pycryptodome）")
     if find_data_dir() is None:
         return False, "本机没找到钉钉 PC 客户端的数据目录（未安装或未登录）"
     return True, ""
