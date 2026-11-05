@@ -70,6 +70,29 @@ class TestTsToDatetime(unittest.TestCase):
         for bad in ("", "今天", "星期一", "10-16", "2026-10-16", "昨天"):
             self.assertIsNone(ts_to_datetime(bad, NOW), bad)
 
+    def test_weekday(self):
+        """「星期三 09:15」= 最近一个星期三（NOW 是周四 → 昨天）。"""
+        got = ts_to_datetime("星期三 09:15", NOW)
+        self.assertEqual(got, datetime(2026, 11, 4, 9, 15))
+        self.assertEqual(ts_to_datetime("周三 09:15", NOW), got)
+
+    def test_weekday_today_but_future_means_last_week(self):
+        """同一天但时刻还没到 → 说的是上周那一天，不是今天未来。"""
+        got = ts_to_datetime("星期四 14:00", NOW)      # NOW 是周四 13:30
+        self.assertEqual(got, datetime(2026, 10, 29, 14, 0))
+
+    def test_month_day(self):
+        self.assertEqual(ts_to_datetime("10-16 14:30", NOW),
+                         datetime(2026, 10, 16, 14, 30))
+
+    def test_month_day_in_future_means_last_year(self):
+        self.assertEqual(ts_to_datetime("12-25 08:00", NOW),
+                         datetime(2025, 12, 25, 8, 0))
+
+    def test_full_date(self):
+        self.assertEqual(ts_to_datetime("2026-10-16 14:30", NOW),
+                         datetime(2026, 10, 16, 14, 30))
+
 
 class TestMsgTimeFromTimeBar(unittest.TestCase):
     def test_today_bar_becomes_msg_time(self):
@@ -86,6 +109,14 @@ class TestMsgTimeFromTimeBar(unittest.TestCase):
         """时间条读不出绝对时刻 → 按本机时间，照发（不许把当下消息吃掉）。"""
         m = units_to_messages([unit("刚进来的", "")], chat_name="群", now=NOW)[0]
         self.assertEqual(m.msg_time, NOW)
+
+    def test_top_unit_inherits_the_bar_below(self):
+        """屏幕上最上面那条没有时间条：用下面第一条当**上界**（真实只会更早）。"""
+        msgs = units_to_messages(
+            [unit("顶部那条", ""), unit("下面那条", "昨天 20:01")],
+            chat_name="群", now=NOW)
+        self.assertEqual(msgs[0].msg_time, datetime(2026, 11, 4, 20, 1))
+        self.assertEqual(msgs[1].msg_time, datetime(2026, 11, 4, 20, 1))
 
 
 class TestGateOnScreenPath(unittest.TestCase):
@@ -130,6 +161,19 @@ class TestGateOnScreenPath(unittest.TestCase):
     def test_unreadable_bar_still_forwards(self):
         self._feed("星期一那批", "星期一")
         self.assertEqual(len(self.target.sent), 1)
+
+    def test_weekday_card_is_not_forwarded(self):
+        """「星期三 09:15」这种一周内的旧卡片同样要被拦。"""
+        self._feed("上周的卡片", "星期三 09:15")
+        self.assertEqual(self.target.sent, [])
+
+    def test_scroll_back_top_unit_is_not_forwarded(self):
+        """翻上历史：顶部那条没有时间条，下面那条是昨天的 → 两条都不许发。"""
+        for m in units_to_messages(
+                [unit("更早的一条", ""), unit("昨天的卡片", "昨天 20:01")],
+                chat_name="钉钉群"):
+            self.svc.handle(m)
+        self.assertEqual(self.target.sent, [])
 
 
 if __name__ == "__main__":

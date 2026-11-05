@@ -54,40 +54,86 @@ TARGET_PKG = "com.alibaba.android.rimet"
 # 一条消息」会把「09:12」当消息转发出去 —— 阶段 1 必须按类型过滤掉。
 # 真机上的格式是「今天 08:13」（实测），只有「今天」后面不带时间时才是孤零零的
 # 三个字，所以这里刻意不写成 `今天.*` —— 那会把「今天还有1票…」这种正文也吃掉。
+# 日词/星期/日期后面可以跟也可以不跟 HH:MM：钉钉两周内画「星期三 09:15」、
+# 更早画「10-16 14:30」，前者漏认就会被当成正文发进微信群。
 TIME_ONLY_RE = re.compile(
-    r"^((今天|昨天|前天|大前天)\s*\d{1,2}:\d{2}|"
-    r"(今天|昨天|前天|大前天)|"
-    r"\d{1,2}:\d{2}(:\d{2})?|"
-    r"星期[一二三四五六日天]|"
-    r"\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2})\s*$"
+    r"^((今天|昨天|前天|大前天"
+    r"|(?:星期|周)[一二三四五六日天]"
+    r"|\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2})"
+    r"(\s*\d{1,2}:\d{2})?"
+    r"|\d{1,2}:\d{2}(:\d{2})?)\s*$"
 )
 
-# 「能读出绝对时刻」的时间条：只有「今天/昨天/前天/大前天 HH:MM」。
-# 裸「今天」、星期、日期都没有时刻，解析不出秒龄。
-_TS_ABS_RE = re.compile(r"^(今天|昨天|前天|大前天)\s*(\d{1,2}):(\d{2})$")
+# 「能读出绝对时刻」的时间条。钉钉安卓真机实测到的四种写法：
+#   「今天 11:52」「昨天 20:01」  —— 两天内，带日词
+#   「星期三 09:15」「周三 09:15」 —— 一周内，带星期
+#   「10-16 14:30」「2026-10-16 14:30」 —— 更早，带日期
+# 只带日词/星期/日期、不带 HH:MM 的（裸「今天」「星期三」「10-16」）解析不出
+# 秒龄 —— 那不是消息的时刻，只是分段标记。
+_TS_ABS_RE = re.compile(
+    r"^(今天|昨天|前天|大前天"
+    r"|(?:星期|周)[一二三四五六日天]"
+    r"|\d{1,2}-\d{1,2}|\d{4}-\d{1,2}-\d{1,2})"
+    r"\s*(\d{1,2}):(\d{2})$"
+)
 _TS_DAY_OFFSET = {"今天": 0, "昨天": 1, "前天": 2, "大前天": 3}
+_WEEKDAY_INDEX = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5,
+                  "日": 6, "天": 6}
 
 
 def ts_to_datetime(ts: str, now: datetime | None = None) -> datetime | None:
     """时间条文本 → 绝对时刻；读不出绝对时刻返回 ``None``。
 
-    「今天 17:57」→ 今天的 17:57；「昨天 20:01」→ 昨天 20:01。
-    裸「今天」「星期一」「10-16」这类没有时刻的返回 ``None`` —— 调用方要退回
-    「按本机时间处理」，不能自己编一个 00:00 出来（那会把今天的消息判成超龄）。
+    「今天 17:57」→ 今天的 17:57；「昨天 20:01」→ 昨天 20:01；
+    「星期三 09:15」→ 最近一个星期三的 09:15（今天就是星期三且时刻未到 →
+    上周三）；「10-16 14:30」→ 今年 10 月 16 日（在未来说明是去年的）。
+
+    裸「今天」「星期三」「10-16」这类**没有时刻**的返回 ``None`` —— 消费者
+    要退回「按本机时间处理」，不能自己编一个 00:00（那会把今天的消息判成
+    超龄，等于把正常转发全吃掉）。
     """
-    m = _TS_ABS_RE.match((ts or "").strip())
+    text = (ts or "").strip()
+    m = _TS_ABS_RE.match(text)
     if not m:
         return None
+    day, hh, mm = m.group(1), int(m.group(2)), int(m.group(3))
     now = now or datetime.now()
-    return (now - timedelta(days=_TS_DAY_OFFSET[m.group(1)])).replace(
-        hour=int(m.group(2)), minute=int(m.group(3)),
-        second=0, microsecond=0)
+
+    if day in _TS_DAY_OFFSET:
+        return (now - timedelta(days=_TS_DAY_OFFSET[day])).replace(
+            hour=hh, minute=mm, second=0, microsecond=0)
+
+    if day[0] in ("星", "周"):
+        target = _WEEKDAY_INDEX.get(day[-1])
+        if target is None:
+            return None
+        base = (now - timedelta(days=(now.weekday() - target) % 7)).replace(
+            hour=hh, minute=mm, second=0, microsecond=0)
+        # 同一天但时刻还没到 = 说的是上周的那一天
+        return base - timedelta(days=7) if base > now else base
+
+    parts = day.split("-")
+    try:
+        if len(parts) == 3:
+            year, month, dom = (int(p) for p in parts)
+        else:
+            year, month, dom = now.year, int(parts[0]), int(parts[1])
+        base = datetime(year, month, dom, hh, mm)
+    except (TypeError, ValueError):
+        return None
+    if len(parts) == 2 and base > now:          # 「10-16」读到 10-05 → 去年的
+        try:
+            return base.replace(year=year - 1)
+        except ValueError:
+            return None
+    return base
 
 
 def unit_age_seconds(ts: str, now: datetime | None = None) -> float | None:
     """时间条文本 → 距 ``now`` 的秒数；读不出绝对时刻返回 ``None``。
 
-    「今天 17:57」→ 秒龄；「星期一」「10-16」「今天」（裸的）→ None。
+    「今天 17:57」→ 秒龄；「星期三 09:15」「10-16 14:30」也算得出（见
+    :func:`ts_to_datetime`）；裸「星期一」「10-16」「今天」→ None。
     手机时钟偶尔比电脑快几十秒，负数按 0 处理（刚到的新消息不该被当旧）。
     """
     base = ts_to_datetime(ts, now)
@@ -1713,12 +1759,26 @@ def units_to_messages(units: list[Unit], *, chat_name: str,
     闸门焊死（2026-11-05 现场：翻历史/重建基线时把昨天的卡片转进了业务群，
     日志里连一条「积压超龄」都没有）。时间条读不出绝对时刻才退回 ``now``
     —— 宁可多发一条，也不因为时间条格式变化把当下的消息全吃掉。
+
+    屏幕**最上面**那几条头顶没有时间条（条被滚出视口了）。它们一定比屏幕上
+    第一条时间条**更早**，所以把那一条当上界用：真实时刻只会更老，拿它算出来的
+    年龄只会偏小 —— 连这个偏小的年龄都超龄，就肯定该拦。这是「翻上去看历史」
+    最常见的形态，不补这一段就等于给翻页留了个后门。
     """
     now = now or datetime.now()
     companies = list(companies or [])
+    # 自下而上把「最近的一条时间条」传给上面没有时间条的单元（上界语义）。
+    eff_ts = [getattr(u, "ts", "") or "" for u in units]
+    below = ""
+    for i in range(len(eff_ts) - 1, -1, -1):
+        if eff_ts[i].strip():
+            below = eff_ts[i]
+        elif below:
+            eff_ts[i] = below
+
     seen: dict[str, int] = {}
     out: list[Message] = []
-    for unit in units:
+    for unit, ts in zip(units, eff_ts):
         fp = unit.fp
         seq = seen.get(fp, 0) + 1
         seen[fp] = seq
@@ -1730,7 +1790,7 @@ def units_to_messages(units: list[Unit], *, chat_name: str,
             content=unit.content,
             msg_type=unit.kind if unit.kind in ("text", "image", "file", "voice",
                                                 "link") else "unknown",
-            msg_time=ts_to_datetime(getattr(unit, "ts", ""), now) or now,
+            msg_time=ts_to_datetime(ts, now) or now,
             raw_id=f"{fp}:{seq}",
             no_forward=getattr(unit, "baseline_only", False),
         ))
