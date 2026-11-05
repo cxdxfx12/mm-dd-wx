@@ -201,6 +201,12 @@ _LAYOUT = {
     "send_btn": (0.925, 0.968),
     # 消息区（回读校验用）：右侧面板，不含标题栏
     "message": (0.44, 0.06, 1.00, 0.94),
+    # ⚠ 2026-11-05 实锤（16:24 附件假成功）：message 的 y1=0.94 把**输入框**
+    #   （y≈0.885 起）罩了进去 —— 回车早了、文件芯片晚挂上时，OCR「回读到
+    #   文件名」读到的是输入框里挂着的附件芯片，判成功但文件根本没发出去
+    #   （群里只有「以下为附件：…」的文字，文件卡片没有）。chat 区把 y1 收到
+    #   0.875（输入框上沿之上），只含聊天历史。文件/图片校验一律用 chat。
+    "chat": (0.44, 0.06, 1.00, 0.875),
 }
 
 
@@ -1964,17 +1970,49 @@ class WeChatOcrTarget(Target):
         time.sleep(self.send_delay)
         if not self.verify:
             return SendResult(True, target, "已发送文件（未校验）")
-        return self._verify_file_sent(hwnd, target, path, before)
 
-    def _verify_file_sent(self, hwnd: int, target: str, path: Path,
-                          before) -> SendResult:
-        """文件投递校验。
+        # ---- 校验 + 两级自愈（2026-11-05 16:24 附件假成功事故）----
+        # 事故：回车早了、芯片晚挂上，校验的 OCR 区又把输入框罩进去，
+        # 「回读到文件名」读到的是**输入框里的芯片** → 假成功，文件没出去。
+        # 现在：① 校验只认 chat 区（不含输入框）；② 没确认到就先**补点一次
+        # 发送按钮**（芯片多半还挂在输入框里，补一发就出去了）；③ 再不行
+        # 完整重粘一遍。都不行才如实报失败。
+        ok, how, frame2 = self._verify_file_sent(hwnd, path, before)
+        if ok:
+            return SendResult(True, target, f"已发送文件（{how}）")
+
+        if self._click(hwnd, *_LAYOUT["send_btn"]):
+            time.sleep(1.2)
+            ok, how, _ = self._verify_file_sent(hwnd, path, None)
+            if ok:
+                return SendResult(True, target, f"已发送文件（补点发送，{how}）")
+
+        if self._click(hwnd, *_LAYOUT["input"]):
+            time.sleep(0.2)
+        if self._put_clipboard_files([str(path)]):
+            time.sleep(0.1)
+            self._press(VK_V, ctrl=True)
+            time.sleep(1.2)                    # 第二次给芯片更长的挂载时间
+            if self._click(hwnd, *_LAYOUT["send_btn"]):
+                time.sleep(self.send_delay)
+                ok, how, _ = self._verify_file_sent(hwnd, path, None)
+                if ok:
+                    return SendResult(True, target, f"已发送文件（重粘后 {how}）")
+        return SendResult(False, target,
+                          f"发送文件后未检测到文件卡片（校验只认聊天区，"
+                          f"不含输入框），请人工确认（{path.name}）")
+
+    def _verify_file_sent(self, hwnd: int, path: Path, before):
+        """文件投递校验。返回 (ok, 证据, 最后一帧)。
 
         文件卡片不是绿色气泡（`_has_outgoing_bubble` 认不出来），OCR 认文件名
         又常常把扩展名读花 —— 所以两级判据：
-          1) 消息区 OCR 出文件名主干（最硬的证据：卡片真的出现了）
-          2) 消息区底部像素相对发送前有变化（退一步的弱证据，挡住了
-             「文件名被 OCR 读错 → 误报失败 → 补投发两遍」这条路）
+          1) **聊天历史区**（chat 区，不含输入框）OCR 出文件名主干（最硬的
+             证据：卡片真的出现了）。2026-11-05 前用的是 message 区，y1=0.94
+             把输入框罩进去 —— 输入框里挂着的附件芯片会被当成「已发出」，
+             假成功（16:24 附件事故）；
+          2) 聊天历史区底部像素相对发送前有变化（退一步的弱证据）——
+             同样只在 chat 区内比，输入框的变化不算数。
         """
         probe = path.stem.strip()[:8]
         frame = None
@@ -1982,22 +2020,37 @@ class WeChatOcrTarget(Target):
         while time.time() < deadline:
             frame = self._grab(hwnd)
             if frame is not None and probe:
-                items, _box, _zoom = self._ocr_region(frame, "message", zoom=2)
+                items, _box, _zoom = self._ocr_region(frame, "chat", zoom=2)
                 joined = "".join((t or "").replace(" ", "")
                                  for _b, t, c in items
                                  if float(c or 0) >= 0.5)
                 if probe.replace(" ", "") in joined:
-                    return SendResult(True, target, "已发送文件（回读到文件名）")
+                    return True, "回读到文件名", frame
             time.sleep(0.5)
-        if frame is not None and before is not None and self._bottom_changed(
-                before, frame):
-            return SendResult(True, target, "已发送文件（检测到消息区变化）")
-        return SendResult(False, target,
-                          f"发送文件后未检测到新内容，请人工确认（{path.name}）")
+        if (frame is not None and before is not None):
+            # 像素弱判据：两帧都裁到聊天历史区再比 —— 输入框里的变化
+            # （附件芯片挂上来）不算数，2026-11-05 前就是被这个骗过的。
+            if self._bottom_changed(self._crop_chat(before),
+                                    self._crop_chat(frame)):
+                return True, "检测到聊天区变化", frame
+        return False, "", frame
+
+    @staticmethod
+    def _crop_chat(img):
+        """把帧裁到聊天历史区（chat 区，不含输入框）——给像素判据用。"""
+        W, H = img.size
+        x0, y0, x1, y1 = _LAYOUT["chat"]
+        return img.crop((int(W * x0), int(H * y0),
+                         int(W * x1), int(H * y1)))
 
     @staticmethod
     def _bottom_changed(before, after) -> bool:
-        """消息区底部 18% 是否明显变化 —— 新卡片落地的弱判据。"""
+        """消息区底部 18% 是否明显变化 —— 新卡片落地的弱判据。
+
+        ⚠ 调用方要自己把帧裁到聊天历史区（`_crop_chat`）：直接喂整帧时
+        底部 18%（y 0.82-1.0）覆盖输入框，输入框里挂个附件芯片也算
+        「变化」—— 2026-11-05 16:24 附件假成功就是这么来的。
+        """
         import numpy as np
 
         try:
