@@ -32,6 +32,12 @@ try:
 except Exception:
     pass
 
+# 必须赶在任何窗口 API 之前：worker 是独立进程，GUI 里那段
+# _enable_dpi_awareness() 管不到它。125% 缩放 + 加第二块屏时，不声明会让
+# GetWindowRect（逻辑坐标）与 ImageGrab（物理像素）差 25%，截图/点击全偏。
+from bridge.win_dpi import enable as _enable_dpi           # noqa: E402
+_enable_dpi()
+
 from bridge.config import load_config                      # noqa: E402
 from bridge.models import Message                          # noqa: E402
 from bridge.service import BridgeService                   # noqa: E402

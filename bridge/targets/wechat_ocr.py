@@ -1268,7 +1268,10 @@ class WeChatOcrTarget(Target):
             if occ is not None:
                 log.warning("置顶后微信仍被「%s」压住（对方也是置顶窗口）", occ)
                 return None
-            return ImageGrab.grab(bbox=r, all_screens=False)
+            # all_screens=True：bbox 用的是虚拟桌面绝对坐标（GetWindowRect），
+            # PIL 会自己减掉虚拟桌面原点；微信拖到副屏 / 副屏在负坐标侧时
+            # all_screens=False 只会抓主屏，抓回来是黑图或隔壁窗口。
+            return ImageGrab.grab(bbox=r, all_screens=True)
         except Exception as exc:                       # noqa: BLE001
             log.warning("置顶抓帧失败：%s", exc)
             return None
@@ -1368,7 +1371,8 @@ class WeChatOcrTarget(Target):
                 log.warning("微信窗口被「%s」遮挡 —— 改用置顶抓帧", occ)
                 return self._grab_pinned(hwnd)
         try:
-            frame = ImageGrab.grab(bbox=r, all_screens=False)
+            # 同上：抓整张虚拟桌面再按窗口矩形裁，微信在哪块屏都能抓对。
+            frame = ImageGrab.grab(bbox=r, all_screens=True)
         except Exception as exc:
             log.warning("ImageGrab 抓窗失败（%s），回退 PrintWindow", exc)
         else:
