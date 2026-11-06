@@ -16,7 +16,7 @@
 所以改版本只需要动这一行，别再在别处硬编码。
 """
 
-__version__ = "0.62"
+__version__ = "0.63"
 
 # 任何 import bridge.* 的进程（worker / GUI / 菜单里的 tools 脚本 / 单测）
 # 都必须在碰窗口 API 之前声明 Per-Monitor V2。以前只有 run.py 和 GUI 的

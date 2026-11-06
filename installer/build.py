@@ -14,7 +14,13 @@
     3. 把 ``installer/setup_gui.py`` + payload.zip 打成单文件 Setup 安装包。
 
 需要构建解释器带 tkinter（官方 Windows 安装包默认自带），并已安装
-``pyinstaller``（``pip install pyinstaller``）。
+``pyinstaller`` **和** ``pillow``（``pip install pyinstaller pillow``）。
+
+⚠ Pillow 不能省：``app/phone_panel.py`` 的「手机画面」靠 ``ImageTk`` 贴图，
+而它的 ``from PIL import`` 包在 try 里 —— 构建环境没装 Pillow 时
+PyInstaller 会**静默跳过**，打出来的 exe 能装能跑、日志全绿，只有右侧
+面板永远停在「正在取第一帧…」。所以 ``build_app_exe()`` 里既有前置检查，
+也会读回 PYZ 做一次实检（2026-11-06 现场事故）。
 """
 from __future__ import annotations
 
@@ -79,16 +85,67 @@ def pyi(*args: str) -> None:
     run([*PYINSTALLER, "--noconfirm", "--clean", *args], cwd=ROOT)
 
 
+def _assert_frozen_pil(exe: Path) -> None:
+    """读回刚打好的 exe，确认 Pillow 真的进了包 —— 不能只信 exit=0。
+
+    2026-11-06 事故：构建用的 venv 只装了 pyinstaller、没装 Pillow，
+    PyInstaller 对 ``phone_panel.py`` 里 try 包裹的 ``from PIL import``
+    静默跳过，产出的主程序 PYZ 里 **PIL 模块数 = 0**。结果面板
+    ``Image=None`` → 不启取帧线程 → 画布永远「正在取第一帧…」，
+    而且错误只写在被挤没的底部状态行，用户看到的是「没画面、也没报错」。
+    所以构建完必须实读归档，缺了就直接判构建失败。
+    """
+    import tempfile
+    try:
+        from PyInstaller.archive.readers import CArchiveReader, ZlibArchiveReader
+    except Exception as exc:                                # noqa: BLE001
+        raise SystemExit(f"读不了打包结果，无法做 Pillow 自检：{exc}")
+    try:
+        reader = CArchiveReader(str(exe))
+        pyz_name = next(n for n in reader.toc if n.endswith(".pyz"))
+        blob = reader.extract(pyz_name)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pyz")
+        try:
+            tmp.write(blob)
+            tmp.close()
+            names = set(ZlibArchiveReader(tmp.name).toc)
+        finally:
+            os.unlink(tmp.name)
+    except Exception as exc:                                # noqa: BLE001
+        raise SystemExit(f"读取主程序归档失败：{exc}")
+    missing = [m for m in ("PIL.Image", "PIL.ImageTk") if m not in names]
+    if not any("_imaging" in n for n in reader.toc):
+        missing.append("PIL._imaging（二进制扩展）")
+    if missing:
+        raise SystemExit(
+            "主程序 exe 里缺少 " + "、".join(missing) +
+            " —— 装出去后「手机画面」会永远停在「正在取第一帧…」。\n"
+            f"请在构建解释器里执行：{sys.executable} -m pip install pillow\n"
+            "然后重新运行 installer/build.py")
+    print(f"    Pillow 自检通过：PYZ 内 "
+          f"{sum(1 for n in names if n.startswith('PIL'))} 个 PIL 模块",
+          flush=True)
+
+
 def build_app_exe() -> Path:
-    """应用主程序：tkinter GUI（不需要任何第三方包）。"""
+    """应用主程序：tkinter GUI + Pillow（手机画面面板要用 ImageTk）。"""
     print("\n>>> 第 1 步：打包应用主程序 exe …", flush=True)
+    if importlib.util.find_spec("PIL") is None:
+        raise SystemExit(
+            "构建解释器缺少 Pillow —— 打出来的主程序会没有「手机画面」。\n"
+            f"先执行：{sys.executable} -m pip install pillow\n"
+            "（build.py 需要带 tkinter 的 Python + pyinstaller + pillow）")
+    if importlib.util.find_spec("tkinter") is None:
+        raise SystemExit("构建解释器缺少 tkinter，无法打 GUI 主程序")
     name = APP_NAME
     pyi("--onefile", "--windowed", "--icon", str(ROOT / "app" / "app.ico"),
+        "--collect-all", "PIL",
         "--name", name, "--paths", "app", str(ROOT / "app" / "gui.py"))
     out = ROOT / "dist" / f"{name}.exe"
     if not out.is_file():
         raise SystemExit("主程序 exe 没有生成")
     print(f"    主程序：{out}（{out.stat().st_size / 1e6:.1f} MB）", flush=True)
+    _assert_frozen_pil(out)
     return out
 
 

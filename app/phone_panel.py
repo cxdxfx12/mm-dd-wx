@@ -127,11 +127,18 @@ class PhonePanel(tk.Frame):
         if not self.adb:
             # 画布中央那行「正在取第一帧…」是建界面时写死的，不更新的话
             # 用户会以为还在连，其实根本没起线程 —— 顺手把它改掉。
-            self.canvas.itemconfigure(
-                self._hint_id, text="未找到 adb（tools\\platform-tools）")
+            self._show_error("未找到 adb.exe\n"
+                             "把 platform-tools 放到 tools/ 下，或重装安装包")
             self._set_status("未找到 adb：把 platform-tools 放到 tools/ 下", err=True)
         elif Image is None:
-            self._set_status("缺少 Pillow，装一下 pillow 才能显示画面", err=True)
+            # 2026-11-06 实机事故：构建机 venv 没装 Pillow，PyInstaller 静默
+            # 跳过 try 里的 from PIL import —— 冻结版 Image=None，线程根本不启，
+            # 画布永远「正在取第一帧…」，而原来这句只写底部状态行，那行又被
+            # 窗口布局挤没了。用户看到的是「没画面、也没报错」。
+            self._show_error("这个安装包缺少 Pillow\n"
+                             "手机画面无法取帧（消息转发不受影响）\n"
+                             "请重装最新版安装包")
+            self._set_status("缺少 Pillow：安装包构建环境没打包 Pillow，请重装", err=True)
         else:
             threading.Thread(target=self._loop, daemon=True).start()
             self.after(150, self._pump)
@@ -155,7 +162,10 @@ class PhonePanel(tk.Frame):
 
         self.canvas = tk.Canvas(self, bg="#fbfcfe", highlightthickness=0,
                                 width=width - 24, height=440)
-        self.canvas.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        # ⚠ pack 的**调用顺序**就是空间分配顺序。canvas 是 expand 的，
+        #   原来它先 pack 会吃光剩余高度，把后面的 bar/foot 挤出可视区 ——
+        #   底部状态行（唯一的报错位置）看不见，用户只看到画布中央那句
+        #   永远不变的「正在取第一帧…」。所以底部行先占位，canvas 最后 pack。
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Button-3>", lambda e: self._send("input keyevent KEYCODE_BACK", "返回"))
@@ -166,7 +176,9 @@ class PhonePanel(tk.Frame):
             width // 2, 24, text="正在取第一帧…", fill=c["muted"],
             font=("Microsoft YaHei UI", 9), anchor="n")
 
-        bar = tk.Frame(self, bg=c["card"])
+        bottom = tk.Frame(self, bg=c["card"])
+        bottom.pack(side="bottom", fill="x")
+        bar = tk.Frame(bottom, bg=c["card"])
         bar.pack(fill="x", padx=10, pady=(0, 6))
         # ⚠ 这里必须用 tk.Button 而不是 ttk.Button：vista 主题在 Per-Monitor
         # DPI 感知下会把 ttk 按钮文字渲染成空白（0.48/0.49 实机截图：五个
@@ -186,7 +198,7 @@ class PhonePanel(tk.Frame):
                   font=("Microsoft YaHei UI", 9),
                   highlightthickness=0, bd=1).pack(side="right")
 
-        foot = tk.Frame(self, bg=c["card"])
+        foot = tk.Frame(bottom, bg=c["card"])
         foot.pack(fill="x", padx=12, pady=(0, 8))
         self._status_lbl = tk.Label(
             foot, textvariable=self._status_var, bg=c["card"], fg=c["muted"],
@@ -194,10 +206,35 @@ class PhonePanel(tk.Frame):
             justify="left", wraplength=width - 30)
         self._status_lbl.pack(fill="x")
 
+        # 底部两行都拿到空间了，再把剩余高度给画布
+        self.canvas.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
     def _set_status(self, text: str, *, err: bool = False) -> None:
         self._status_var.set(text)
         try:
             self._status_lbl.configure(fg=self.C["red"] if err else self.C["muted"])
+        except Exception:                                  # noqa: BLE001
+            pass
+
+    def _show_error(self, msg: str) -> None:
+        """把失败原因**画在画布正中**，覆盖「正在取第一帧…」。
+
+        只写底部状态行是不够的：窗口一矮/用户拉小窗口，那行就被挤没，
+        现场表现为「没画面、也没报错、永远在取第一帧」。画布中央这块
+        空间一定可见，所以初始化失败和取帧失败都必须写到这里。
+        """
+        try:
+            cw = max(160, self.canvas.winfo_width())
+            ch = max(160, self.canvas.winfo_height())
+            self.canvas.itemconfigure(self._img_id, image="")
+            self._photo = None                 # 别让旧帧盖住错误文字
+            self._last_img = None
+            self.canvas.coords(self._hint_id, cw // 2, ch // 2)
+            self.canvas.itemconfigure(
+                self._hint_id,
+                text=msg[:400], anchor="center", justify="center",
+                fill=self.C["red"], width=max(140, cw - 24),
+                font=("Microsoft YaHei UI", 9))
         except Exception:                                  # noqa: BLE001
             pass
 
@@ -215,6 +252,29 @@ class PhonePanel(tk.Frame):
             return b""
         p = _run_adb([self.adb, *args], timeout=timeout)
         return p.stdout
+
+    def _adb_capture(self, args: list[str], timeout: float = 12) -> tuple[bytes, bytes]:
+        """取截图时连 stderr 一起拿：adb 把「没设备」写在 stderr。"""
+        if not self.adb:
+            return b"", b""
+        p = _run_adb([self.adb, *args], timeout=timeout)
+        return p.stdout, p.stderr
+
+    def _device_problem(self) -> str | None:
+        """`adb devices` 文本 → 人话问题说明；None = 有可用设备。"""
+        try:
+            out = self._adb(["devices"], timeout=8).decode("utf-8", "replace")
+        except Exception as e:                             # noqa: BLE001
+            return f"adb devices 调用失败：{type(e).__name__}: {e}"
+        lines = out.splitlines()
+        if any("\tdevice" in ln for ln in lines):
+            return None
+        if any("unauthorized" in ln for ln in lines):
+            return "手机弹了「允许 USB 调试」但没确认 —— 请在手机上点允许"
+        if any("offline" in ln for ln in lines):
+            return "adb 显示设备 offline —— 拔插数据线，或跑一次 adb kill-server"
+        return ("adb 没找到手机 —— 插 USB 数据线并在手机上点「允许 USB 调试」；"
+                "或开无线调试后 adb connect IP:端口")
 
     def _loop(self) -> None:
         # 整个线程体套一层兜底：任何没料到的异常都要落到队列里显示出来，
@@ -238,10 +298,16 @@ class PhonePanel(tk.Frame):
                 continue
             t0 = time.monotonic()
             try:
-                raw = self._adb(["exec-out", "screencap", "-p"])
+                raw, err = self._adb_capture(["exec-out", "screencap", "-p"])
                 if not raw.startswith(b"\x89PNG"):
-                    detail = raw[:80].decode("utf-8", "replace").strip()
-                    raise RuntimeError(f"不是 PNG（adb 回了 {len(raw)} 字节：{detail}）")
+                    # adb 把「no devices/emulators found」写在 stderr，
+                    # 原来只取 stdout，报错退化成「不是 PNG（0 字节）」，
+                    # 用户根本看不出是手机没连上。
+                    detail = (err or raw)[:120].decode("utf-8", "replace").strip()
+                    problem = self._device_problem()
+                    if problem:
+                        raise RuntimeError(problem)
+                    raise RuntimeError(f"截图失败（{len(raw)} 字节）：{detail}")
                 im = Image.open(io.BytesIO(raw))
                 im.load()
                 fails = 0
@@ -278,7 +344,13 @@ class PhonePanel(tk.Frame):
             if got:
                 im, meta = got
                 if im is None:
-                    self._set_status(f"取画面失败：{meta}\n检查 USB 连接 / 手机是否授权调试", err=True)
+                    self._set_status(f"取画面失败：{meta}", err=True)
+                    self._show_error(
+                        f"取不到手机画面：{str(meta)[:180]}\n\n"
+                        "消息转发走 WiFi，不受影响。要显示画面请：\n"
+                        "① 插 USB 数据线，手机上点「允许 USB 调试」\n"
+                        "② 或开无线调试后 adb connect IP:端口\n"
+                        "连上后这里会自动出图")
                 else:
                     self._show(im, meta)
         except Exception as e:                             # noqa: BLE001
@@ -303,7 +375,9 @@ class PhonePanel(tk.Frame):
         self.canvas.coords(self._img_id, ox, oy)
         self.canvas.itemconfig(self._img_id, image=self._photo)
         self.canvas.coords(self._hint_id, cw // 2, dh + oy + 14)
-        self.canvas.itemconfig(self._hint_id, text="")
+        # 出图成功：把 _show_error 改过的红色/居中/换行样式一并复原
+        self.canvas.itemconfig(self._hint_id, text="", anchor="n",
+                               fill=self.C["muted"], width=0, justify="left")
         if dt <= 0:
             return
         if dt > 0.05:
