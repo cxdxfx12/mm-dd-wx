@@ -20,8 +20,9 @@
    被其他窗口遮挡也能截（所以钉钉可以一直停在前台做采集）；
 2. RapidOCR（PP-OCRv6）识别左侧会话列表，按文本模糊匹配找到目标群，
    拿到它在**截图坐标系**里的位置；
-3. 换算成屏幕坐标（窗口矩形 + 截图坐标；本机 DPI 100%，1:1），
-   `SetCursorPos` + `mouse_event` 点开会话；
+3. 换算成屏幕坐标（窗口矩形 + 截图坐标）。进程必须声明 Per-Monitor V2
+   （见 ``bridge.win_dpi``），这样 Win32 坐标、截图像素、鼠标坐标三者
+   都是虚拟桌面的**物理像素**，任意缩放 / 任意副屏位置都 1:1；
 4. 点输入框 → 剪贴板粘贴（绕开中文输入法）→ 回车发送；
 5. 回读截图做校验：消息区**左下角**出现绿色气泡即视为成功。
 
@@ -46,6 +47,7 @@ import logging
 import time
 from pathlib import Path
 
+from .. import screen
 from ..logfun import tail
 from .base import SendResult, Target
 
@@ -210,13 +212,14 @@ _LAYOUT = {
 }
 
 
-# 标题栏裁剪线 x0 的固定像素上限。
-# 实测（2026-10-31，972×1332 窗口）：会话列表右缘 ~310px、标题文字起点
-# x≈324。封顶 316 = 起点左侧留 8px 余量：
+# 标题栏裁剪线 x0 的上限，单位是 **100% 缩放下的 DIP**。
+# 实测（2026-10-31，972×1332 窗口 / 96 DPI）：会话列表右缘 ~310px、
+# 标题文字起点 x≈324。封顶 316 = 起点左侧留 8px 余量：
 #   · 窗口 ≥ 790 宽时 x0 = 316，恰好盖住标题起点；
 #   · 窗口更窄时仍用 0.40 比例（720 宽 → 288，同样在起点左侧）；
-#   · 高 DPI 机器列表按 DIP 放大、标题起点更靠右，316 只会多扫进来
-#     一点空白/列表边缘，靠 _title_matches 的包含判据兜住，不会切字。
+#   · 缩放屏上微信按 DIP 排版，标题起点也按同一倍率右移，所以运行时
+#     必须乘 ``_screen_scale()``（125% → 395），否则照样切掉群名开头。
+#     旧注释以为「316 只是多扫点空白」，在 125% 下是错的。
 TITLE_X0_MAX_PX = 316
 
 
@@ -324,39 +327,82 @@ class WeChatOcrTarget(Target):
 
     # ---------- 主流程 ----------
 
-    # 已验证 OCR 坐标可用的窗口尺寸范围（实测 520~1100 宽双栏布局正常）。
+    # 已验证 OCR 坐标可用的窗口尺寸范围。
+    # ⚠ 这四组数字是 **100% 缩放（96 DPI）下的逻辑像素 DIP**，不是物理像素！
+    #    125% 屏上同样的「看起来一样大」窗口是 900×1360 物理像素；直接
+    #    MoveWindow 到 720×1088 会把微信压成 576×870 DIP，列表折叠成单栏。
+    #    反过来在 1366×768 小屏上 1088 高比整块屏幕还高，输入框落在屏外，
+    #    发送按钮永远点不中。换算 + 夹进工作区见 ``_layout_bounds``。
     # ⚠ 最大化（如 2576 宽）时微信把列表压成 ~90px 固定窄条，**不是等比
-    # 缩放**，比例坐标全部失效 → 匹配不到任何会话。所以发送前把窗口
-    # 恢复到标准尺寸，用户平时怎么拉窗口都不影响。
+    #    缩放**，比例坐标全部失效 → 匹配不到任何会话。
     STD_W, STD_H = 720, 1088
     MIN_OK_W, MAX_OK_W = 520, 1100
     MIN_OK_H = 800
 
-    def _ensure_layout_safe(self, hwnd: int) -> None:
-        """窗口尺寸不在已验证范围内就恢复到标准尺寸（720×1088）。
+    @staticmethod
+    def _layout_bounds(hwnd: int, rect: tuple[int, int, int, int]) -> dict:
+        """把 100% 下标定的尺寸常量换算成本机物理像素，并夹进工作区。
 
-        最大化 → SW_RESTORE 后再 MoveWindow（只还原不恢复，位置会乱）；
-        过小 → 可能触发微信「单栏模式」折叠列表；过大 → 比例坐标失效。
-        恢复动作用户可见（窗口会跳一下），但只发生在发送前的一瞬间。
+        返回 scale / want_w,h / min_w,h / max_w / avail_w,h。
+        拿不到显示器拓扑时全部退回 1.0 与原值，行为与历史一致。
+        """
+        scale = screen.scale_for_window(hwnd)
+        mon = screen.monitor_for_rect(rect) or screen.primary_monitor()
+        if mon is None:
+            return dict(scale=scale,
+                        want_w=int(WeChatOcrTarget.STD_W * scale),
+                        want_h=int(WeChatOcrTarget.STD_H * scale),
+                        min_w=int(WeChatOcrTarget.MIN_OK_W * scale),
+                        max_w=int(WeChatOcrTarget.MAX_OK_W * scale),
+                        min_h=int(WeChatOcrTarget.MIN_OK_H * scale),
+                        avail_w=10 ** 6, avail_h=10 ** 6)
+        avail_w = max(320, mon.work[2] - mon.work[0] - 2 * screen.EDGE_MARGIN)
+        avail_h = max(240, mon.work[3] - mon.work[1] - 2 * screen.EDGE_MARGIN)
+        return dict(
+            scale=scale,
+            want_w=min(int(WeChatOcrTarget.STD_W * scale), avail_w),
+            want_h=min(int(WeChatOcrTarget.STD_H * scale), avail_h),
+            min_w=min(int(WeChatOcrTarget.MIN_OK_W * scale), avail_w),
+            max_w=min(int(WeChatOcrTarget.MAX_OK_W * scale), avail_w),
+            min_h=min(int(WeChatOcrTarget.MIN_OK_H * scale), avail_h),
+            avail_w=avail_w, avail_h=avail_h,
+        )
+
+    def _ensure_layout_safe(self, hwnd: int) -> None:
+        """尺寸越界 / 最大化 / 窗口跑出屏幕时，恢复到本机合适的窗口矩形。
+
+        与旧版的区别（2026-11-06）：旧版无条件 MoveWindow 到 720×1088
+        **物理像素**，在缩放屏和小屏上都会把布局弄坏；现在按显示器缩放比
+        换算、夹进工作区，且窗口本来就在合理范围时**完全不动**，不再每次
+        发送都让窗口跳一下。
         """
         r = self._rect(hwnd)
         if not r:
             return
         w, hgt = r[2] - r[0], r[3] - r[1]
+        b = self._layout_bounds(hwnd, r)
         style = user32.GetWindowLongW(wt.HWND(hwnd), -16)   # GWL_STYLE
         maximized = bool(style & 0x01000000)                # WS_MAXIMIZE
-        in_range = (self.MIN_OK_W <= w <= self.MAX_OK_W
-                    and hgt >= self.MIN_OK_H)
-        if in_range and not maximized:
+        visible = screen.is_fully_visible(r)
+        in_range = (b["min_w"] <= w <= b["max_w"] and hgt >= b["min_h"])
+        if in_range and visible and not maximized:
             return
+
         if maximized:
             user32.ShowWindow(wt.HWND(hwnd), 9)             # SW_RESTORE
             time.sleep(0.5)
-        user32.MoveWindow(wt.HWND(hwnd), r[0], r[1],
-                          self.STD_W, self.STD_H, True)
+            r = self._rect(hwnd) or r                       # 还原后矩形会变
+            b = self._layout_bounds(hwnd, r)
+        # fit_rect 保证窗口完整落在它当前那块屏的工作区里：
+        # 副屏在左（负 x）不会被拽回主屏，小屏也不会把输入框顶出屏幕。
+        l, t, rr, bb = screen.fit_rect(r, b["want_w"], b["want_h"])
+        user32.MoveWindow(wt.HWND(hwnd), l, t, rr - l, bb - t, True)
         time.sleep(0.8)
-        log.info("微信窗口尺寸 %dx%d 超出已验证范围，已恢复为 %dx%d",
-                 w, hgt, self.STD_W, self.STD_H)
+        log.info("微信窗口 %dx%d @(%d,%d) 不适合 OCR（合理范围 %d~%d 宽 / "
+                 "≥%d 高，完整可见=%s，最大化=%s，缩放 %.0f%%），已调整为 "
+                 "%dx%d @(%d,%d)",
+                 w, hgt, r[0], r[1], b["min_w"], b["max_w"], b["min_h"],
+                 visible, maximized, b["scale"] * 100, rr - l, bb - t, l, t)
 
     def _send_live(self, target: str, text: str) -> SendResult:
         hwnd = self._find_window()
@@ -1498,6 +1544,19 @@ class WeChatOcrTarget(Target):
     # 「聊天面板已打开」的最小非背景像素占比（见 `_pane_is_open` 的量测记录）。
     PANE_MIN_FRAC = 0.02
 
+    def _screen_scale(self) -> float:
+        """当前微信窗口所在显示器的缩放比。
+
+        ``_hwnd`` 为 0（纯图像单测 / 还没找窗口）时返回 1.0，保持 100%
+        下标定的历史行为；真机上由 ``bridge.screen`` 按窗口所在屏取。
+        """
+        if not self._hwnd:
+            return 1.0
+        try:
+            return screen.scale_for_window(self._hwnd)
+        except Exception:                                   # noqa: BLE001
+            return 1.0
+
     def _ocr_region(self, img, guide_name: str, zoom: int = 0):
         """按 `_LAYOUT[guide_name]` 裁一块区域，放大 `zoom` 倍后 OCR。
 
@@ -1516,7 +1575,10 @@ class WeChatOcrTarget(Target):
             # 会话列表固定像素宽、标题起点不随窗口等比移动（详见
             # _LAYOUT["title"] 的 2026-10-31 注）：宽窗口下比例线会切掉
             # 群名开头，这里封顶到固定像素。窄窗口取 min 后仍是比例值。
-            box = (min(box[0], TITLE_X0_MAX_PX), box[1], box[2], box[3])
+            # ⚠ 316 是 100% 下量出来的 DIP：125% 屏上标题起点在 405
+            #   物理像素，封顶线也得跟着 ×1.25，否则照样把群名切掉。
+            cap = int(TITLE_X0_MAX_PX * self._screen_scale())
+            box = (min(box[0], cap), box[1], box[2], box[3])
         crop = img.crop(box)
         if crop.width < 20 or crop.height < 10:
             return [], box, zoom

@@ -165,12 +165,22 @@ def _pad_to_window(arr, hwnd: int):
 
     img = Image.fromarray(arr, "RGB")
     if img.size != (cli_w, cli_h) and cli_w > 0 and cli_h > 0:
-        # 缩放/DPI 不一致时先归一到客户区尺寸，保证下面的偏移有意义
+        # 窗口刚改过尺寸时 WGC 可能还推着旧帧；归一到当前客户区，
+        # 保证下面的 ox/oy 偏移有意义。正常情况下（进程声明了
+        # Per-Monitor V2）帧与客户区同为物理像素，这一步是 1:1。
+        ratio = img.size[0] / cli_w if cli_w else 1.0
+        if not 0.95 <= ratio <= 1.05:
+            log.warning(
+                "WGC 帧 %s 与客户区 %dx%d 差 %.2f× —— 检查进程是否声明了 "
+                "Per-Monitor V2，以及微信是否跨了两块不同缩放的屏幕",
+                img.size, cli_w, cli_h, ratio)
         img = img.resize((cli_w, cli_h))
     if ox == 0 and oy == 0 and img.size == (win_w, win_h):
         return img
     canvas = Image.new("RGB", (win_w, win_h), (0, 0, 0))
-    canvas.paste(img, (max(0, ox), max(0, oy)))
+    # 别把负偏移钳成 0：某些无边框/带阴影窗口的客户区会伸到窗口矩形
+    # 左上之外，PIL.paste 自己会裁掉越界部分。钳 0 反而让画面整体右移。
+    canvas.paste(img, (ox, oy))
     return canvas
 
 

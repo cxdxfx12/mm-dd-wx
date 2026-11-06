@@ -252,9 +252,18 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        # 右侧多了一列「手机画面」面板（可在设置里关掉），默认宽度让出 340px
-        self.geometry("1520x780")
-        self.minsize(1180, 640)
+        # 右侧多了一列「手机画面」面板（可在设置里关掉），默认宽度让出 340px。
+        # ⚠ 不能写死 1520×780：1366×768 / 缩放屏上窗口会超出桌面，第三列
+        #   「手机画面」连带被推到屏幕外，看起来像「画面没了」。全部用 Tk
+        #   自己的坐标系（winfo_screen*）夹一次，不混 Win32 物理像素。
+        sw = max(800, self.winfo_screenwidth())
+        sh = max(600, self.winfo_screenheight())
+        w = min(1520, max(1000, sw - 80))
+        h = min(780, max(560, sh - 100))
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(min(1180, w), min(640, h))
         self.configure(bg=BG)
         self._set_taskbar_icon()
 
@@ -2243,20 +2252,10 @@ def _enable_dpi_awareness() -> None:
     自检/投递端按 GetWindowRect 的缩放坐标去屏幕抓帧会整体错位几百
     像素，OCR 读到的是旁边窗口的内容（2026-11-04 投递全挂的根因）。
     """
-    import ctypes
-    try:
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(
-            ctypes.c_void_p(-4))     # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-        return
-    except Exception:
-        pass
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
+    # 统一走 bridge.win_dpi：worker / tools / GUI 只保留一份实现，
+    # 免得哪天又出现「只有一个入口声明了」的漏网之鱼。
+    from bridge.win_dpi import enable
+    enable()
 
 
 if __name__ == "__main__":

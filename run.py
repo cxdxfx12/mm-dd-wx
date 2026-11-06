@@ -2,7 +2,8 @@
 
 常用命令：
     python run.py --simulate                # 用样例消息跑通全链路（不需要微信）
-    python run.py --check                   # 启动自检
+    python run.py --check                   # 启动自检（含屏幕/DPI/坐标对齐）
+    python run.py --screen                  # 只看显示器拓扑与缩放
     python run.py --live                    # 正式运行：Stream 长连接采集 → 真实投递微信
     python run.py --stats                   # 查看统计
     python run.py --export out.csv          # 导出消息
@@ -224,6 +225,8 @@ def main() -> int:
     parser.add_argument("--simulate", action="store_true", help="用样例消息跑通链路")
     parser.add_argument("--interactive", action="store_true", help="交互测试：手动输入消息看效果")
     parser.add_argument("--check", action="store_true", help="启动自检")
+    parser.add_argument("--screen", action="store_true",
+                        help="只打印显示器拓扑 / 缩放 / DPI 感知，排障用")
     parser.add_argument("--live", action="store_true", help="正式运行（采集真实消息）")
     parser.add_argument("--dry-run", action="store_true", help="强制 dry-run，不真实发送")
     parser.add_argument("--stats", action="store_true", help="打印统计")
@@ -246,6 +249,13 @@ def main() -> int:
     args = parser.parse_args()
 
     setup_logging(args.verbose)
+
+    if args.screen:
+        # 不需要配置文件也能看：换机器/加副屏后第一件事就是跑这个
+        from bridge import screen
+        for line in screen.describe():
+            print(line)
+        return 0
 
     try:
         cfg = load_config(args.config)
@@ -404,6 +414,28 @@ def main() -> int:
 
         if args.check:
             problems = svc.preflight()
+            # 屏幕拓扑 / DPI / 坐标自洽：换机器、加副屏、改缩放之后，
+            # 一眼就能看出是不是「截图与窗口坐标差一个倍率」。
+            from bridge import screen
+            for line in screen.describe():
+                print(line)
+            try:
+                from bridge.targets.wechat_ocr import WeChatOcrTarget
+                probe = WeChatOcrTarget(dry_run=True)
+                hwnd = probe._find_window()
+                if hwnd:
+                    ok, detail = screen.check_alignment(hwnd)
+                    print(f"  坐标对齐 : {'通过' if ok else '未通过'} — {detail}")
+                    if not ok:
+                        problems.append(f"屏幕坐标不对齐：{detail}")
+                    rect = screen.window_rect(hwnd)
+                    if rect and not screen.is_fully_visible(rect):
+                        print(f"  ⚠ 微信窗口 {rect} 没完整落在工作区内，"
+                              "发送时会自动挪回来（也可手动拖回屏幕里）")
+                else:
+                    print("  坐标对齐 : 跳过（未找到微信窗口）")
+            except Exception as exc:
+                print(f"  坐标对齐 : 跳过（{type(exc).__name__}: {exc}）")
             ok_t, detail_t = svc.last_target_check
             print(f"  投递端   : {svc.target.name}（{type(svc.target).__name__}）")
             print(f"  微信连接 : {'通过' if ok_t else '未通过'} — {detail_t}")

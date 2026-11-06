@@ -758,7 +758,28 @@ class DingTalkOCRSource(Source):
 
     # ---------- 每帧处理 ----------
 
-    def _read_title(self, wnd, msg_rect) -> list[str]:
+    @staticmethod
+    def _frame_coord_scale(wnd, frame) -> float:
+        """UIA 矩形 → PrintWindow 位图的坐标换算比。
+
+        ``_find_msg_rect`` 给的是 UIA ``BoundingRectangle``（窗口相对坐标），
+        ``frame.crop(msg_rect)`` 却是在 PrintWindow 的**像素**上裁。进程声明
+        Per-Monitor V2 时两者都是物理像素，比值 1.0；一旦 UIA 退回逻辑坐标
+        （125% 屏上常见），位图会比 UIA 宽 1.25 倍，裁剪区整体偏左上 ——
+        表现为「消息区读不到字」而不是明确报错。用窗口宽做基准把两套
+        坐标系归一，异常比值（窗口刚缩放、UIA 读到的是子控件）直接忽略。
+        """
+        try:
+            wr = wnd.BoundingRectangle
+            ui_w = wr.right - wr.left
+        except Exception:                                   # noqa: BLE001
+            return 1.0
+        if ui_w <= 0 or frame is None or not getattr(frame, "width", 0):
+            return 1.0
+        ratio = frame.width / ui_w
+        return ratio if 0.5 <= ratio <= 3.0 else 1.0
+
+    def _read_title(self, wnd, msg_rect, coord_scale: float = 1.0) -> list[str]:
         """OCR 窗口标题条（聊天面板顶部），返回多个候选读法。
 
         为什么返回列表：标题行下面紧挨着「归属于 XX集团」一行，整条
@@ -771,15 +792,20 @@ class DingTalkOCRSource(Source):
         import numpy as np
         from PIL import Image
 
-        wr = wnd.BoundingRectangle
-        w = wr.right - wr.left
+        # 裁剪右边界必须用**位图自己的宽**：UIA 窗口宽在缩放屏上可能是
+        # 逻辑像素，拿它裁物理位图会把标题右半段切掉（旧实现就踩了这个）。
+        w = (self._last_frame.width if self._last_frame is not None
+             else wnd.BoundingRectangle.right - wnd.BoundingRectangle.left)
+        cs = coord_scale if coord_scale and coord_scale > 0 else 1.0
         left, top = msg_rect[0], msg_rect[1]
-        strip = self._last_frame.crop(
-            (left, max(20, top - 64), w, max(top - 4, top - 64 + 10)))
+        band_top = max(int(20 * cs), top - int(64 * cs))
+        band_bot = max(top - int(4 * cs), band_top + int(10 * cs))
+        strip = self._last_frame.crop((left, band_top, w, band_bot))
         h = strip.height
 
-        parts = [strip, strip.crop((0, 0, strip.width, max(12, int(h * 0.6))))]
-        if h > 30:
+        parts = [strip, strip.crop(
+            (0, 0, strip.width, max(int(12 * cs), int(h * 0.6))))]
+        if h > 30 * cs:
             parts.append(strip.crop((0, int(h * 0.35), strip.width, h)))
         texts: list[str] = []
         for part in parts:
@@ -851,6 +877,14 @@ class DingTalkOCRSource(Source):
             return None
         self._last_frame = frame
 
+        # UIA 矩形与抓帧位图必须落在同一套坐标里（见 _frame_coord_scale）。
+        # 换算后的 msg_rect 继续往下传给 _read_title，别让标题条还用旧坐标。
+        cscale = self._frame_coord_scale(wnd, frame)
+        if not 0.98 <= cscale <= 1.02:
+            log.warning("钉钉 UIA 矩形与抓帧位图坐标系差 %.2f×，已换算裁剪区；"
+                        "请确认进程已声明 Per-Monitor V2（bridge.win_dpi）", cscale)
+            msg_rect = tuple(int(round(v * cscale)) for v in msg_rect)
+
         area = frame.crop(msg_rect)
         scaled = area.resize((int(area.width * OCR_SCALE), int(area.height * OCR_SCALE)),
                              Image.LANCZOS)
@@ -881,7 +915,8 @@ class DingTalkOCRSource(Source):
             blocks.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1,
                            "text": item[1].strip(), "kind": kind, "conf": conf})
 
-        title = self._read_title(wnd, msg_rect) if self.title_check else []
+        title = (self._read_title(wnd, msg_rect, cscale)
+                 if self.title_check else [])
         return {"area_w": aw, "area_h": ah, "blocks": blocks, "title": title,
                 "scroll": scroll}
 

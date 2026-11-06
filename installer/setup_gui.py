@@ -40,7 +40,7 @@ APP_NAME = "喵喵钉钉-微信消息转发桥"
 #   bridge/__init__.py 里的 __version__。手工单独跑 setup_gui.py 调试时
 #   才会用到这里的值 —— 改了记得跟 bridge/__init__.py 对齐。
 #   格式必须是「0.xx」，与主程序底部的版本号一致。
-VERSION = "0.61"
+VERSION = "0.62"
 PUBLISHER = "杭州喵喵至家网络有限公司"
 WEBSITE = "www.hbdxm.com"
 COPYRIGHT = f"杭州喵喵至家网络有限公司　{WEBSITE}"
@@ -267,7 +267,9 @@ class Wizard(tk.Tk):
                 INSTALL_DIR = Path(d)
         self.title(f"{APP_NAME} 安装向导")
         self.geometry("680x520")
-        self.minsize(640, 480)
+        # 小屏 / 高缩放机器上 640×480 的下限会把窗口顶出桌面，
+        # _center() 会按实际屏幕再夹一次，这里先给个宽松下限。
+        self.minsize(560, 400)
         self.configure(bg="#eef1f7")
         self.resizable(False, False)
         self._center()
@@ -334,10 +336,20 @@ class Wizard(tk.Tk):
     # ---------------- 框架 ----------------
 
     def _center(self):
+        """居中到主屏，且完整落在屏幕内。
+
+        只用 Tk 自己的 winfo_screen*（逻辑像素）：这个 exe 不做任何 Win32
+        坐标操作，刻意不声明 Per-Monitor V2 —— tkinter 8.6 在 PMv2 下
+        不会自动放大字体，反而会让安装向导在高 DPI 屏上变得又小又糊。
+        混用 Win32 物理像素与 Tk 逻辑像素才是真正会错位的做法。
+        """
         self.update_idletasks()
-        w, h = 680, 520
-        x = (self.winfo_screenwidth() - w) // 2
-        y = (self.winfo_screenheight() - h) // 2
+        sw = max(600, self.winfo_screenwidth())
+        sh = max(460, self.winfo_screenheight())
+        w = min(680, sw - 40)
+        h = min(520, sh - 60)
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
         self.geometry(f"{w}x{h}+{x}+{y}")
 
     def _build_header(self):
